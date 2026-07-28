@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>团队 Multi-Agent Harness</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/styles.css?v=20260702-run-console" />
+  </head>
+  <body>
+    <a class="skip-link" href="#mainWorkspace">跳到主工作区</a>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true">H</div>
+          <div>
+            <strong>Team Harness</strong>
+            <span>多模型协作控制台</span>
+          </div>
+        </div>
+
+        <nav class="side-nav" aria-label="功能导航">
+          <a class="active" href="#dashboardView" data-view-target="dashboardView" aria-current="page">
+            <span class="nav-icon grid-icon" aria-hidden="true"></span>
+            运行控制台
+          </a>
+          <a href="#workflowView" data-view-target="workflowView">
+            <span class="nav-icon key-icon" aria-hidden="true"></span>
+            工作流
+          </a>
+          <a href="#routingView" data-view-target="routingView">
+            <span class="nav-icon channel-icon" aria-hidden="true"></span>
+            模型路由
+          </a>
+          <a href="#roleCardsView" data-view-target="roleCardsView">
+            <span class="nav-icon role-card-icon" aria-hidden="true"></span>
+            角色卡
+          </a>
+          <a href="#skillsView" data-view-target="skillsView">
+            <span class="nav-icon skill-icon" aria-hidden="true"></span>
+            能力包
+          </a>
+          <a href="#recordsView" data-view-target="recordsView">
+            <span class="nav-icon record-icon" aria-hidden="true"></span>
+            任务记录
+          </a>
+          <a href="#traceView" data-view-target="traceView">
+            <span class="nav-icon trace-icon" aria-hidden="true"></span>
+            追踪产物
+          </a>
+          <a href="/docs" target="_blank" rel="noreferrer">
+            <span class="nav-icon doc-icon" aria-hidden="true"></span>
+            API 文档
+          </a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="sidebar-note">
+            <strong>安全边界</strong>
+            <span>API key 不进入界面、SQLite、任务输入、追踪事件或产物。</span>
+          </div>
+          <button id="refreshButton" type="button">刷新数据</button>
+        </div>
+      </aside>
+
+      <div class="app-main">
+        <header class="topbar">
+          <div>
+            <p id="viewEyebrow" class="eyebrow">Run Console</p>
+            <h1 id="viewTitle">运行控制台</h1>
+            <p id="viewSubtitle" class="topbar-subtitle">监督当前 task/run、人工动作、追踪产物和刷新状态。</p>
+          </div>
+          <div class="topbar-actions" aria-label="服务状态">
+            <span id="healthBadge" class="status-pill muted">连接中</span>
+            <span class="status-pill ok">本地优先</span>
+            <span class="status-pill waiting">显式确认</span>
+          </div>
+        </header>
+
+        <main id="mainWorkspace" class="workspace">
+          <section id="globalRunBar" class="global-run-bar" aria-labelledby="globalRunTitle">
+            <div>
+              <p class="eyebrow">当前运行对象</p>
+              <h2 id="globalRunTitle">未选择任务</h2>
+              <p id="globalRunSummary">创建或选择一个任务后，这里会固定显示当前 task/run、状态、步骤和刷新时间。</p>
+            </div>
+            <dl id="globalRunMeta" class="global-run-meta">
+              <div>
+                <dt>状态</dt>
+                <dd><span class="status-pill muted">未选择</span></dd>
+              </div>
+              <div>
+                <dt>当前步骤</dt>
+                <dd>-</dd>
+              </div>
+              <div>
+                <dt>刷新</dt>
+                <dd>尚未刷新</dd>
+              </div>
+            </dl>
+            <div class="button-row compact global-run-actions">
+              <button id="globalRunTaskButton" type="button" disabled>运行所选任务</button>
+              <button id="globalTraceButton" type="button" disabled>查看运行详情</button>
+              <button id="followActiveRunButton" type="button" aria-pressed="false">跟随活跃运行</button>
+            </div>
+          </section>
+
+          <section id="dashboardView" class="view-page active" aria-labelledby="dashboardTitle">
+            <div class="view-header">
+              <div>
+                <p class="eyebrow">Run Console</p>
+                <h2 id="dashboardTitle">运行控制台</h2>
+                <p>先看当前运行、待处理动作和最近结果；配置与平台说明退到辅助区。</p>
+                <p class="view-note">Harness 负责主控线程和子智能体的长期编排；Claude、GPT、DeepSeek 或 LiteLLM 只是按智能体路由的模型，运行方式和会话策略决定长期子会话或工程执行器边界。本地后台 worker 执行持久化运行队列，外部工程执行器仍未启动。</p>
+              </div>
+            </div>
+
+            <section class="panel run-console-panel" aria-labelledby="runConsoleTitle">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">Operations</p>
+                  <h3 id="runConsoleTitle">运行队列</h3>
+                  <p class="panel-copy">按“需要处理、正在运行、失败阻塞、最近完成”显示 task/run。</p>
+                </div>
+                <span id="runConsoleFreshness" class="status-pill muted">尚未刷新</span>
+              </div>
+              <div id="needsAttentionPanel" class="attention-strip empty">暂无需要人工处理的运行。</div>
+              <div id="runConsoleList" class="run-console-list empty">暂无运行记录；创建并运行任务后会显示在这里。</div>
+            </section>
+
+            <section id="overviewPanel" class="metric-grid" aria-label="概览指标">
+              <article class="metric-card accent-green">
+                <span class="metric-icon wallet-icon" aria-hidden="true"></span>
+                <div>
+                  <p>服务状态</p>
+                  <strong>本地运行</strong>
+                  <span>外部执行器未启动</span>
+                </div>
+              </article>
+              <article class="metric-card accent-blue">
+                <span class="metric-icon workflow-icon" aria-hidden="true"></span>
+                <div>
+                  <p>工作流</p>
+                  <strong id="packCount">0</strong>
+                  <span>Code R&D / Research</span>
+                </div>
+              </article>
+              <article class="metric-card accent-gold">
+                <span class="metric-icon agent-icon" aria-hidden="true"></span>
+                <div>
+                  <p>智能体</p>
+                  <strong id="agentCount">0</strong>
+                  <span>按角色路由模型</span>
+                </div>
+              </article>
+              <article class="metric-card accent-violet">
+                <span class="metric-icon run-icon" aria-hidden="true"></span>
+                <div>
+                  <p>运行</p>
+                  <strong id="runCount">0</strong>
+                  <span>追踪 / 产物 / 评估</span>
+                </div>
+              </article>
+            </section>
+
+            <section class="safety-strip" aria-label="安全边界">
+              <strong>运行规则</strong>
+              <span>真实模型调用会二次确认；写回原仓库必须先预览再确认。</span>
+              <span>普通本地批准只记录审批意图，不启动外部工程执行器。</span>
+            </section>
+
+            <section class="panel dashboard-breakdown" aria-labelledby="platformBreakdownTitle">
+              <div class="section-title">
+                <h3 id="platformBreakdownTitle">平台拆分</h3>
+              </div>
+              <div class="breakdown-grid">
+                <article>
+                  <strong>Harness Core</strong>
+                  <p>任务编排、追踪、产物、评估、审批边界与本地状态。</p>
+                </article>
+                <article>
+                  <strong>Code R&D Pack</strong>
+                  <p>面向代码研发协作，支持规划、执行、评审、测试和写回预览。</p>
+                </article>
+                <article>
+                  <strong>Research Pack</strong>
+                  <p>面向知识研究协作，支持资料收集、阅读摘要、事实核验和报告汇总。</p>
+                </article>
+              </div>
+            </section>
+
+            <section class="panel quick-actions" aria-labelledby="quickActionsTitle">
+              <div class="section-title">
+                <h3 id="quickActionsTitle">快捷操作</h3>
+              </div>
+              <div class="button-row">
+                <button type="button" data-view-shortcut="workflowView">新建协作任务</button>
+                <button type="button" data-view-shortcut="recordsView">查看运行记录</button>
+                <button type="button" data-view-shortcut="traceView">查看追踪产物</button>
+                <button type="button" data-view-shortcut="routingView">查看模型路由</button>
+                <button type="button" data-view-shortcut="roleCardsView">管理角色卡</button>
+                <button type="button" data-view-shortcut="skillsView">管理能力包</button>
+              </div>
+            </section>
+          </section>
+
+          <section id="workflowView" class="view-page" aria-labelledby="taskPanelTitle">
+            <section class="panel task-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">任务录入</p>
+                  <h2 id="taskPanelTitle">启动协作流</h2>
+                  <p class="panel-copy">选择工作流，填写目标和约束，再交给 harness 编排多个 agent。</p>
+                </div>
+                <div class="button-row compact">
+                  <button id="codeExampleButton" type="button">代码研发示例</button>
+                  <button id="researchExampleButton" type="button">知识研究示例</button>
+                </div>
+              </div>
+
+              <form id="taskForm" class="task-form">
+                <label class="field-wide">
+                  <span>工作流</span>
+                  <select id="workflowPack" name="workflow_pack" required></select>
+                </label>
+
+                <label>
+                  <span>任务标题</span>
+                  <input
+                    id="taskTitle"
+                    name="title"
+                    type="text"
+                    value="研究 multi-agent harness 架构"
+                    maxlength="120"
+                    required
+                  />
+                </label>
+
+                <label class="field-wide">
+                  <span>目标说明</span>
+                  <textarea
+                    id="taskGoal"
+                    name="goal"
+                    rows="5"
+                    required
+                  >产出一份关于团队 multi-agent harness 的阶段性协作结果。</textarea>
+                </label>
+
+                <label>
+                  <span>输入 JSON</span>
+                  <textarea id="taskInputs" name="inputs" rows="4">{"recency":"not_required"}</textarea>
+                </label>
+
+                <label>
+                  <span>约束条件</span>
+                  <textarea id="taskConstraints" name="constraints" rows="4">默认使用本地模拟路由；如服务端已为该工作流配置并启用真实模型渠道，运行前需要确认。</textarea>
+                </label>
+
+                <label class="field-wide">
+                  <span>验收标准</span>
+                  <textarea id="taskCriteria" name="acceptance_criteria" rows="3">产出最终产物，并能查看追踪事件与产物。</textarea>
+                </label>
+
+                <div class="button-row form-actions">
+                  <button id="createTaskButton" class="primary" type="submit">创建任务</button>
+                  <button id="runTaskButton" type="button" disabled>创建并运行</button>
+                </div>
+              </form>
+            </section>
+
+            <section id="workflowCurrentPanel" class="panel workflow-current" aria-labelledby="workflowCurrentTitle">
+              <div class="section-title">
+                <h3 id="workflowCurrentTitle">当前工作台</h3>
+                <span id="workflowCurrentBadge" class="status-pill muted">未选择</span>
+              </div>
+              <div id="workflowCurrentSummary" class="workflow-current-summary empty">
+                创建或选择一个任务后，这里会显示当前任务、最近运行和下一步动作。
+              </div>
+              <div class="button-row compact workflow-current-actions">
+                <button id="workflowRunCurrentButton" type="button" disabled>运行当前任务</button>
+                <button type="button" data-view-shortcut="recordsView">查看任务记录</button>
+                <button id="workflowTraceCurrentButton" type="button" disabled>查看追踪产物</button>
+              </div>
+            </section>
+          </section>
+
+          <section id="routingView" class="view-page" aria-labelledby="workflowObserveTitle">
+            <section class="panel overview-panel">
+              <div class="section-title">
+                <h3 id="workflowObserveTitle">模型路由与工作流观察</h3>
+                <span id="selectedPackBadge" class="status-pill muted">未加载</span>
+              </div>
+              <div id="providerOverview" class="provider-overview empty">加载模型渠道目录后显示启用状态。</div>
+              <div id="packOverview" class="pack-overview empty">加载工作流后显示步骤、智能体、模型配置与评估检查。</div>
+            </section>
+          </section>
+
+          <section id="roleCardsView" class="view-page" aria-labelledby="roleCardsTitle">
+            <section class="panel role-card-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">角色模板</p>
+                  <h2 id="roleCardsTitle">角色卡</h2>
+                  <p class="panel-copy">创建独立角色卡，并绑定到指定智能体。保存后需要重启服务生效。</p>
+                </div>
+                <span id="roleCardCount" class="status-pill muted">0 张</span>
+              </div>
+
+              <div class="role-card-layout">
+                <section aria-labelledby="roleCardListTitle">
+                  <div class="section-title">
+                    <h3 id="roleCardListTitle">角色卡列表</h3>
+                    <button id="newRoleCardButton" type="button">新建角色卡</button>
+                  </div>
+                  <div id="roleCardList" class="item-list empty">暂无角色卡</div>
+                </section>
+
+                <section aria-labelledby="roleCardEditorTitle">
+                  <div class="section-title">
+                    <h3 id="roleCardEditorTitle">角色卡编辑器</h3>
+                    <span id="roleCardSaveBadge" class="status-pill muted">本地文件</span>
+                  </div>
+                  <form id="roleCardForm" class="role-editor">
+                    <label>
+                      <span>角色卡 ID</span>
+                      <input id="roleCardId" type="text" placeholder="code-reviewer" pattern="[A-Za-z0-9_-]+" required />
+                      <small class="field-help">本地文件名，只能用字母、数字、下划线和短横线。</small>
+                    </label>
+                    <label>
+                      <span>名称</span>
+                      <input id="roleCardName" type="text" placeholder="代码审查员" maxlength="120" required />
+                    </label>
+                    <label class="field-wide">
+                      <span>描述</span>
+                      <input id="roleCardDescription" type="text" placeholder="负责代码审查、风险把控和质量反馈" maxlength="500" />
+                    </label>
+                    <label>
+                      <span>颜色</span>
+                      <input id="roleCardColor" type="text" placeholder="purple / blue / green" maxlength="40" />
+                      <small class="field-help">只作为角色标记，不影响模型调用。</small>
+                    </label>
+                    <label>
+                      <span>标识</span>
+                      <input id="roleCardEmoji" type="text" placeholder="eye" maxlength="40" />
+                      <small class="field-help">可以填文字标识；不会影响运行逻辑。</small>
+                    </label>
+                    <label class="field-wide">
+                      <span>风格说明</span>
+                      <input id="roleCardVibe" type="text" placeholder="像导师一样审查代码，结论具体、可执行。" maxlength="500" />
+                    </label>
+                    <label class="field-wide">
+                      <span>角色提示词</span>
+                      <textarea id="roleCardContent" rows="12" placeholder="# 代码审查员&#10;&#10;你负责检查正确性、安全性、可维护性、性能和测试覆盖。"></textarea>
+                      <small class="field-help">这里写这个角色的长期工作规则，不要填 API key。</small>
+                    </label>
+                    <div class="button-row form-actions">
+                      <button id="saveRoleCardButton" class="primary" type="submit">保存角色卡</button>
+                      <button id="deleteRoleCardButton" class="danger-button" type="button">删除角色卡</button>
+                    </div>
+                  </form>
+                </section>
+              </div>
+            </section>
+
+            <section class="panel role-binding-panel" aria-labelledby="roleBindingTitle">
+              <div class="section-title">
+                <h3 id="roleBindingTitle">绑定到智能体</h3>
+                <span id="roleBindingBadge" class="status-pill waiting">重启后生效</span>
+              </div>
+              <form id="agentBindingForm" class="role-editor">
+                <label>
+                  <span>智能体</span>
+                  <select id="bindingAgent" required></select>
+                  <small class="field-help">选择要配置的岗位；后面的内部 ID 用于精确保存绑定。</small>
+                </label>
+                <label>
+                  <span>模型渠道</span>
+                  <select id="bindingProvider" required></select>
+                  <small class="field-help">推荐 GPT 与 DeepSeek 均经 LiteLLM，分别使用 gpt5.5 与 deepseek-v4-pro。</small>
+                </label>
+                <label>
+                  <span>模型</span>
+                  <input id="bindingModel" type="text" placeholder="gpt5.5 / deepseek-v4-pro" required />
+                  <small class="field-help">填写对应模型渠道里可用的模型名。</small>
+                </label>
+                <label>
+                  <span>思考强度</span>
+                  <select id="bindingReasoningEffort">
+                    <option value="">不指定</option>
+                    <option value="minimal">minimal</option>
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                    <option value="xhigh">xhigh</option>
+                  </select>
+                  <small class="field-help">真实模型默认 xhigh；运行时按渠道能力直传、映射或记录忽略。</small>
+                </label>
+                <label>
+                  <span>角色卡</span>
+                  <select id="bindingRoleCard"></select>
+                  <small class="field-help">可选；用于覆盖该智能体的系统角色设定。</small>
+                </label>
+                <label>
+                  <span>随机性</span>
+                  <input id="bindingTemperature" type="number" min="0" max="2" step="0.1" placeholder="可留空" />
+                  <small class="field-help">留空使用默认值；代码和审查建议偏低。</small>
+                </label>
+                <label>
+                  <span>最大输出</span>
+                  <input id="bindingMaxTokens" type="number" min="1" max="200000" step="1" placeholder="可留空" />
+                  <small class="field-help">留空使用默认值；长上下文阅读角色可以适当加大。</small>
+                </label>
+                <label class="checkbox-field field-wide">
+                  <input id="bindingAllowRealCalls" type="checkbox" />
+                  <span>允许该智能体真实调用模型。需要服务端已开启 TEAM_AGENT_ALLOW_REAL_MODEL_CALLS=1 和对应凭据。</span>
+                </label>
+                <div class="button-row form-actions">
+                  <button id="saveBindingButton" class="primary" type="submit">保存绑定</button>
+                  <button id="deleteBindingButton" type="button">清除绑定</button>
+                </div>
+              </form>
+              <section class="route-preset-panel" aria-labelledby="routePresetTitle">
+                <div class="section-title">
+                  <h3 id="routePresetTitle">推荐模型方案</h3>
+                  <span id="routingPresetBadge" class="status-pill muted">GPT 主线程 + DeepSeek 把控</span>
+                </div>
+                <div class="preset-grid">
+                  <article>
+                    <strong>GPT 主线程</strong>
+                    <p>用于规划、派发、代码执行、测试、汇总和最终审批。</p>
+                    <button id="applyGptPresetButton" type="button">填入当前智能体</button>
+                  </article>
+                  <article>
+                    <strong>DeepSeek 长上下文</strong>
+                    <p>用于上下文阅读、计划质询、代码审查、文档分析和风险复核。</p>
+                    <button id="applyDeepSeekPresetButton" type="button">填入当前智能体</button>
+                  </article>
+                  <article>
+                    <strong>制度化代码研发</strong>
+                    <p>按你的默认分工批量保存：GPT 做主线程与代码，DeepSeek 做长上下文把控。</p>
+                    <button id="saveInstitutionalPresetButton" class="primary" type="button">一键保存推荐分工</button>
+                  </article>
+                </div>
+              </section>
+              <div id="agentBindingList" class="provider-overview empty">暂无绑定配置。</div>
+            </section>
+          </section>
+
+          <section id="skillsView" class="view-page" aria-labelledby="skillsTitle">
+            <section class="panel role-card-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">Skill Library</p>
+                  <h2 id="skillsTitle">能力包</h2>
+                  <p class="panel-copy">只读扫描本地 SKILL.md，绑定给智能体作为方法说明。脚本存在但禁用，不会提升工具权限。</p>
+                </div>
+                <span id="skillCount" class="status-pill muted">0 个</span>
+              </div>
+
+              <div class="role-card-layout">
+                <section aria-labelledby="skillListTitle">
+                  <div class="section-title">
+                    <h3 id="skillListTitle">能力包列表</h3>
+                    <button id="refreshSkillsButton" type="button">刷新能力包</button>
+                  </div>
+                  <div id="skillList" class="item-list empty">暂无能力包</div>
+                </section>
+
+                <section aria-labelledby="skillPreviewTitle">
+                  <div class="section-title">
+                    <h3 id="skillPreviewTitle">能力包预览</h3>
+                    <span id="skillPreviewBadge" class="status-pill muted">只读</span>
+                  </div>
+                  <div id="skillPreview" class="skill-preview empty">选择一个能力包查看内容、风险标记和本地路径。</div>
+                </section>
+              </div>
+            </section>
+
+            <section class="panel role-binding-panel" aria-labelledby="skillBindingTitle">
+              <div class="section-title">
+                <h3 id="skillBindingTitle">绑定能力包到智能体</h3>
+                <span class="status-pill waiting">重启后生效</span>
+              </div>
+              <form id="skillBindingForm" class="role-editor">
+                <label>
+                  <span>智能体</span>
+                  <select id="skillBindingAgent" required></select>
+                  <small class="field-help">能力包只影响提示词，不改变模型和工具权限。</small>
+                </label>
+                <label class="field-wide">
+                  <span>能力包 ID</span>
+                  <input id="skillBindingIds" type="text" placeholder="skills-brainstorming, skills-frontend-design" />
+                  <small class="field-help">多个能力包用英文逗号分隔；保存后需要重启服务生效。</small>
+                </label>
+                <div class="button-row form-actions">
+                  <button id="saveSkillBindingButton" class="primary" type="submit">保存能力包绑定</button>
+                  <button id="deleteSkillBindingButton" type="button">清除能力包绑定</button>
+                </div>
+              </form>
+              <div id="skillBindingList" class="provider-overview empty">暂无能力包绑定。</div>
+            </section>
+
+            <section class="panel role-binding-panel" aria-labelledby="autoSkillTitle">
+              <div class="section-title">
+                <h3 id="autoSkillTitle">自动识别能力包</h3>
+                <span class="status-pill ok">自动注入</span>
+              </div>
+              <p class="panel-copy">系统会按工作流、智能体角色和任务场景自动选择只读能力包；不会执行脚本、不会读取 references，也不会改变工具权限。</p>
+              <div id="autoSkillRoutes" class="provider-overview empty">暂无自动识别能力包。</div>
+            </section>
+          </section>
+
+          <section id="recordsView" class="view-page" aria-labelledby="runsPanelTitle">
+            <section class="panel list-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">运行队列</p>
+                  <h2 id="runsPanelTitle">任务与运行</h2>
+                  <p class="panel-copy">优先处理当前和活跃任务，完成或失败的历史运行会折叠归档。</p>
+                </div>
+                <span id="summaryCount" class="status-pill muted">0 项</span>
+              </div>
+
+              <div class="record-toolbar" aria-label="任务和运行筛选">
+                <label>
+                  <span>搜索任务 / Run</span>
+                  <input id="recordSearch" type="search" placeholder="输入任务标题、目标、run id 或步骤" />
+                </label>
+                <label>
+                  <span>状态筛选</span>
+                  <select id="recordStatusFilter">
+                    <option value="all">全部状态</option>
+                    <option value="attention">需要处理</option>
+                    <option value="active">正在运行 / 待处理</option>
+                    <option value="failed">失败 / 取消</option>
+                    <option value="done">已完成</option>
+                    <option value="unrun">未运行任务</option>
+                  </select>
+                </label>
+                <button id="clearRecordFiltersButton" type="button">清除筛选</button>
+                <span id="recordFilterSummary" class="status-pill muted">未筛选</span>
+              </div>
+
+              <div class="list-grid">
+                <div>
+                  <div class="section-title">
+                    <h3>任务归纳</h3>
+                    <button id="runSelectedButton" type="button" disabled>运行所选任务</button>
+                  </div>
+                  <div id="taskList" class="item-list empty">暂无任务</div>
+                </div>
+
+                <div>
+                  <div class="section-title">
+                    <h3>运行归纳</h3>
+                  </div>
+                  <div id="runList" class="item-list empty">暂无运行记录</div>
+                </div>
+              </div>
+            </section>
+          </section>
+
+          <section id="traceView" class="view-page" aria-labelledby="detailPanelTitle">
+            <section class="panel detail-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">执行控制台</p>
+                  <h2 id="detailPanelTitle">执行追踪与产物</h2>
+                  <p class="panel-copy">检查执行链路、模型路由、产物、评估与本地写回风险。</p>
+                </div>
+                <span id="selectedRunBadge" class="status-pill muted">未选择</span>
+              </div>
+
+              <div class="run-state-grid">
+                <div id="selectedRunMeta" class="run-meta empty">选择一个运行记录查看执行过程。</div>
+                <div id="runtimeStatus" class="runtime-status empty">选择一个运行记录查看本地会话、任务、审批、队列和锁状态。</div>
+              </div>
+              <div id="failureSummary" class="failure-summary hidden"></div>
+
+              <div class="detail-tabs" role="tablist" aria-label="详情类型">
+                <button id="chainTab" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="chainPanel" data-tab="chain">执行链路</button>
+                <button id="traceTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tracePanel" data-tab="trace">追踪事件<span class="sr-only">Trace</span></button>
+                <button id="artifactTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="artifactPanel" data-tab="artifacts">产物<span class="sr-only">Artifacts</span></button>
+                <button id="evalTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="evalPanel" data-tab="evals">评估结果<span class="sr-only">Eval Results</span></button>
+              </div>
+
+              <div id="chainPanel" class="detail-section" role="tabpanel" aria-labelledby="chainTab"></div>
+              <div id="tracePanel" class="detail-section hidden" role="tabpanel" aria-labelledby="traceTab"></div>
+              <div id="artifactPanel" class="detail-section hidden" role="tabpanel" aria-labelledby="artifactTab"></div>
+              <div id="evalPanel" class="detail-section hidden" role="tabpanel" aria-labelledby="evalTab"></div>
+            </section>
+          </section>
+        </main>
+      </div>
+
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </div>
+
+    <script src="/static/runtime.js?v=20260727-reliability" defer></script>
+    <script src="/static/app.js?v=20260727-reliability" defer></script>
+  </body>
+</html>

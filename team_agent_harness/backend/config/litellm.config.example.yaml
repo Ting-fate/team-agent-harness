@@ -1,0 +1,14 @@
+model_list:
+  - model_name: gpt5.5
+    litellm_params:
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: os.environ/OPENAI_API_BASE
+
+  - model_name: deepseek-v4-pro
+    litellm_params:
+      model: deepseek/deepseek-v4-pro
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_API_KEY

@@ -1,0 +1,226 @@
+team harness 完善计划
+对比项目：https://github.com/fengshao1227/ccg-workflow
+本次对比快照：本地临时快照（路径已省略）
+快照 commit：c2ecda192a1a565d2faf2a21283912d8bbea84c7
+本地基线：team_agent_harness/backend
+
+一、修订目标与边界
+
+本计划的目标不是把 team_agent_harness 改造成 ccg-workflow，也不是复刻 Claude Code 的 hook、slash command、TeamCreate 或 codeagent-wrapper。ccg-workflow 的可借鉴价值在于一组工作流模式：
+
+- Task Intake：先理解任务类型、复杂度、风险、领域，再推荐策略。
+- State Breadcrumb：持续向执行环节提供当前 run/step/phase/gate 状态。
+- Context Curation：按角色和步骤注入必要上下文，而不是把所有内容无差别塞进去。
+- Phase / Quality Gate：把审批、产物、质量检查做成 workflow 的显式规则。
+- Skill Routing：根据任务信号注入只读领域知识，并记录命中原因。
+- Parallel Decomposition：对可并行分支进行调度，但必须保留 ownership 和冲突边界。
+
+team_agent_harness 的方向仍然是后端原生编排：FastAPI + SQLite + WorkflowPack + Trace + Artifact + Handoff + Tool/Model Gateway。可借鉴 ccg 的模式，但不照搬它的宿主依赖和文件状态机制。
+
+二、两个系统的真实差异
+
+ccg-workflow 是 Claude Code 宿主上的 workflow/plugin layer。它不是独立后端服务，主要通过命令模板、文件状态和 hooks 影响 Claude Code 会话。
+
+更准确的上下文机制是：
+
+- Claude 模式安装 5 个 hook 相关文件，其中 task-utils.js 是共享工具；实际注册 workflow-state.js、session-start.js、subagent-context.js、skill-router.js。
+- workflow-state.js 在 UserPromptSubmit 注入 active task 状态面包屑，并用 .turns.json 做重复阶段检测。
+- session-start.js 只在 startup/clear/compact 注入 session 摘要，不是每轮注入完整项目上下文。
+- subagent-context.js 在 PreToolUse 场景读取 context.jsonl、requirements.md、plan.md、research/*.md，并按需截断注入。
+- skill-router.js 是用户 prompt 关键词触发后注入主会话，不是严格按子 Agent 定向注入。
+- Codex 模式只有一个 Python UserPromptSubmit hook，偏 guardrail，不具备 Claude 模式的 SessionStart/PreToolUse/skill-router 链路。
+
+team_agent_harness 是独立 FastAPI 编排后端。当前已经具备：
+
+- Pydantic domain models、SQLite storage、TraceEvent、ArtifactStore、Handoff。
+- WorkflowPack schema、DAG dependency metadata、coordination_role、runtime/session_policy。
+- Tool Gateway、Model Gateway、Model Routing、Skill Library、Role Cards。
+- Run Coordinator、Runtime Controller、本地 approval/reject/cancel。
+- code_rd、code_rd_institutional、research 三个 pack。
+- Thin UI 和安全 CLI operator。
+
+但它此前缺少三类关键能力：
+
+- 用户不懂 pack 时的任务 intake 分析。
+- 稳定、预算化、可审计的 context envelope。
+- task-time skill routing 的更广领域覆盖和 route reason 可观测。
+
+三、原计划需要校准的判断
+
+保留：
+
+- ccg-workflow 深度绑定 Claude Code CLI/文件系统/模板。
+- team_agent_harness 不应从 ccg 分叉。
+- API 模型调用、Tool Gateway、SQLite trace/artifact、结构化 Handoff 是本地项目应保留的核心优势。
+- 任务理解、上下文策展、质量门、并行拆分是最值得借鉴的模式。
+
+修正：
+
+- 不再说 ccg “安全完全空白”。更准确是：它主要依赖 Claude Code 宿主权限和文件约定，没有独立后端 Tool Gateway。
+- 不再说 ccg “每轮注入完整项目上下文”。实际每轮主要注入 active task 面包屑，startup/clear/compact 才注入 session 摘要。
+- 不再说 “4 个 JS hook” 是完整安装事实。实际复制 5 个相关文件，注册 4 个事件脚本。
+- 不再说 “领域知识注入到对应 agent”。实际 skill-router 是 prompt-triggered 主会话注入。
+- 不再说本地完全没有上下文注入。本地已有 WorkflowRunner._build_context()，问题是缺少预算、摘要、关键状态固定保留和 trace 摘要。
+- 不再说 “XML 比 JSON 省 token”。源码只能证明 XML-like tag 用作清晰边界，不能证明 token 优势。
+- 不把 ccg 的 “S 任务跳过 task 创建” 规则带入本地 harness。本地规则统一为：只要进入 harness 编排，就创建 Task；复杂度只影响 pack、context、gate 和 review 强度。
+
+四、已落地的本地改进
+
+1. TaskIntake
+
+新增 app/core/task_intake.py：
+
+- TaskIntakeRequest
+- TaskIntakeResult
+- analyze_task_intake()
+
+新增 API：
+
+- POST /task-intake/analyze
+
+输出字段固定为：
+
+- task_type
+- complexity
+- risk
+- domain
+- recommended_pack
+- confidence
+- reasons
+- constraints
+
+行为边界：
+
+- 只分析，不创建 Task。
+- 不启动 Run。
+- 不调用真实模型。
+- 当前是规则版分类器，后续可在同一接口后面接模型分类器。
+
+2. ContextInjector
+
+新增 app/core/context_injection.py：
+
+- ContextInjector
+- ContextBuildResult
+
+WorkflowRunner._build_context() 已改为通过 ContextInjector 生成 context envelope。
+
+固定保留：
+
+- task_objective：title、goal、constraints、acceptance_criteria。
+- step_objective：当前 step、phase、required_inputs、required_artifacts、allowed_tools、produced artifact。
+- state_breadcrumb：run、task、pack、current_step、phase、dependency、coordination、runtime 状态。
+- coordination_context：coordination_role、controller_step、return_contract、runtime、session_policy、runtime_job。
+- handoff_summary：previous 和 upstream handoff 摘要。
+- artifact_refs：artifact id/type/path/hash/source_refs/validation_status。
+
+默认策略：
+
+- artifact 默认只传 metadata/ref，不传全文。
+- context_manifest 记录 retained keys、artifact_ref_count、upstream_handoff_count、excerpt_bytes、dropped_context。
+- 每个 step 执行前写 workflow_event trace：context_envelope_built。
+
+3. Task-time Skill Routing 扩展
+
+app/core/skill_library.py 已扩展 task-time 路由：
+
+- 保留原 pdf/docx/pptx/xlsx 文档类任务信号。
+- 新增 security、performance、database、testing、architecture、web_ui、ai_model 领域信号。
+- 仍然只注入 read-only prompt guidance。
+- 不改变 tool_permissions、model_config、runtime 或 approval policy。
+- routed agent runtime_limits 会记录 task_skill_routes 和 task_skill_injected_bytes。
+- 默认 PackMappedExecutor 路径会写 workflow_event trace：task_skill_routes_applied。
+- trace 只记录 skill_id、reason、content_bytes、injected_bytes，不记录 skill 正文。
+
+4. Gate Schema 安全切片
+
+WorkflowStep 新增向后兼容字段：
+
+- requires_eval_pass: bool = false
+- requires_artifact: list[str] = []
+- ownership: dict[str, list[str]] = {}
+
+当前 runner 行为：
+
+- requires_artifact 与 required_artifacts 一起校验。
+- requires_eval_pass=true 时，executor 必须返回 eval_results，且全部为 pass。
+- ownership 先进入 schema/context/gate_context，作为后续并发 ownership 检查的稳定接口。
+
+5. Trace 类型扩展
+
+TraceEventType 新增：
+
+- workflow_event
+
+用于记录 intake、context envelope、skill routing 等 workflow 层事件，避免混入 runtime_event 或 model_action。
+
+五、后续路线
+
+v1：已完成主体能力
+
+- TaskIntake analyze API。
+- ContextInjector envelope。
+- intake/context trace。
+- task-time skill routing 扩展。
+- step gate 字段基础。
+
+仍可补：
+
+- UI 侧增加 “分析任务” 按钮，展示 recommended_pack、risk、complexity、reasons，并由用户确认后创建 task。
+- CLI operator 增加 analyze-task 子命令，只输出建议，不启动 run。
+
+v2：Gate + Quality
+
+建议下一步实现：
+
+- 在 workflow pack 中显式使用 requires_eval_pass / requires_artifact。
+- 增加 quality gate 规则版检查，例如 security_review_present、test_report_present、citation_or_source_present。
+- API/detail UI 展示 gate_context、blocked reason、next action。
+- 将 task_intake result 可选保存为 task inputs 下的 intake_snapshot，前提是 UI/用户确认。
+
+v3：DAG 并发与长期上下文治理
+
+暂不建议直接把 runner 改成真正多线程/async 并发。原因：
+
+- 当前 SQLiteStorage 是单 connection，虽然 API 创建时 check_same_thread=false，但并发写入 artifact、handoff、agent_run、runtime_job 仍需要事务和锁策略。
+- 当前 approval/resume 语义依赖同步 runner，贸然并发会影响 prepare_patch/test_changes 的等待和恢复顺序。
+- 真并发前必须先完成 ownership 检查、storage 锁、executor 并发边界和失败回滚策略。
+
+建议顺序：
+
+1. 实现 ready batch 计算和 ownership conflict 检查，但默认仍顺序执行。
+2. 对无写冲突、无 approval 的纯 model step 开启受控并发。
+3. 对 acp/session step 保持 approval 优先，不启动外部 ACP。
+4. 在 code_rd_institutional 上验证并发分支、汇总、review、final approval 全链路 trace。
+
+六、验证矩阵
+
+已补测试覆盖：
+
+- POST /task-intake/analyze 不创建 task/run，并能识别 JWT/auth 高风险任务推荐 code_rd_institutional。
+- runner trace 包含 task_intake_analyzed 和 context_envelope_built。
+- context envelope 保留 state_breadcrumb、artifact_refs、handoff_summary。
+- task-time document skill route 仍不改变 tools/model/runtime。
+- task-time domain skill route 可命中 security/database，且不误注入 frontend。
+- task-time skill route trace 记录 reason/bytes，不泄漏 skill body。
+- WorkflowStep gate 字段可序列化，并继续校验 artifact 类型。
+- runner 对 requires_eval_pass 失败和通过路径都有测试。
+
+建议每次修改后运行：
+
+.\.venv\Scripts\python.exe -m pytest app/tests/test_runner.py app/tests/test_skill_library.py app/tests/test_workflow_pack_schema.py -q
+.\.venv\Scripts\python.exe -m pytest app/tests/test_api.py -q
+.\.venv\Scripts\python.exe -m pytest -q
+
+七、结论
+
+team_agent_harness 不需要照搬 ccg-workflow。更稳的路径是吸收 ccg 的 workflow 经验，并落成本地后端原生能力：
+
+- 用 TaskIntake 替代 slash-command 策略模板。
+- 用 ContextInjector 替代 Claude hooks。
+- 用 workflow_event trace 替代散落 CLI 输出。
+- 用 WorkflowStep gate 字段和 EvalResult 替代纯 prompt 约定。
+- 用 Skill Library 的 read-only routing 替代无边界 prompt 注入。
+- 用 ownership + storage lock 后再做真正 DAG 并发。
+
+当前第一阶段已经具备可执行基础，下一阶段应优先做 UI/CLI 的 analyze-task 入口和质量 gate，而不是急着做真并发。

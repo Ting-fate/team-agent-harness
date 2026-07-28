@@ -1,0 +1,51 @@
+# Local agent and workspace state
+/.agents/
+/.codex/
+/output/
+
+# Python environments, caches, and build output
+**/.venv/
+**/.venv-litellm/
+**/.pytest_cache/
+**/.playwright-cli/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/dist/
+**/build/
+**/.coverage
+**/htmlcov/
+
+# Credentials and machine-local configuration
+**/.env
+**/.env.*
+!**/.env.local.example
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+/team_agent_harness/backend/config/model-routing.local*.json*
+/team_agent_harness/backend/config/skill-bindings.local*.json*
+/team_agent_harness/backend/config/roles/*.md
+!/team_agent_harness/backend/config/roles/code-reviewer.md
+
+# Runtime state, generated artifacts, and browser profiles
+/team_agent_harness/backend/data/
+/team_agent_harness/backend/output/
+**/*.sqlite
+**/*.sqlite3
+**/*.sqlite-*
+**/*.sqlite3-*
+**/*.db
+**/*.db-*
+**/*.pid
+**/*.log
+**/*.tmp
+**/*.bak
+
+# Editor and operating-system metadata
+**/.vscode/
+**/.idea/
+**/.DS_Store
+**/Thumbs.db
+**/desktop.ini

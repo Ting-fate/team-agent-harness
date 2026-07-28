@@ -1,0 +1,13 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+.env
+.env.local
+config/model-routing.local.json
+config/skill-bindings.local.json
