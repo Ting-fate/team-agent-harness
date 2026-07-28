@@ -22,6 +22,7 @@ $ExampleRoutingConfig = Join-Path $ConfigDir "model-routing.litellm.example.json
 $RoutingConfig = if (Test-Path $LocalRoutingConfig) { $LocalRoutingConfig } else { $ExampleRoutingConfig }
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 $DefaultLiteLlmPython = Join-Path $Root ".venv-litellm\Scripts\python.exe"
+$LiteLlmRequirement = "litellm[proxy]==1.89.2"
 $LiteLlmPythonExe = if ($LiteLlmPython) {
     $LiteLlmPython
 } elseif (Test-Path $DefaultLiteLlmPython) {
@@ -232,9 +233,9 @@ if ([version]$LiteLlmVersion -ge [version]"3.14") {
 
 & $LiteLlmPythonExe -m pip show litellm *> $null
 if ($LASTEXITCODE -ne 0) {
-    & $LiteLlmPythonExe -m pip install "litellm[proxy]"
+    & $LiteLlmPythonExe -m pip install $LiteLlmRequirement
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to install litellm[proxy]. Check the pip error above."
+        throw "Failed to install $LiteLlmRequirement. Check the pip error above."
     }
 }
 

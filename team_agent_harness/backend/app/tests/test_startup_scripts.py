@@ -13,7 +13,11 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+REPOSITORY_ROOT = ROOT.parents[1]
 LAUNCHER = ROOT / "scripts" / "harness-launcher.ps1"
+SETUP = ROOT / "scripts" / "setup-desktop.ps1"
+SHORTCUT = ROOT / "scripts" / "create-desktop-shortcut.ps1"
+ROOT_ENTRY = REPOSITORY_ROOT / "Start-Team-Agent-Harness.cmd"
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
 
 
@@ -126,6 +130,162 @@ def test_start_script_decodes_litellm_json_string_liveliness_response() -> None:
 
     assert "ConvertFrom-Json" in probe
     assert '[string]$response -eq "I\'m alive!"' in probe
+
+
+def test_download_entry_resolves_setup_relative_to_the_extracted_repository() -> None:
+    entry = ROOT_ENTRY.read_text(encoding="utf-8")
+    setup = SETUP.read_text(encoding="utf-8")
+
+    assert 'set "REPOSITORY_ROOT=%~dp0"' in entry
+    assert "%REPOSITORY_ROOT%team_agent_harness\\backend\\scripts\\setup-desktop.ps1" in entry
+    assert "$BackendRoot = Split-Path -Parent $PSScriptRoot" in setup
+    assert "$RepositoryRoot = Split-Path -Parent (Split-Path -Parent $BackendRoot)" in setup
+    assert "Set-Location" not in setup
+
+
+def test_setup_prefers_python_313_then_312_and_rejects_314_for_litellm() -> None:
+    setup = SETUP.read_text(encoding="utf-8")
+
+    assert setup.index('@("-3.13")') < setup.index('@("-3.12")')
+    assert "$Minor -in @(12, 13)" in setup
+    assert "$version.Minor -ge 14" in setup
+    assert '$LiteLlmRequirement = "litellm[proxy]==1.89.2"' in setup
+
+
+def test_start_and_setup_scripts_pin_the_same_litellm_release() -> None:
+    setup = SETUP.read_text(encoding="utf-8")
+    start = (ROOT / "scripts" / "start-litellm-harness.ps1").read_text(encoding="utf-8")
+
+    requirement = '$LiteLlmRequirement = "litellm[proxy]==1.89.2"'
+    assert requirement in setup
+    assert requirement in start
+    assert 'pip install $LiteLlmRequirement' in start
+
+
+def test_setup_never_passes_provider_credentials_to_child_commands() -> None:
+    distribution_scripts = "\n".join(
+        path.read_text(encoding="utf-8") for path in (ROOT_ENTRY, SETUP, SHORTCUT)
+    )
+
+    for credential_name in (
+        "OPENAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "LITELLM_API_KEY",
+        "OPENAI_API_BASE",
+    ):
+        assert credential_name not in distribution_scripts
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for setup behavior testing")
+def test_setup_version_gate_and_ready_state_are_idempotent(tmp_path: Path) -> None:
+    setup_path = str(SETUP).replace("'", "''")
+    state_path = str(tmp_path / "ready state.json").replace("'", "''")
+    python_path = str(Path(sys.executable)).replace("'", "''")
+    command = f"""
+. '{setup_path}' -FunctionsOnly
+$before = Test-EnvironmentReady -PythonExe '{python_path}' -StatePath '{state_path}' -DependencyHash 'test-hash' -ProbeCode \"import json\"
+Write-SetupState -StatePath '{state_path}' -DependencyHash 'test-hash' -PythonExe '{python_path}'
+$first = Test-EnvironmentReady -PythonExe '{python_path}' -StatePath '{state_path}' -DependencyHash 'test-hash' -ProbeCode \"import json\"
+$second = Test-EnvironmentReady -PythonExe '{python_path}' -StatePath '{state_path}' -DependencyHash 'test-hash' -ProbeCode \"import json\"
+[PSCustomObject]@{{
+    Python312 = Test-SupportedBootstrapPythonVersion -Major 3 -Minor 12
+    Python313 = Test-SupportedBootstrapPythonVersion -Major 3 -Minor 13
+    Python314 = Test-SupportedBootstrapPythonVersion -Major 3 -Minor 14
+    Before = $before
+    First = $first
+    Second = $second
+}} | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not result.stderr.strip(), result.stderr
+    assert json.loads(result.stdout.strip()) == {
+        "Python312": True,
+        "Python313": True,
+        "Python314": False,
+        "Before": False,
+        "First": True,
+        "Second": True,
+    }
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for shortcut behavior testing")
+def test_desktop_shortcut_runs_setup_before_the_launcher(tmp_path: Path) -> None:
+    copied_scripts = (
+        tmp_path
+        / "Extracted Team Agent Harness"
+        / "team_agent_harness"
+        / "backend"
+        / "scripts"
+    )
+    copied_scripts.mkdir(parents=True)
+    copied_shortcut_script = copied_scripts / SHORTCUT.name
+    shutil.copy2(SHORTCUT, copied_shortcut_script)
+    shutil.copy2(SETUP, copied_scripts / SETUP.name)
+    desktop_path = tmp_path / "Desktop Folder"
+    desktop_path.mkdir()
+
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(copied_shortcut_script),
+            "-DesktopPath",
+            str(desktop_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    shortcut_path = desktop_path / "Team Agent Harness Launcher.lnk"
+    assert shortcut_path.exists()
+    escaped_shortcut = str(shortcut_path).replace("'", "''")
+    inspect_command = f"""
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut('{escaped_shortcut}')
+[PSCustomObject]@{{
+    TargetPath = $shortcut.TargetPath
+    Arguments = $shortcut.Arguments
+    WorkingDirectory = $shortcut.WorkingDirectory
+}} | ConvertTo-Json -Compress
+"""
+    inspected = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", inspect_command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+
+    assert inspected.returncode == 0, inspected.stderr
+    payload = json.loads(inspected.stdout.strip())
+    assert payload["TargetPath"].lower().endswith("powershell.exe")
+    assert "setup-desktop.ps1" in payload["Arguments"]
+    assert "harness-launcher.ps1" not in payload["Arguments"]
+    assert '"' in payload["Arguments"]
+    assert Path(payload["WorkingDirectory"]) == copied_scripts.parent
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for startup behavior testing")

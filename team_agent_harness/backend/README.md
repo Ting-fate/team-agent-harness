@@ -284,7 +284,38 @@ Role files are not secret storage. Their content is used as model prompt text an
 
 `config/model-routing.local.json` is local machine state and is ignored by Git. The desktop/start scripts prefer it when present, then fall back to `config/model-routing.litellm.example.json`.
 
-## LiteLLM Quick Start
+## Windows Download And Desktop Setup
+
+GitHub users do not need to deploy FastAPI or LiteLLM manually:
+
+1. Download the repository ZIP and extract the complete folder.
+2. Double-click `Start-Team-Agent-Harness.cmd` at the repository root.
+3. Wait for the first-run installer to create `.venv` and `.venv-litellm` and
+   install their dependencies. Both environments remain inside the project.
+4. Use the desktop launcher to enter the GPT relay key and `/v1` base URL plus
+   the DeepSeek API key. The local LiteLLM key is a private value chosen by the
+   user and must begin with `sk-`.
+5. Choose **Save Config**, **Start Services**, and **Open UI**.
+
+Setup selects Python 3.13 first and Python 3.12 second because LiteLLM is not
+supported by this project on Python 3.14. When neither compatible version is
+available, the user can explicitly approve a current-user Python 3.13 install
+through `winget`. No provider key is placed in setup arguments, console output,
+the shortcut, or tracked files.
+
+The setup is idempotent. Dependency fingerprints are stored only inside the
+ignored virtual environments, so later launches skip installation while a
+changed `pyproject.toml` triggers dependency reconciliation. The desktop
+shortcut also runs the setup check before opening `scripts/harness-launcher.ps1`.
+The downloaded LiteLLM Proxy dependency is pinned to the release covered by the
+current project verification record instead of following an untested latest release.
+To rebuild incomplete project-local environments explicitly:
+
+```powershell
+.\scripts\setup-desktop.ps1 -Repair
+```
+
+## LiteLLM Manual Start
 
 This repo includes safe, no-key templates:
 
@@ -326,13 +357,19 @@ The start script automatically prefers `.venv-litellm\Scripts\python.exe` for Li
 py -3.13 -m venv .venv-litellm
 ```
 
-On Windows, you can also use the desktop launcher:
+To create or refresh only the desktop shortcut manually:
 
 ```powershell
 .\scripts\create-desktop-shortcut.ps1
 ```
 
-This creates `Team Agent Harness Launcher.lnk` on the desktop. The launcher can edit `.env.local`, save model settings, start/stop local services, open the Harness UI, open the project folder, open `.env.local`, and open the log folder. Stop actions revalidate the project venv command line, base Python executable, service entry point, and port before terminating a process; unrelated port owners are displayed but never stopped.
+This creates `Team Agent Harness Launcher.lnk` on the desktop. The shortcut runs
+the idempotent setup check and then opens the launcher. The launcher can edit
+`.env.local`, save model settings, start/stop local services, open the Harness
+UI, open the project folder, open `.env.local`, and open the log folder. Stop
+actions revalidate the project venv command line, base Python executable,
+service entry point, and port before terminating a process; unrelated port
+owners are displayed but never stopped.
 
 The script starts LiteLLM on `http://127.0.0.1:4000` and the harness UI on `http://127.0.0.1:8014/`. The harness routes GPT-family agents through the single LiteLLM alias `gpt5.5`; do not use role-specific GPT aliases such as `gpt-planner`, `gpt-coder`, or `gpt-reviewer` in project routing unless you intentionally reintroduce them. GPT routes use `OPENAI_API_BASE`, so they can point at an OpenAI-compatible relay instead of the official OpenAI endpoint. DeepSeek routes stay on `deepseek-v4-pro` and are used for long-context reading and review, not code writing or final approval.
 
@@ -497,7 +534,7 @@ Writeback safety limits:
 - Before source replacement, version 2 journals persist verified base backups and transaction-owned temporary paths. Startup recovery runs before the worker starts, revalidates the journal against SQLite and the patch artifact, and hashes every target as one set: an exact success trace plus all-new hashes is retained, base/new mixed state is rolled back as a whole, and any unknown target bytes stop startup without deleting the journal or overwriting the external edit.
 - Trace records file names and hashes, not API keys or full patch contents.
 
-## Local Setup
+## Manual Developer Setup
 
 ```powershell
 python -m venv .venv
@@ -519,7 +556,7 @@ If editable install dependency resolution is slow, install the minimal current t
 
 ### Current Verification Record
 
-- On 2026-07-28 the full backend suite passed with `563 passed, 5 skipped`; `python -m compileall -q app scripts`, `pip check`, JavaScript syntax, and all project PowerShell parse checks also passed.
+- On 2026-07-28 the full backend suite passed with `569 passed, 5 skipped`; `python -m compileall -q app scripts`, `pip check` in both project environments, JavaScript syntax, and all project PowerShell parse checks also passed. The desktop bootstrap also completed a real dependency reconciliation and then reused both environments without reinstalling them on its second run.
 - A temporary-database 100-run stress completed 100/100 runs, 600/600 agent checkpoints, and 600 artifacts with no error trace, active lock, queue, session, job, or SQLite integrity failure. A run lasting beyond the production five-second heartbeat interval advanced its heartbeat.
 - A separate forced-process restart preserved the completed first checkpoint, cancelled and retried only the interrupted second step, wrote its retry artifact with `attempt-2`, completed the recovered run, and released both old and new locks. The recovery phase took 2.141 seconds in the deterministic test.
 - Paid route smoke passed for `gpt5.5` and `deepseek-v4-pro`. Stored run `edfbd0e2-443e-43c4-b9a2-75cd52a39430` completed all six real Research steps in 172.3 seconds with `mocked=false`, six `finish_reason=stop` responses, no error trace, a completed queue item, a released lock, and a non-empty final artifact.
