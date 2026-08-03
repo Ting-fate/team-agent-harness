@@ -4,10 +4,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-import re
 from typing import Any, Protocol
 
-from app.core.artifacts import ArtifactStore
+from app.core.artifacts import ArtifactStore, ArtifactStoreError
 from app.core.context_injection import ContextInjector
 from app.core.model_runtime import (
     ModelGateway,
@@ -37,6 +36,7 @@ from app.core.models import (
     TraceEventType,
 )
 from app.core.registry import AgentRegistry
+from app.core.sensitive_text import redact_secret_like_text
 from app.core.storage import SQLiteStorage
 from app.core.task_intake import analyze_task_intake
 from app.core.trace import TraceLogger
@@ -260,71 +260,172 @@ class WorkflowRunner:
     def _invalidate_incomplete_checkpoints(self, run_id: str, pack: WorkflowPack) -> None:
         ordered_steps = self._ordered_steps(pack)
         steps_by_name = {step.name: step for step in ordered_steps}
+        agents_by_role = {agent.role: agent for agent in pack.agents}
         handoffs = self.storage.list_handoffs_for_run(run_id)
         eval_events = [
             event
             for event in self.storage.list_trace_events_for_run(run_id)
             if event.event_type == TraceEventType.EVAL_RESULT
         ]
+        pack_eval_check_names = {check.name for check in pack.eval_checks}
 
-        for agent_run in self.storage.list_agent_runs_for_run(run_id):
-            if agent_run.status != AgentRunStatus.COMPLETED:
-                continue
-            step = steps_by_name.get(agent_run.step_name)
-            if step is None:
+        agent_runs = self.storage.list_agent_runs_for_run(run_id)
+        artifacts_by_agent_run: dict[str, list[Artifact]] = {}
+        for artifact in self.storage.list_artifacts_for_run(run_id):
+            artifacts_by_agent_run.setdefault(artifact.agent_run_id, []).append(artifact)
+        latest_completed_by_step: dict[str, AgentRun] = {}
+        for candidate in agent_runs:
+            if candidate.status == AgentRunStatus.COMPLETED and candidate.step_name in steps_by_name:
+                latest_completed_by_step[candidate.step_name] = candidate
+        invalidated_steps: set[str] = set()
+
+        for step in ordered_steps:
+            agent_run = latest_completed_by_step.get(step.name)
+            if agent_run is None:
                 continue
 
             reasons: list[str] = []
+            for artifact in artifacts_by_agent_run.get(agent_run.id, []):
+                try:
+                    self.artifact_store.read_text_excerpt(artifact, max_chars=0)
+                except ArtifactStoreError:
+                    reasons.append(
+                        f"checkpoint artifact content is missing, invalid, or does not match durable metadata: {artifact.id}"
+                    )
+            dependency_lineage = agent_run.input_context.get("dependency_lineage")
+            if not step.depends_on:
+                if "dependency_lineage" in agent_run.input_context:
+                    reasons.append("step without dependencies must not declare dependency lineage")
+            elif not isinstance(dependency_lineage, dict) or set(dependency_lineage) != set(step.depends_on):
+                reasons.append("checkpoint dependency lineage keys do not exactly match depends_on")
+
+            for dependency_name in step.depends_on:
+                dependency_attempt = latest_completed_by_step.get(dependency_name)
+                if dependency_attempt is None or dependency_name in invalidated_steps:
+                    reasons.append(f"completed dependency attempt is missing for: {dependency_name}")
+                    continue
+                try:
+                    incoming_handoff = self._validated_dependency_handoff(
+                        run_id=run_id,
+                        dependency_name=dependency_name,
+                        dependency_step=steps_by_name[dependency_name],
+                        dependency_attempt=dependency_attempt,
+                        consumer_step=step,
+                        consumer_agent=agents_by_role[step.agent_role],
+                        handoffs=handoffs,
+                    )
+                except WorkflowRunnerError as exc:
+                    reasons.append(str(exc))
+                    continue
+                lineage_entry = (
+                    dependency_lineage.get(dependency_name)
+                    if isinstance(dependency_lineage, dict)
+                    else None
+                )
+                if not isinstance(lineage_entry, dict) or (
+                    lineage_entry.get("handoff_id") != incoming_handoff.id
+                    or lineage_entry.get("from_agent_run_id") != dependency_attempt.id
+                ):
+                    reasons.append(
+                        f"checkpoint dependency provenance does not match the current {dependency_name} attempt"
+                    )
+
             step_eval_events = [event for event in eval_events if event.agent_run_id == agent_run.id]
             structural_check = f"{step.name}:artifacts_created"
-            if not any(event.payload.get("check_name") == structural_check for event in step_eval_events):
-                reasons.append("structural evaluation is missing")
+            structural_events = [
+                event
+                for event in step_eval_events
+                if event.payload.get("check_name") == structural_check
+                and event.payload.get("status") == EvalStatus.PASS.value
+                and (
+                    event.payload.get("scope") == "step_structural"
+                    or (
+                        event.payload.get("scope") is None
+                        and structural_check not in pack_eval_check_names
+                    )
+                )
+            ]
+            if len(structural_events) != 1:
+                reasons.append("passing structural evaluation is missing or ambiguous")
 
             if step.requires_eval_pass:
                 gate_events = [
                     event
                     for event in step_eval_events
                     if event.payload.get("check_name") != structural_check
+                    and event.payload.get("scope") != "pack"
+                    and not (
+                        event.payload.get("scope") is None
+                        and event.payload.get("check_name") in pack_eval_check_names
+                    )
                 ]
                 if not gate_events:
                     reasons.append("required evaluation gate is missing")
                 elif any(event.payload.get("status") != EvalStatus.PASS.value for event in gate_events):
                     reasons.append("required evaluation gate did not pass")
+                for required_check in step.required_eval_checks:
+                    matching_events = [
+                        event
+                        for event in step_eval_events
+                        if event.payload.get("check_name") == required_check
+                        and event.payload.get("scope") == "step_executor"
+                    ]
+                    if len(matching_events) != 1:
+                        reasons.append(f"required evaluation is missing or ambiguous: {required_check}")
+                    elif matching_events[0].payload.get("status") != EvalStatus.PASS.value:
+                        reasons.append(f"required evaluation did not pass: {required_check}")
 
-            expected_handoffs = {
-                next_step.name for next_step in self._next_steps(pack, ordered_steps, step)
-            }
-            persisted_handoffs = {
-                handoff.next_objective
-                for handoff in handoffs
-                if handoff.from_agent_run_id == agent_run.id
-            }
-            missing_handoffs = sorted(expected_handoffs - persisted_handoffs)
-            if missing_handoffs:
-                reasons.append(f"handoff is missing for: {', '.join(missing_handoffs)}")
+            next_steps = self._next_steps(pack, ordered_steps, step)
+            expected_handoff_targets = sorted(next_step.name for next_step in next_steps)
+            outgoing_handoffs = [
+                handoff for handoff in handoffs if handoff.from_agent_run_id == agent_run.id
+            ]
+            persisted_handoff_targets = sorted(
+                handoff.next_objective for handoff in outgoing_handoffs
+            )
+            if persisted_handoff_targets != expected_handoff_targets:
+                reasons.append("outgoing handoffs do not exactly match the declared dependency edges")
+            else:
+                for next_step in next_steps:
+                    try:
+                        self._validated_dependency_handoff(
+                            run_id=run_id,
+                            dependency_name=step.name,
+                            dependency_step=step,
+                            dependency_attempt=agent_run,
+                            consumer_step=next_step,
+                            consumer_agent=agents_by_role[next_step.agent_role],
+                            handoffs=outgoing_handoffs,
+                        )
+                    except WorkflowRunnerError as exc:
+                        reasons.append(str(exc))
 
             if not reasons:
                 continue
-            invalidated = agent_run.model_copy(
-                update={
-                    "status": AgentRunStatus.CANCELLED,
-                    "output_summary": f"Incomplete recovery checkpoint: {'; '.join(reasons)}.",
-                }
-            )
-            self.storage.update_agent_run(invalidated)
-            try:
-                self.trace_logger.record(
-                    run_id=run_id,
-                    agent_run_id=agent_run.id,
-                    event_type=TraceEventType.RUNTIME_EVENT,
-                    payload={
-                        "action": "incomplete_checkpoint_invalidated",
-                        "step_name": step.name,
-                        "reasons": reasons,
-                    },
+            invalidated_steps.add(step.name)
+            for candidate in agent_runs:
+                if candidate.step_name != step.name or candidate.status != AgentRunStatus.COMPLETED:
+                    continue
+                invalidated = candidate.model_copy(
+                    update={
+                        "status": AgentRunStatus.CANCELLED,
+                        "output_summary": f"Incomplete recovery checkpoint: {'; '.join(reasons)}.",
+                    }
                 )
-            except Exception:
-                pass
+                self.storage.update_agent_run(invalidated)
+                try:
+                    self.trace_logger.record(
+                        run_id=run_id,
+                        agent_run_id=candidate.id,
+                        event_type=TraceEventType.RUNTIME_EVENT,
+                        payload={
+                            "action": "incomplete_checkpoint_invalidated",
+                            "step_name": step.name,
+                            "reasons": reasons,
+                        },
+                    )
+                except Exception:
+                    pass
 
     def _run(self, run: Run, pack: WorkflowPack, *, resume_waiting: bool) -> Run:
         active_run = self._start_run(run, resume_waiting=resume_waiting)
@@ -606,6 +707,7 @@ class WorkflowRunner:
                 "runtime": step.runtime,
                 "session_policy": step.session_policy.model_dump(mode="json"),
                 "requires_eval_pass": step.requires_eval_pass,
+                "required_eval_checks": step.required_eval_checks,
                 "requires_artifact": step.requires_artifact,
                 "ownership": step.ownership,
             },
@@ -644,10 +746,18 @@ class WorkflowRunner:
         return matches[-1] if matches else None
 
     def _handoffs_by_target_step(self, run_id: str) -> dict[str, list[Handoff]]:
+        latest_completed_by_step: dict[str, AgentRun] = {}
+        for agent_run in self.storage.list_agent_runs_for_run(run_id):
+            if agent_run.status == AgentRunStatus.COMPLETED:
+                latest_completed_by_step[agent_run.step_name] = agent_run
+
         handoffs_by_target: dict[str, list[Handoff]] = {}
         for handoff in self.storage.list_handoffs_for_run(run_id):
             source_agent_run = self.storage.get_agent_run(handoff.from_agent_run_id)
             if source_agent_run is None or source_agent_run.status != AgentRunStatus.COMPLETED:
+                continue
+            latest_source = latest_completed_by_step.get(source_agent_run.step_name)
+            if latest_source is None or latest_source.id != source_agent_run.id:
                 continue
             handoffs_by_target.setdefault(handoff.next_objective, []).append(handoff)
         return handoffs_by_target
@@ -766,7 +876,24 @@ class WorkflowRunner:
                     f"Step {step.name} cannot run from agent_run status {agent_run.status.value}."
                 )
 
-            upstream_handoffs = handoffs_by_target_step.get(step.name, [])
+            upstream_handoffs, dependency_lineage = self._dependency_context_for_step(
+                run_id=active_run.id,
+                pack=pack,
+                step=step,
+                agent=agent,
+                candidate_handoffs=handoffs_by_target_step.get(step.name, []),
+                agent_runs_by_step=agent_runs_by_step,
+            )
+            if dependency_lineage:
+                agent_run = agent_run.model_copy(
+                    update={
+                        "input_context": {
+                            **agent_run.input_context,
+                            "dependency_lineage": dependency_lineage,
+                        }
+                    }
+                )
+                self.storage.update_agent_run(agent_run)
             previous_agent_run, previous_handoff = self._previous_context_for_step(
                 step,
                 upstream_handoffs,
@@ -993,17 +1120,27 @@ class WorkflowRunner:
                 EvalStatus.PASS if artifacts else EvalStatus.WARN,
                 "Step created one or more artifacts." if artifacts else "Step completed without artifacts.",
                 artifacts[-1].id if artifacts else None,
+                scope="step_structural",
             )
 
             for eval_result in output.eval_results:
                 if eval_result.run_id != active_run.id:
                     raise WorkflowRunnerError("Executor returned eval result for a different run.")
+                if eval_result.check_name == f"{step.name}:artifacts_created":
+                    raise WorkflowRunnerError(
+                        "Executor eval results cannot reuse the structural artifact check name."
+                    )
                 self.storage.create_eval_result(eval_result)
                 self.trace_logger.record(
                     run_id=active_run.id,
                     agent_run_id=agent_run.id,
                     event_type=TraceEventType.EVAL_RESULT,
-                    payload={"eval_result_id": eval_result.id, "status": eval_result.status.value},
+                    payload={
+                        "eval_result_id": eval_result.id,
+                        "check_name": eval_result.check_name,
+                        "status": eval_result.status.value,
+                        "scope": "step_executor",
+                    },
                 )
                 if eval_result.status == EvalStatus.FAIL:
                     raise WorkflowRunnerError(f"Executor evaluation failed: {eval_result.check_name}")
@@ -1327,6 +1464,133 @@ class WorkflowRunner:
             return agent_runs_by_step.get(step.depends_on[0]), None
         return None, None
 
+    def _dependency_context_for_step(
+        self,
+        *,
+        run_id: str,
+        pack: WorkflowPack,
+        step: WorkflowStep,
+        agent: AgentDefinition,
+        candidate_handoffs: list[Handoff],
+        agent_runs_by_step: dict[str, AgentRun],
+    ) -> tuple[list[Handoff], dict[str, dict[str, str]]]:
+        steps_by_name = {candidate.name: candidate for candidate in pack.steps}
+        upstream_handoffs: list[Handoff] = []
+        lineage: dict[str, dict[str, str]] = {}
+        if not step.depends_on and not any(candidate.depends_on for candidate in pack.steps):
+            ordered_steps = self._ordered_steps(pack)
+            step_index = next(
+                index for index, candidate in enumerate(ordered_steps) if candidate.name == step.name
+            )
+            if step_index == 0:
+                return upstream_handoffs, lineage
+            dependency_step = ordered_steps[step_index - 1]
+            dependency_attempt = agent_runs_by_step.get(dependency_step.name)
+            if dependency_attempt is None:
+                raise WorkflowRunnerError(
+                    f"Step {step.name} is missing the completed previous attempt: {dependency_step.name}"
+                )
+            upstream_handoffs.append(
+                self._validated_dependency_handoff(
+                    run_id=run_id,
+                    dependency_name=dependency_step.name,
+                    dependency_step=dependency_step,
+                    dependency_attempt=dependency_attempt,
+                    consumer_step=step,
+                    consumer_agent=agent,
+                    handoffs=candidate_handoffs,
+                )
+            )
+            return upstream_handoffs, lineage
+        for dependency_name in step.depends_on:
+            dependency_attempt = agent_runs_by_step.get(dependency_name)
+            if (
+                dependency_attempt is None
+                or dependency_attempt.run_id != run_id
+                or dependency_attempt.step_name != dependency_name
+                or dependency_attempt.status != AgentRunStatus.COMPLETED
+            ):
+                raise WorkflowRunnerError(
+                    f"Step {step.name} is missing the completed dependency attempt: {dependency_name}"
+                )
+            handoff = self._validated_dependency_handoff(
+                run_id=run_id,
+                dependency_name=dependency_name,
+                dependency_step=steps_by_name[dependency_name],
+                dependency_attempt=dependency_attempt,
+                consumer_step=step,
+                consumer_agent=agent,
+                handoffs=candidate_handoffs,
+            )
+            upstream_handoffs.append(handoff)
+            lineage[dependency_name] = {
+                "handoff_id": handoff.id,
+                "from_agent_run_id": handoff.from_agent_run_id,
+            }
+        return upstream_handoffs, lineage
+
+    def _validated_dependency_handoff(
+        self,
+        *,
+        run_id: str,
+        dependency_name: str,
+        dependency_step: WorkflowStep,
+        dependency_attempt: AgentRun,
+        consumer_step: WorkflowStep,
+        consumer_agent: AgentDefinition,
+        handoffs: list[Handoff],
+    ) -> Handoff:
+        matching_handoffs = [
+            handoff
+            for handoff in handoffs
+            if handoff.from_agent_run_id == dependency_attempt.id
+            and handoff.next_objective == consumer_step.name
+        ]
+        if len(matching_handoffs) != 1:
+            raise WorkflowRunnerError(
+                f"Step {consumer_step.name} requires exactly one current handoff from {dependency_name}."
+            )
+        handoff = matching_handoffs[0]
+        if handoff.run_id != run_id or handoff.to_agent_id != consumer_agent.id:
+            raise WorkflowRunnerError(
+                f"Step {consumer_step.name} handoff from {dependency_name} targets a different run or agent."
+            )
+        if len(handoff.artifact_refs) != len(set(handoff.artifact_refs)):
+            raise WorkflowRunnerError(
+                f"Step {consumer_step.name} handoff from {dependency_name} has duplicate artifact references."
+            )
+        referenced_artifacts = [
+            self.storage.get_artifact(artifact_id) for artifact_id in handoff.artifact_refs
+        ]
+        if any(
+            artifact is None
+            or artifact.run_id != run_id
+            or artifact.agent_run_id != dependency_attempt.id
+            for artifact in referenced_artifacts
+        ):
+            raise WorkflowRunnerError(
+                f"Step {consumer_step.name} handoff artifacts do not belong to the current {dependency_name} attempt."
+            )
+        produced_type = dependency_step.produces_artifact_type
+        produced_artifacts = [
+            artifact
+            for artifact in referenced_artifacts
+            if artifact is not None and artifact.type.value == produced_type
+        ]
+        if produced_type is not None and not produced_artifacts:
+            raise WorkflowRunnerError(
+                f"Step {consumer_step.name} handoff from {dependency_name} must reference a {produced_type} artifact."
+            )
+        if (
+            produced_type == ArtifactType.PATCH.value
+            and ArtifactType.PATCH.value in consumer_step.required_artifacts
+            and len(produced_artifacts) != 1
+        ):
+            raise WorkflowRunnerError(
+                f"Step {consumer_step.name} handoff from {dependency_name} requires exactly one patch artifact."
+            )
+        return handoff
+
     def _record_runtime_state_if_needed(
         self,
         run: Run,
@@ -1592,6 +1856,24 @@ class WorkflowRunner:
             return
         if not eval_results:
             raise WorkflowRunnerError(f"Step {step.name} requires eval_results to pass.")
+        missing_checks: list[str] = []
+        ambiguous_checks: list[str] = []
+        for check_name in step.required_eval_checks:
+            matching_results = [
+                result for result in eval_results if result.check_name == check_name
+            ]
+            if not matching_results:
+                missing_checks.append(check_name)
+            elif len(matching_results) != 1:
+                ambiguous_checks.append(check_name)
+        if missing_checks:
+            raise WorkflowRunnerError(
+                f"Step {step.name} is missing required eval results: {', '.join(missing_checks)}"
+            )
+        if ambiguous_checks:
+            raise WorkflowRunnerError(
+                f"Step {step.name} has ambiguous required eval results: {', '.join(ambiguous_checks)}"
+            )
         non_pass = [result.check_name for result in eval_results if result.status != EvalStatus.PASS]
         if non_pass:
             raise WorkflowRunnerError(
@@ -1621,6 +1903,7 @@ class WorkflowRunner:
                 check.name,
                 EvalStatus.PASS,
                 "Required artifact types are present.",
+                scope="pack",
             )
 
         status = EvalStatus.FAIL if check.severity == "blocker" else EvalStatus.WARN
@@ -1630,6 +1913,7 @@ class WorkflowRunner:
             check.name,
             status,
             f"Missing artifact types: {', '.join(missing)}",
+            scope="pack",
         )
         return result
 
@@ -1680,6 +1964,8 @@ class WorkflowRunner:
         status: EvalStatus,
         message: str,
         artifact_id: str | None = None,
+        *,
+        scope: str = "system",
     ) -> EvalResult:
         result = self.storage.create_eval_result(
             EvalResult(
@@ -1698,6 +1984,7 @@ class WorkflowRunner:
                 "eval_result_id": result.id,
                 "check_name": result.check_name,
                 "status": result.status.value,
+                "scope": scope,
             },
         )
         return result
@@ -1952,15 +2239,7 @@ def _is_terminal_runtime_job_status(status: RuntimeJobStatus) -> bool:
 
 
 def _redact_error_message(message: str) -> str:
-    redacted = message
-    redacted = re.sub(r"(?i)(Authorization\s*:\s*Bearer\s+)[^\s,;]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(Bearer\s+)[^\s,;]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(api[_-]?key\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(token\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(secret\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(payload\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"sk-[A-Za-z0-9_-]+", "sk-[REDACTED]", redacted)
-    return redacted
+    return redact_secret_like_text(message)
 
 
 def _safe_error_message(exc: Exception) -> str:

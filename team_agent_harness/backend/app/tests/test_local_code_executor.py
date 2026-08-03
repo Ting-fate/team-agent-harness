@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from app.core.local_code_executor import LocalCodeExecutor, TestCommandResult as LocalTestCommandResult
 from app.core.model_runtime import MockModelAdapter, ModelGateway
-from app.core.models import AgentDefinition, ArtifactType, Run, Task
+from app.core.models import AgentDefinition, AgentRun, AgentRunStatus, ArtifactType, EvalStatus, Handoff, Run, Task
 from app.core.runner import WorkflowRunnerError
 from app.core.writeback import WritebackConflict, WritebackError, WritebackService
 from app.main import create_app
@@ -43,36 +43,125 @@ def test_local_code_executor_prepares_patch_without_modifying_source(tmp_path) -
 
     assert source.read_text(encoding="utf-8") == original
     assert output.artifacts[0].type == ArtifactType.PATCH
-    assert "Original repository modified: `false`" in output.artifacts[0].content
+    assert "Source repository write requested: `false`" in output.artifacts[0].content
+    assert str(repo.resolve()) not in output.artifacts[0].content
     assert "app.py" in output.artifacts[0].content
     assert ".env" not in output.artifacts[0].content
     assert "sk-secret" not in output.artifacts[0].content
     assert output.model_response is not None
     assert output.model_response.mocked is True
+    assert output.model_request is not None
+    assert str(repo.resolve()) not in str(output.model_request)
 
 
-def test_local_code_executor_runs_allowed_pytest_in_workspace_copy(tmp_path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-
+def test_local_code_executor_redacts_source_paths_from_task_context_and_artifact(tmp_path) -> None:
+    repo = tmp_path / "private" / "repo"
+    repo.mkdir(parents=True)
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    source_path = str(repo.resolve())
+    source_path_forward = source_path.replace("\\", "/")
+    task = _task(repo).model_copy(
+        update={
+            "title": f"Fix {source_path}",
+            "goal": f"Edit {source_path_forward}/app.py without exposing the source path.",
+            "constraints": [f"Keep {source_path} private."],
+            "acceptance_criteria": [f"No output contains {source_path}."],
+        }
+    )
     executor = LocalCodeExecutor(
         model_gateway=ModelGateway({"mock": MockModelAdapter()}),
         workspace_root=tmp_path / "workspaces",
     )
-    task = _task(repo, inputs={"test_command": "python -m pytest -q"})
 
     output = executor.execute(
         task=task,
+        run=Run(id="run-1", task_id=task.id),
+        step=_step("prepare_patch"),
+        agent=_agent(),
+        context={"operator_note": f"Repository is {source_path}."},
+    )
+
+    assert source_path not in str(output.model_request)
+    assert source_path_forward not in str(output.model_request)
+    assert source_path not in output.artifacts[0].content
+    assert "[LOCAL_PATH]" in str(output.model_request)
+    assert "[LOCAL_PATH]" in output.artifacts[0].content
+
+
+def test_local_code_executor_redacts_credentials_from_normal_source_files(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    github_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"
+    aws_access_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+    credentials = {
+        "database_password": "db-password-should-not-leak",
+        "github_token": github_token,
+        "aws_access_key": aws_access_key,
+        "jwt": "eyJabcdefghijklmno.eyJpqrstuvwxyz012.abcdefghijklmnopqr",
+    }
+    (repo / "settings.py").write_text(
+        "DATABASE_URL = \"postgresql://service:db-password-should-not-leak@db.invalid/app\"\n"
+        f"GITHUB_TOKEN = \"{github_token}\"\n"
+        f"AWS_ACCESS_KEY_ID = \"{aws_access_key}\"\n"
+        "JWT_VALUE = \"eyJabcdefghijklmno.eyJpqrstuvwxyz012.abcdefghijklmnopqr\"\n",
+        encoding="utf-8",
+    )
+    executor = LocalCodeExecutor(
+        model_gateway=ModelGateway({"mock": MockModelAdapter()}),
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    output = executor.execute(
+        task=_task(repo),
         run=Run(id="run-1", task_id="task-1"),
-        step=_step("test_changes"),
+        step=_step("prepare_patch"),
         agent=_agent(),
         context={},
     )
 
+    request_dump = str(output.model_request)
+    artifact_dump = output.artifacts[0].content
+    for secret in credentials.values():
+        assert secret not in request_dump
+        assert secret not in artifact_dump
+    assert "[REDACTED]" in request_dump
+
+
+def test_local_code_executor_tests_applied_patch_without_modifying_source(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "app.py"
+    source.write_text("def answer():\n    return 41\n", encoding="utf-8")
+    (repo / "test_app.py").write_text(
+        "from app import answer\n\n\ndef test_answer():\n    assert answer() == 42\n",
+        encoding="utf-8",
+    )
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    task = _task(repo, inputs={"test_command": "python -m pytest -q"})
+
+    try:
+        output = executor.execute(
+            task=task,
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context=context,
+        )
+    finally:
+        storage.close()
+
+    assert source.read_text(encoding="utf-8") == "def answer():\n    return 41\n"
+    assert (tmp_path / "workspaces" / "run-1" / "test_changes" / "repo" / "app.py").read_text(
+        encoding="utf-8"
+    ) == "def answer():\n    return 42\n"
     assert output.artifacts[0].type == ArtifactType.TEST_REPORT
     assert "Test command passed" in output.summary
     assert "1 passed" in output.artifacts[0].content
+    assert context["previous_handoff"]["artifact_refs"][0] in output.artifacts[0].content
+    assert "Patch applied to isolated workspace: `true`" in output.artifacts[0].content
     assert output.eval_results[0].status.value == "pass"
 
 
@@ -85,18 +174,30 @@ def test_local_code_executor_redacts_secret_like_test_output(tmp_path) -> None:
         "    assert False\n",
         encoding="utf-8",
     )
-    executor = LocalCodeExecutor(
-        model_gateway=ModelGateway({"mock": MockModelAdapter()}),
-        workspace_root=tmp_path / "workspaces",
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        "# Patch\n\n"
+        "```diff\n"
+        "--- a/test_sample.py\n"
+        "+++ b/test_sample.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " def test_leaky_output():\n"
+        "     print('api_key=abc123 token=tok123 secret=sauce Authorization: Bearer sk-other')\n"
+        "-    assert False\n"
+        "+    assert 0\n"
+        "```\n",
     )
 
-    output = executor.execute(
-        task=_task(repo, inputs={"test_command": "python -m pytest -q -s"}),
-        run=Run(id="run-1", task_id="task-1"),
-        step=_step("test_changes"),
-        agent=_agent(),
-        context={},
-    )
+    try:
+        output = executor.execute(
+            task=_task(repo, inputs={"test_command": "python -m pytest -q -s"}),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context=context,
+        )
+    finally:
+        storage.close()
 
     content = output.artifacts[0].content
     assert "api_key=[REDACTED]" in content
@@ -107,15 +208,100 @@ def test_local_code_executor_redacts_secret_like_test_output(tmp_path) -> None:
     assert "tok123" not in content
     assert "sauce" not in content
     assert "sk-other" not in content
+    assert output.eval_results[0].status.value == "fail"
+
+
+def test_local_code_executor_redacts_source_path_from_test_output_and_review(tmp_path) -> None:
+    repo = tmp_path / "private" / "repo"
+    repo.mkdir(parents=True)
+    source_path = str(repo.resolve())
+    (repo / "test_sample.py").write_text(
+        "def test_path_output():\n"
+        f"    print({source_path!r})\n"
+        "    assert False\n",
+        encoding="utf-8",
+    )
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        "# Patch\n\n"
+        "```diff\n"
+        "--- a/test_sample.py\n"
+        "+++ b/test_sample.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " def test_path_output():\n"
+        f"     print({source_path!r})\n"
+        "-    assert False\n"
+        "+    assert True\n"
+        "```\n",
+    )
+    task = _task(repo, inputs={"test_command": "python -m pytest -q -s"}).model_copy(
+        update={"title": f"Test {source_path}", "goal": f"Verify {source_path} privately."}
+    )
+
+    try:
+        output = executor.execute(
+            task=task,
+            run=Run(id="run-1", task_id=task.id),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context=context,
+        )
+    finally:
+        storage.close()
+
+    assert source_path not in str(output.model_request)
+    assert source_path not in output.artifacts[0].content
+    assert "[LOCAL_PATH]" in output.artifacts[0].content
+
+
+def test_local_code_executor_rejects_source_changed_after_workspace_preparation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "app.py"
+    source.write_text("def answer():\n    return 41\n", encoding="utf-8")
+    (repo / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    preparer = executor.patch_workspace_preparer
+    assert preparer is not None
+    original_prepare = preparer.prepare_patched_workspace
+
+    def prepare_then_change_source(**kwargs):
+        details = original_prepare(**kwargs)
+        source.write_text("def answer():\n    return 43\n", encoding="utf-8")
+        return details
+
+    monkeypatch.setattr(preparer, "prepare_patched_workspace", prepare_then_change_source)
+    try:
+        with pytest.raises(WorkflowRunnerError, match="no longer match the patch base"):
+            executor.execute(
+                task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+                run=Run(id="run-1", task_id="task-1"),
+                step=_step("test_changes"),
+                agent=_agent(),
+                context=context,
+            )
+    finally:
+        storage.close()
 
 
 def test_local_code_executor_isolates_workspace_by_step(tmp_path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "app.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
-    executor = LocalCodeExecutor(
-        model_gateway=ModelGateway({"mock": MockModelAdapter()}),
-        workspace_root=tmp_path / "workspaces",
+    source = repo / "app.py"
+    source.write_text("def answer():\n    return 42\n", encoding="utf-8")
+    (repo / "test_app.py").write_text(
+        "from app import answer\n\n\ndef test_answer():\n    assert answer() == 43\n",
+        encoding="utf-8",
+    )
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 42", "    return 43"),
     )
     run = Run(id="run-1", task_id="task-1")
 
@@ -126,22 +312,25 @@ def test_local_code_executor_isolates_workspace_by_step(tmp_path) -> None:
         agent=_agent(),
         context={},
     )
-    test_output = executor.execute(
-        task=_task(repo),
-        run=run,
-        step=_step("test_changes"),
-        agent=_agent(),
-        context={},
-    )
+    try:
+        test_output = executor.execute(
+            task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+            run=run,
+            step=_step("test_changes"),
+            agent=_agent(),
+            context=context,
+        )
+    finally:
+        storage.close()
 
-    assert f"workspaces\\{run.id}\\prepare_patch\\repo" in patch_output.artifacts[0].content or (
-        f"workspaces/{run.id}/prepare_patch/repo" in patch_output.artifacts[0].content
-    )
-    assert f"workspaces\\{run.id}\\test_changes\\repo" in test_output.artifacts[0].content or (
-        f"workspaces/{run.id}/test_changes/repo" in test_output.artifacts[0].content
-    )
+    assert str((tmp_path / "workspaces").resolve()) not in patch_output.artifacts[0].content
+    assert str((tmp_path / "workspaces").resolve()) not in test_output.artifacts[0].content
     assert (tmp_path / "workspaces" / run.id / "prepare_patch" / "repo").is_dir()
     assert (tmp_path / "workspaces" / run.id / "test_changes" / "repo").is_dir()
+    assert source.read_text(encoding="utf-8") == "def answer():\n    return 42\n"
+    assert (tmp_path / "workspaces" / run.id / "test_changes" / "repo" / "app.py").read_text(
+        encoding="utf-8"
+    ) == "def answer():\n    return 43\n"
 
 
 def test_local_code_executor_rejects_dangerous_test_command(tmp_path) -> None:
@@ -161,6 +350,367 @@ def test_local_code_executor_rejects_dangerous_test_command(tmp_path) -> None:
             agent=_agent(),
             context={},
         )
+
+
+def test_local_code_executor_rejects_missing_test_command_before_model_call(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    executor = LocalCodeExecutor(
+        model_gateway=ModelGateway({"mock": MockModelAdapter()}),
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="test_command is required"):
+        executor.execute(
+            task=_task(repo),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context={},
+        )
+
+
+def test_local_code_executor_requires_explicit_host_execution_opt_in(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+
+    try:
+        with pytest.raises(WorkflowRunnerError, match="allow_host_test_execution=true"):
+            executor.execute(
+                task=_task(
+                    repo,
+                    inputs={
+                        "test_command": "python -m pytest -q",
+                        "allow_host_test_execution": False,
+                    },
+                ),
+                run=Run(id="run-1", task_id="task-1"),
+                step=_step("test_changes"),
+                agent=_agent(),
+                context=context,
+            )
+    finally:
+        storage.close()
+
+
+def test_local_code_executor_marks_breaking_patch_test_failure(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "app.py"
+    source.write_text("def answer():\n    return 42\n", encoding="utf-8")
+    (repo / "test_app.py").write_text(
+        "from app import answer\n\n\ndef test_answer():\n    assert answer() == 42\n",
+        encoding="utf-8",
+    )
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 42", "    return 43"),
+    )
+    adapter = CountingMockAdapter()
+    executor.model_gateway = ModelGateway({"mock": adapter})
+
+    try:
+        output = executor.execute(
+            task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context=context,
+        )
+    finally:
+        storage.close()
+
+    assert output.eval_results[0].status.value == "fail"
+    assert "failed with exit code" in output.summary
+    assert adapter.calls == 0
+    assert source.read_text(encoding="utf-8") == "def answer():\n    return 42\n"
+
+
+def test_local_code_executor_rejects_all_skipped_test_run_without_model_review(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    (repo / "test_app.py").write_text(
+        "import pytest\n\n"
+        "def test_answer():\n"
+        "    pytest.skip('no executable assertion')\n",
+        encoding="utf-8",
+    )
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    adapter = CountingMockAdapter()
+    executor.model_gateway = ModelGateway({"mock": adapter})
+
+    try:
+        output = executor.execute(
+            task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context=context,
+        )
+    finally:
+        storage.close()
+
+    assert output.eval_results[0].status == EvalStatus.FAIL
+    assert "no non-skipped tests" in output.summary.lower()
+    assert adapter.calls == 0
+
+
+def test_local_code_executor_rejects_invalid_patch_before_model_call(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(tmp_path, "# Patch\n\nNo unified diff.\n")
+    adapter = CountingMockAdapter()
+    executor.model_gateway = ModelGateway({"mock": adapter})
+
+    from app.core import local_code_executor as executor_module
+
+    monkeypatch.setattr(
+        executor_module,
+        "_run_test_command",
+        lambda *args, **kwargs: pytest.fail("test command must not run for an invalid patch"),
+    )
+
+    try:
+        with pytest.raises(WritebackError, match="fenced unified diff"):
+            executor.execute(
+                task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+                run=Run(id="run-1", task_id="task-1"),
+                step=_step("test_changes"),
+                agent=_agent(),
+                context=context,
+            )
+    finally:
+        storage.close()
+    assert adapter.calls == 0
+
+
+def test_local_code_executor_rejects_tampered_patch_artifact(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    artifact_id = context["previous_handoff"]["artifact_refs"][0]
+    artifact = storage.get_artifact(artifact_id)
+    assert artifact is not None
+    assert executor.artifact_store is not None
+    (executor.artifact_store.root_dir / artifact.path).write_text("tampered", encoding="utf-8")
+
+    try:
+        with pytest.raises(WorkflowRunnerError, match="content hash"):
+            executor.execute(
+                task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+                run=Run(id="run-1", task_id="task-1"),
+                step=_step("test_changes"),
+                agent=_agent(),
+                context=context,
+            )
+    finally:
+        storage.close()
+
+
+def test_local_code_executor_rechecks_patch_after_test_before_model_review(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    adapter = CountingMockAdapter()
+    executor.model_gateway = ModelGateway({"mock": adapter})
+    artifact = storage.get_artifact(context["previous_handoff"]["artifact_refs"][0])
+    assert artifact is not None
+    assert executor.artifact_store is not None
+
+    def passing_test_that_tampers_artifact(*args, **kwargs):
+        (executor.artifact_store.root_dir / artifact.path).write_text("tampered", encoding="utf-8")
+        return LocalTestCommandResult(command="python -m pytest -q", exit_code=0)
+
+    from app.core import local_code_executor as executor_module
+
+    monkeypatch.setattr(executor_module, "_run_test_command", passing_test_that_tampers_artifact)
+    try:
+        with pytest.raises(WorkflowRunnerError, match="content hash"):
+            executor.execute(
+                task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+                run=Run(id="run-1", task_id="task-1"),
+                step=_step("test_changes"),
+                agent=_agent(),
+                context=context,
+            )
+    finally:
+        storage.close()
+
+    assert adapter.calls == 0
+
+
+def test_patch_application_preserves_no_newline_marker(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "app.py"
+    source.write_text("value = 1", encoding="utf-8", newline="")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        "# Patch\n\n"
+        "```diff\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-value = 1\n"
+        "\\ No newline at end of file\n"
+        "+value = 2\n"
+        "\\ No newline at end of file\n"
+        "```\n",
+    )
+    try:
+        output = executor.execute(
+            task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context=context,
+        )
+    finally:
+        storage.close()
+
+    applied = tmp_path / "workspaces" / "run-1" / "test_changes" / "repo" / "app.py"
+    assert applied.read_bytes() == b"value = 2"
+    assert output.eval_results[0].status == EvalStatus.FAIL
+
+
+def test_patch_application_rejects_inconsistent_new_hunk_start(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("value = 1\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        "# Patch\n\n"
+        "```diff\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +9 @@\n"
+        "-value = 1\n"
+        "+value = 2\n"
+        "```\n",
+    )
+    try:
+        with pytest.raises(WritebackConflict, match="does not apply cleanly"):
+            executor.execute(
+                task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+                run=Run(id="run-1", task_id="task-1"),
+                step=_step("test_changes"),
+                agent=_agent(),
+                context=context,
+            )
+    finally:
+        storage.close()
+
+
+def test_local_code_executor_rejects_patch_from_incomplete_attempt(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    patch_attempt = storage.get_agent_run("agent-run-1")
+    assert patch_attempt is not None
+    storage.update_agent_run(patch_attempt.model_copy(update={"status": AgentRunStatus.FAILED}))
+
+    try:
+        with pytest.raises(WorkflowRunnerError, match="completed prepare_patch attempt"):
+            executor.execute(
+                task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+                run=Run(id="run-1", task_id="task-1"),
+                step=_step("test_changes"),
+                agent=_agent(),
+                context=context,
+            )
+    finally:
+        storage.close()
+
+
+def test_local_code_executor_rejects_patch_from_superseded_completed_attempt(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    storage.create_agent_run(
+        AgentRun(
+            id="agent-run-2",
+            run_id="run-1",
+            agent_id="agent-1",
+            step_name="prepare_patch",
+            status=AgentRunStatus.COMPLETED,
+        )
+    )
+
+    try:
+        with pytest.raises(WorkflowRunnerError, match="current prepare_patch attempt"):
+            executor.execute(
+                task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+                run=Run(id="run-1", task_id="task-1"),
+                step=_step("test_changes"),
+                agent=_agent(),
+                context=context,
+            )
+    finally:
+        storage.close()
+
+
+def test_local_code_executor_marks_test_timeout_as_failure_without_model_call(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    adapter = CountingMockAdapter()
+    executor.model_gateway = ModelGateway({"mock": adapter})
+
+    from app.core import local_code_executor as executor_module
+
+    monkeypatch.setattr(
+        executor_module,
+        "_run_test_command",
+        lambda *args, **kwargs: LocalTestCommandResult(
+            command="python -m pytest -q",
+            exit_code=None,
+            timed_out=True,
+        ),
+    )
+    try:
+        output = executor.execute(
+            task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context=context,
+        )
+    finally:
+        storage.close()
+
+    assert output.eval_results[0].status == EvalStatus.FAIL
+    assert adapter.calls == 0
 
 
 def test_local_code_executor_rejects_missing_repository_path(tmp_path) -> None:
@@ -226,6 +776,189 @@ def test_writeback_preview_and_approve_applies_verified_diff(tmp_path) -> None:
     assert "writeback_previewed" in trace_dump
     assert "writeback_applied" in trace_dump
     assert "return 42" not in trace_dump
+    storage.close()
+
+
+def test_writeback_rejects_patch_from_superseded_prepare_attempt(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    artifact_store, trace_logger, storage = _artifact_store(tmp_path)
+    stale_artifact = artifact_store.write_text(
+        run_id="run-1",
+        agent_run_id="agent-run-1",
+        artifact_type=ArtifactType.PATCH,
+        filename="stale-patch.md",
+        content=_patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    storage.create_agent_run(
+        AgentRun(
+            id="agent-run-2",
+            run_id="run-1",
+            agent_id="agent-1",
+            step_name="prepare_patch",
+            status=AgentRunStatus.COMPLETED,
+        )
+    )
+    current_artifact = artifact_store.write_text(
+        run_id="run-1",
+        agent_run_id="agent-run-2",
+        artifact_type=ArtifactType.PATCH,
+        filename="current-patch.md",
+        content=_patch_artifact("app.py", "    return 41", "    return 43"),
+    )
+    service = WritebackService(artifact_store=artifact_store, trace_logger=trace_logger)
+    run = Run(id="run-1", task_id="task-1")
+    task = _task(repo)
+
+    with pytest.raises(WritebackError, match="current completed prepare_patch"):
+        service.preview(run=run, task=task, artifact=stale_artifact)
+
+    preview = service.preview(run=run, task=task, artifact=current_artifact)
+    assert preview["patch_artifact_id"] == current_artifact.id
+    storage.close()
+
+
+def test_writeback_revalidates_patch_ownership_after_long_running_tests(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "app.py"
+    source.write_text("def answer():\n    return 41\n", encoding="utf-8")
+    artifact_store, trace_logger, storage = _artifact_store(tmp_path)
+    artifact = artifact_store.write_text(
+        run_id="run-1",
+        agent_run_id="agent-run-1",
+        artifact_type=ArtifactType.PATCH,
+        filename="patch.md",
+        content=_patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    task = _task(repo, inputs={"test_command": "python -m pytest -q"})
+    run = Run(id="run-1", task_id=task.id)
+    service = WritebackService(
+        artifact_store=artifact_store,
+        trace_logger=trace_logger,
+        workspace_root=tmp_path / "writeback-workspaces",
+    )
+    preview = service.preview(run=run, task=task, artifact=artifact)
+
+    from app.core import writeback as writeback_module
+
+    def supersede_during_test(*args, **kwargs):
+        storage.create_agent_run(
+            AgentRun(
+                id="agent-run-2",
+                run_id=run.id,
+                agent_id="agent-1",
+                step_name="prepare_patch",
+                status=AgentRunStatus.COMPLETED,
+            )
+        )
+        artifact_store.write_text(
+            run_id=run.id,
+            agent_run_id="agent-run-2",
+            artifact_type=ArtifactType.PATCH,
+            filename="newer-patch.md",
+            content=_patch_artifact("app.py", "    return 41", "    return 43"),
+        )
+        return LocalTestCommandResult(command="python -m pytest -q", exit_code=0)
+
+    monkeypatch.setattr(writeback_module, "_run_test_command", supersede_during_test)
+
+    with pytest.raises(WritebackError, match="current completed prepare_patch"):
+        service.approve(
+            run=run,
+            task=task,
+            artifact=artifact,
+            writeback_id=preview["writeback_id"],
+            confirm_repository_path=str(repo),
+            confirm_patch_hash=preview["patch_hash"],
+            expected_base_hashes=preview["base_hashes"],
+        )
+    assert source.read_text(encoding="utf-8") == "def answer():\n    return 41\n"
+    storage.close()
+
+
+def test_writeback_preserves_trailing_spaces_on_final_diff_line(tmp_path, monkeypatch) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = repo / "note.md"
+    source.write_text("line\n", encoding="utf-8")
+    artifact_store, trace_logger, storage = _artifact_store(tmp_path)
+    artifact = artifact_store.write_text(
+        run_id="run-1",
+        agent_run_id="agent-run-1",
+        artifact_type=ArtifactType.PATCH,
+        filename="patch.md",
+        content=(
+            "# Patch\n\n"
+            "```diff\n"
+            "--- a/note.md\n"
+            "+++ b/note.md\n"
+            "@@ -1 +1 @@\n"
+            "-line\n"
+            "+Markdown hard break  \n"
+            "```\n"
+        ),
+    )
+    task = _task(repo, inputs={"test_command": "python -m pytest -q"})
+    run = Run(id="run-1", task_id=task.id)
+    service = WritebackService(
+        artifact_store=artifact_store,
+        trace_logger=trace_logger,
+        workspace_root=tmp_path / "writeback-workspaces",
+    )
+    preview = service.preview(run=run, task=task, artifact=artifact)
+
+    from app.core import writeback as writeback_module
+
+    monkeypatch.setattr(
+        writeback_module,
+        "_run_test_command",
+        lambda *args, **kwargs: LocalTestCommandResult(command="python -m pytest -q", exit_code=0),
+    )
+    service.approve(
+        run=run,
+        task=task,
+        artifact=artifact,
+        writeback_id=preview["writeback_id"],
+        confirm_repository_path=str(repo),
+        confirm_patch_hash=preview["patch_hash"],
+        expected_base_hashes=preview["base_hashes"],
+    )
+
+    assert source.read_bytes() == b"Markdown hard break  \n"
+    storage.close()
+
+
+def test_writeback_rejects_patch_from_failed_prepare_attempt(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    artifact_store, trace_logger, storage = _artifact_store(tmp_path)
+    failed_attempt = storage.create_agent_run(
+        AgentRun(
+            id="failed-agent-run",
+            run_id="run-1",
+            agent_id="agent-1",
+            step_name="prepare_patch",
+            status=AgentRunStatus.FAILED,
+        )
+    )
+    failed_artifact = artifact_store.write_text(
+        run_id="run-1",
+        agent_run_id=failed_attempt.id,
+        artifact_type=ArtifactType.PATCH,
+        filename="failed-patch.md",
+        content=_patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    service = WritebackService(artifact_store=artifact_store, trace_logger=trace_logger)
+
+    with pytest.raises(WritebackError, match="completed prepare_patch"):
+        service.preview(
+            run=Run(id="run-1", task_id="task-1"),
+            task=_task(repo),
+            artifact=failed_artifact,
+        )
     storage.close()
 
 
@@ -695,7 +1428,11 @@ task = Task(
     title="Fix answer",
     goal="Change answer from 41 to 42.",
     workflow_pack="code_rd_institutional",
-    inputs={"repository_path": repo, "test_command": "python -m pytest -q"},
+    inputs={
+        "repository_path": repo,
+        "test_command": "python -m pytest -q",
+        "allow_host_test_execution": True,
+    },
 )
 writeback._run_test_command = lambda *args, **kwargs: TestCommandResult(
     command="python -m pytest -q",
@@ -1074,13 +1811,67 @@ def _leave_successful_writeback_journal(tmp_path, monkeypatch) -> dict[str, obje
     }
 
 
+class CountingMockAdapter:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.requests = []
+
+    def complete(self, request):
+        self.calls += 1
+        self.requests.append(request)
+        return MockModelAdapter().complete(request)
+
+
+def _executor_with_patch(tmp_path: Path, patch_content: str):
+    artifact_store, trace_logger, storage = _artifact_store(tmp_path)
+    artifact = artifact_store.write_text(
+        run_id="run-1",
+        agent_run_id="agent-run-1",
+        artifact_type=ArtifactType.PATCH,
+        filename="patch.md",
+        content=patch_content,
+    )
+    executor = LocalCodeExecutor(
+        model_gateway=ModelGateway({"mock": MockModelAdapter()}),
+        artifact_store=artifact_store,
+        patch_workspace_preparer=WritebackService(
+            artifact_store=artifact_store,
+            trace_logger=trace_logger,
+            workspace_root=tmp_path / "workspaces",
+        ),
+        workspace_root=tmp_path / "workspaces",
+    )
+    handoff = storage.create_handoff(Handoff(
+        id="handoff-1",
+        run_id="run-1",
+        from_agent_run_id="agent-run-1",
+        to_agent_id=_agent().id,
+        summary="Prepared patch.",
+        artifact_refs=[artifact.id],
+        next_objective="test_changes",
+    ))
+    return executor, {
+        "previous_handoff": handoff.model_dump(mode="json"),
+        "dependency_lineage": {
+            "prepare_patch": {
+                "handoff_id": handoff.id,
+                "from_agent_run_id": "agent-run-1",
+            }
+        },
+    }, storage
+
+
 def _task(repo: Path, *, inputs: dict[str, object] | None = None) -> Task:
     return Task(
         id="task-1",
         title="Fix answer",
         goal="Change answer from 41 to 42.",
         workflow_pack="code_rd_institutional",
-        inputs={"repository_path": str(repo), **(inputs or {})},
+        inputs={
+            "repository_path": str(repo),
+            "allow_host_test_execution": True,
+            **(inputs or {}),
+        },
     )
 
 
@@ -1102,7 +1893,7 @@ def _step(name: str) -> WorkflowStep:
 
 def _agent() -> AgentDefinition:
     return AgentDefinition(
-        id="code_rd_institutional-implementation_executor",
+        id="agent-1",
         pack_name="code_rd_institutional",
         role="ImplementationExecutor",
         system_prompt="Prepare local code output.",
@@ -1164,7 +1955,13 @@ def _artifact_store(tmp_path):
         )
     )
     storage.create_agent_run(
-        AgentRun(id="agent-run-1", run_id="run-1", agent_id="agent-1", step_name="prepare_patch")
+        AgentRun(
+            id="agent-run-1",
+            run_id="run-1",
+            agent_id="agent-1",
+            step_name="prepare_patch",
+            status=AgentRunStatus.COMPLETED,
+        )
     )
     trace_logger = TraceLogger(storage)
     return ArtifactStore(tmp_path / "artifacts", storage, trace_logger), trace_logger, storage

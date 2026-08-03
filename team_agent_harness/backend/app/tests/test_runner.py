@@ -17,6 +17,7 @@ from app.core.models import (
     ArtifactType,
     EvalResult,
     EvalStatus,
+    Handoff,
     Run,
     RunStatus,
     RuntimeJobStatus,
@@ -630,6 +631,381 @@ def test_recovery_invalidates_completed_step_without_durable_gate_and_handoff(
     assert "Incomplete recovery checkpoint" in recovered_checkpoint.output_summary
 
 
+def test_recovery_invalidates_test_checkpoint_bound_to_superseded_patch_attempt(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    old_patch, old_handoff = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="old-patch-attempt",
+        handoff_id="old-patch-handoff",
+    )
+    old_test = _completed_test_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="old-test-attempt",
+        patch_attempt=old_patch,
+        patch_handoff=old_handoff,
+    )
+    storage.update_agent_run(old_patch.model_copy(update={"status": AgentRunStatus.CANCELLED}))
+    new_patch, _new_handoff = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="new-patch-attempt",
+        handoff_id="new-patch-handoff",
+    )
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    assert storage.get_agent_run(new_patch.id).status == AgentRunStatus.COMPLETED  # type: ignore[union-attr]
+    recovered_test = storage.get_agent_run(old_test.id)
+    assert recovered_test is not None
+    assert recovered_test.status == AgentRunStatus.CANCELLED
+    assert "dependency provenance" in recovered_test.output_summary
+
+
+def test_recovery_keeps_test_checkpoint_with_exact_patch_and_eval_provenance(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    patch_attempt, patch_handoff = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="patch-attempt",
+        handoff_id="patch-handoff",
+    )
+    test_attempt = _completed_test_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="test-attempt",
+        patch_attempt=patch_attempt,
+        patch_handoff=patch_handoff,
+    )
+    runner._record_eval_result(
+        run,
+        test_attempt,
+        "pack_warning",
+        EvalStatus.WARN,
+        "A pack-level warning must not invalidate the step gate.",
+        scope="pack",
+    )
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    assert storage.get_agent_run(patch_attempt.id).status == AgentRunStatus.COMPLETED  # type: ignore[union-attr]
+    assert storage.get_agent_run(test_attempt.id).status == AgentRunStatus.COMPLETED  # type: ignore[union-attr]
+
+
+def test_recovery_invalidates_ambiguous_required_eval_provenance(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    patch_attempt, patch_handoff = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="patch-attempt",
+        handoff_id="patch-handoff",
+    )
+    test_attempt = _completed_test_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="test-attempt",
+        patch_attempt=patch_attempt,
+        patch_handoff=patch_handoff,
+    )
+    runner._record_eval_result(
+        run,
+        test_attempt,
+        "patched_local_test_command",
+        EvalStatus.PASS,
+        "Duplicate evidence must not be accepted.",
+        scope="step_executor",
+    )
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    recovered_test = storage.get_agent_run(test_attempt.id)
+    assert recovered_test is not None
+    assert recovered_test.status == AgentRunStatus.CANCELLED
+    assert "required evaluation is missing or ambiguous" in recovered_test.output_summary
+
+
+def test_recovery_invalidates_source_checkpoint_with_duplicate_outgoing_handoff(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    patch_attempt, patch_handoff = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="patch-attempt",
+        handoff_id="patch-handoff",
+    )
+    storage.create_handoff(
+        patch_handoff.model_copy(update={"id": "duplicate-patch-handoff"})
+    )
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    recovered_patch = storage.get_agent_run(patch_attempt.id)
+    assert recovered_patch is not None
+    assert recovered_patch.status == AgentRunStatus.CANCELLED
+    assert "handoff" in recovered_patch.output_summary
+
+
+def test_recovery_invalidates_checkpoint_when_artifact_file_is_tampered(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    patch_attempt, patch_handoff = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="patch-attempt",
+        handoff_id="patch-handoff",
+    )
+    patch_artifact = storage.get_artifact(patch_handoff.artifact_refs[0])
+    assert patch_artifact is not None
+    (runner.artifact_store.root_dir / patch_artifact.path).write_text(
+        "tampered checkpoint bytes",
+        encoding="utf-8",
+    )
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    recovered_patch = storage.get_agent_run(patch_attempt.id)
+    assert recovered_patch is not None
+    assert recovered_patch.status == AgentRunStatus.CANCELLED
+    assert "artifact" in recovered_patch.output_summary
+
+
+def test_recovery_invalidates_final_checkpoint_when_artifact_file_is_missing(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    patch_attempt, patch_handoff = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="patch-attempt",
+        handoff_id="patch-handoff",
+    )
+    test_attempt = _completed_test_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="test-attempt",
+        patch_attempt=patch_attempt,
+        patch_handoff=patch_handoff,
+    )
+    test_artifact = next(
+        artifact
+        for artifact in storage.list_artifacts_for_run(run.id)
+        if artifact.agent_run_id == test_attempt.id
+    )
+    (runner.artifact_store.root_dir / test_artifact.path).unlink()
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    assert storage.get_agent_run(patch_attempt.id).status == AgentRunStatus.COMPLETED  # type: ignore[union-attr]
+    recovered_test = storage.get_agent_run(test_attempt.id)
+    assert recovered_test is not None
+    assert recovered_test.status == AgentRunStatus.CANCELLED
+    assert "artifact" in recovered_test.output_summary
+
+
+def test_recovery_rejects_multiple_canonical_patch_artifacts_in_handoff(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    patch_attempt, _ = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="patch-attempt",
+        handoff_id="patch-handoff",
+        patch_artifact_count=2,
+    )
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    recovered_patch = storage.get_agent_run(patch_attempt.id)
+    assert recovered_patch is not None
+    assert recovered_patch.status == AgentRunStatus.CANCELLED
+    assert "exactly one patch" in recovered_patch.output_summary.lower()
+
+
+def test_recovery_requires_exact_dependency_lineage_keys(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    patch_attempt, patch_handoff = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="patch-attempt",
+        handoff_id="patch-handoff",
+    )
+    test_attempt = _completed_test_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="test-attempt",
+        patch_attempt=patch_attempt,
+        patch_handoff=patch_handoff,
+    )
+    storage.update_agent_run(
+        test_attempt.model_copy(
+            update={
+                "input_context": {
+                    **test_attempt.input_context,
+                    "dependency_lineage": {
+                        **test_attempt.input_context["dependency_lineage"],
+                        "removed_dependency": {
+                            "handoff_id": "stale-handoff",
+                            "from_agent_run_id": "stale-attempt",
+                        },
+                    },
+                }
+            }
+        )
+    )
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    recovered_test = storage.get_agent_run(test_attempt.id)
+    assert recovered_test is not None
+    assert recovered_test.status == AgentRunStatus.CANCELLED
+    assert "dependency lineage keys" in recovered_test.output_summary
+
+
+def test_recovery_rejects_dependency_lineage_on_step_without_dependencies(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack, run, runner = _patch_test_recovery_setup(storage, runner_factory)
+    patch_attempt, _ = _completed_patch_checkpoint(
+        storage,
+        runner,
+        run,
+        attempt_id="patch-attempt",
+        handoff_id="patch-handoff",
+    )
+    storage.update_agent_run(
+        patch_attempt.model_copy(
+            update={
+                "input_context": {
+                    "dependency_lineage": {
+                        "forged": {
+                            "handoff_id": "forged-handoff",
+                            "from_agent_run_id": "forged-attempt",
+                        }
+                    }
+                }
+            }
+        )
+    )
+
+    runner.requeue_interrupted_run(run.id, pack)
+
+    recovered_patch = storage.get_agent_run(patch_attempt.id)
+    assert recovered_patch is not None
+    assert recovered_patch.status == AgentRunStatus.CANCELLED
+    assert "must not declare dependency lineage" in recovered_patch.output_summary
+
+
+def test_runner_rejects_handoff_artifact_owned_by_another_attempt(
+    storage: SQLiteStorage,
+    runner_factory,
+    monkeypatch,
+) -> None:
+    pack = WorkflowPack(
+        name="demo",
+        description="Reject mixed dependency provenance.",
+        agents=[
+            AgentDefinition(id="agent-builder", pack_name="demo", role="Builder", system_prompt="Build."),
+            AgentDefinition(id="agent-tester", pack_name="demo", role="Tester", system_prompt="Test."),
+        ],
+        steps=[
+            WorkflowStep(
+                name="prepare_patch",
+                agent_role="Builder",
+                produces_artifact_type=ArtifactType.PATCH.value,
+            ),
+            WorkflowStep(
+                name="test_changes",
+                agent_role="Tester",
+                depends_on=["prepare_patch"],
+                required_artifacts=[ArtifactType.PATCH.value],
+                produces_artifact_type=ArtifactType.TEST_REPORT.value,
+            ),
+        ],
+        final_artifact_type=ArtifactType.TEST_REPORT.value,
+    )
+    task = storage.create_task(
+        Task(
+            id="task-1",
+            title="Mixed provenance",
+            goal="Do not test an artifact from an older attempt.",
+            workflow_pack=pack.name,
+        )
+    )
+    run = storage.create_run(Run(id="run-1", task_id=task.id))
+    for agent in pack.agents:
+        storage.upsert_agent_definition(agent)
+    old_attempt = storage.create_agent_run(
+        AgentRun(
+            id="old-patch-attempt",
+            run_id=run.id,
+            agent_id="agent-builder",
+            step_name="prepare_patch",
+            status=AgentRunStatus.CANCELLED,
+        )
+    )
+    runner = runner_factory(DemoExecutor())
+    old_artifact = runner.artifact_store.write_text(
+        run_id=run.id,
+        agent_run_id=old_attempt.id,
+        artifact_type=ArtifactType.PATCH,
+        filename="old-patch.md",
+        content="# old patch",
+    )
+    original_create_handoff = storage.create_handoff
+
+    def create_mixed_handoff(handoff: Handoff) -> Handoff:
+        if handoff.next_objective == "test_changes":
+            handoff = handoff.model_copy(update={"artifact_refs": [old_artifact.id]})
+        return original_create_handoff(handoff)
+
+    monkeypatch.setattr(storage, "create_handoff", create_mixed_handoff)
+
+    with pytest.raises(WorkflowRunnerError, match="artifacts do not belong"):
+        runner.run(run, pack)
+
+    assert [
+        agent_run.step_name
+        for agent_run in storage.list_agent_runs_for_run(run.id)
+        if agent_run.step_name == "test_changes"
+    ] == ["test_changes"]
+    assert storage.list_agent_runs_for_run(run.id)[-1].status == AgentRunStatus.FAILED
+
+
 def test_third_step_receives_second_step_handoff(storage: SQLiteStorage, runner_factory) -> None:
     task = storage.create_task(
         Task(
@@ -1050,7 +1426,12 @@ def test_runner_allows_step_eval_pass_gate_when_executor_returns_pass(storage: S
     pack = base_pack.model_copy(
         update={
             "steps": [
-                base_pack.steps[0].model_copy(update={"requires_eval_pass": True})
+                base_pack.steps[0].model_copy(
+                    update={
+                        "requires_eval_pass": True,
+                        "required_eval_checks": ["write:quality_gate"],
+                    }
+                )
             ]
         }
     )
@@ -1058,6 +1439,88 @@ def test_runner_allows_step_eval_pass_gate_when_executor_returns_pass(storage: S
     final_run = runner_factory(PassingEvalExecutor()).run(Run(id="run-1", task_id=task.id), pack)
 
     assert final_run.status == RunStatus.COMPLETED
+
+
+def test_runner_rejects_missing_named_step_eval(storage: SQLiteStorage, runner_factory) -> None:
+    task = storage.create_task(
+        Task(
+            id="task-1",
+            title="Named eval gate task",
+            goal="Require the exact declared step eval result.",
+            workflow_pack="demo",
+            inputs={"brief": "Build a deterministic runner."},
+        )
+    )
+    base_pack = _single_step_pack()
+    pack = base_pack.model_copy(
+        update={
+            "steps": [
+                base_pack.steps[0].model_copy(
+                    update={
+                        "requires_eval_pass": True,
+                        "required_eval_checks": ["patched_local_test_command"],
+                    }
+                )
+            ]
+        }
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="missing required eval results"):
+        runner_factory(PassingEvalExecutor()).run(Run(id="run-1", task_id=task.id), pack)
+
+
+def test_runner_rejects_duplicate_named_step_eval(storage: SQLiteStorage, runner_factory) -> None:
+    task = storage.create_task(
+        Task(
+            id="task-1",
+            title="Ambiguous eval gate task",
+            goal="Reject duplicate required eval evidence.",
+            workflow_pack="demo",
+            inputs={"brief": "Build a deterministic runner."},
+        )
+    )
+    base_pack = _single_step_pack()
+    pack = base_pack.model_copy(
+        update={
+            "steps": [
+                base_pack.steps[0].model_copy(
+                    update={
+                        "requires_eval_pass": True,
+                        "required_eval_checks": ["write:quality_gate"],
+                    }
+                )
+            ]
+        }
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="ambiguous required eval results"):
+        runner_factory(DuplicateRequiredEvalExecutor()).run(Run(id="run-1", task_id=task.id), pack)
+
+
+def test_runner_rejects_executor_eval_using_structural_check_name(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    task = storage.create_task(
+        Task(
+            id="task-1",
+            title="Reserved eval name task",
+            goal="Keep structural and executor eval evidence distinct.",
+            workflow_pack="demo",
+            inputs={"brief": "Build a deterministic runner."},
+        )
+    )
+    base_pack = _single_step_pack()
+    pack = base_pack.model_copy(
+        update={
+            "steps": [
+                base_pack.steps[0].model_copy(update={"requires_eval_pass": True})
+            ]
+        }
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="cannot reuse the structural artifact check"):
+        runner_factory(StructuralNameEvalExecutor()).run(Run(id="run-1", task_id=task.id), pack)
 
 
 def test_runner_requires_artifact_gate_only_accepts_upstream_artifacts(
@@ -1106,7 +1569,7 @@ def test_runner_requires_artifact_gate_only_accepts_upstream_artifacts(
     assert storage.get_run("run-1").status == RunStatus.FAILED  # type: ignore[union-attr]
 
 
-def test_context_injector_truncates_upstream_handoffs_by_budget(
+def test_runner_retains_every_declared_dependency_handoff(
     storage: SQLiteStorage,
     runner_factory,
 ) -> None:
@@ -1143,6 +1606,7 @@ def test_context_injector_truncates_upstream_handoffs_by_budget(
                 name="merge",
                 agent_role="Reviewer",
                 depends_on=[step.name for step in branch_steps],
+                context_policy=ContextPolicy(max_upstream_handoffs=len(branch_steps)),
                 produces_artifact_type="final_report",
             ),
         ],
@@ -1153,7 +1617,7 @@ def test_context_injector_truncates_upstream_handoffs_by_budget(
     final_run = runner_factory(executor).run(Run(id="run-1", task_id=task.id), pack)
 
     assert final_run.status == RunStatus.COMPLETED
-    assert len(executor.upstream_handoffs_by_step["merge"]) == 8
+    assert len(executor.upstream_handoffs_by_step["merge"]) == 9
     context_events = [
         event
         for event in storage.list_trace_events_for_run("run-1")
@@ -1161,9 +1625,12 @@ def test_context_injector_truncates_upstream_handoffs_by_budget(
         and event.payload.get("action") == "context_envelope_built"
         and event.payload.get("step_name") == "merge"
     ]
-    assert context_events[-1].payload["upstream_handoff_count"] == 8
+    assert context_events[-1].payload["upstream_handoff_count"] == 9
     assert context_events[-1].payload["total_upstream_handoff_count"] == 9
-    assert context_events[-1].payload["dropped_context"][0]["source"] == "upstream_handoffs"
+    assert not any(
+        item["source"] == "upstream_handoffs"
+        for item in context_events[-1].payload["dropped_context"]
+    )
 
 
 def test_context_injector_reads_bounded_excerpts_from_completed_attempts_only(
@@ -1402,6 +1869,159 @@ class FailingSecondStepExecutor:
         return _step_output(step, ArtifactType.RESEARCH_NOTE)
 
 
+def _patch_test_recovery_setup(storage: SQLiteStorage, runner_factory):
+    pack = WorkflowPack(
+        name="demo",
+        description="Patch and test recovery workflow.",
+        agents=[
+            AgentDefinition(id="agent-builder", pack_name="demo", role="Builder", system_prompt="Build."),
+            AgentDefinition(id="agent-tester", pack_name="demo", role="Tester", system_prompt="Test."),
+        ],
+        steps=[
+            WorkflowStep(
+                name="prepare_patch",
+                agent_role="Builder",
+                produces_artifact_type=ArtifactType.PATCH.value,
+            ),
+            WorkflowStep(
+                name="test_changes",
+                agent_role="Tester",
+                depends_on=["prepare_patch"],
+                required_artifacts=[ArtifactType.PATCH.value],
+                produces_artifact_type=ArtifactType.TEST_REPORT.value,
+                requires_eval_pass=True,
+                required_eval_checks=["patched_local_test_command"],
+            ),
+        ],
+        final_artifact_type=ArtifactType.TEST_REPORT.value,
+    )
+    task = storage.create_task(
+        Task(
+            id="task-1",
+            title="Patch test recovery",
+            goal="Recover only checkpoints with exact durable provenance.",
+            workflow_pack=pack.name,
+        )
+    )
+    run = storage.create_run(
+        Run(
+            id="run-1",
+            task_id=task.id,
+            status=RunStatus.RUNNING,
+            current_step="test_changes",
+            started_at=datetime.now(UTC),
+        )
+    )
+    for agent in pack.agents:
+        storage.upsert_agent_definition(agent)
+    return pack, run, runner_factory(DemoExecutor())
+
+
+def _completed_patch_checkpoint(
+    storage: SQLiteStorage,
+    runner: WorkflowRunner,
+    run: Run,
+    *,
+    attempt_id: str,
+    handoff_id: str,
+    patch_artifact_count: int = 1,
+) -> tuple[AgentRun, Handoff]:
+    patch_attempt = storage.create_agent_run(
+        AgentRun(
+            id=attempt_id,
+            run_id=run.id,
+            agent_id="agent-builder",
+            step_name="prepare_patch",
+            status=AgentRunStatus.COMPLETED,
+        )
+    )
+    patch_artifacts = [
+        runner.artifact_store.write_text(
+            run_id=run.id,
+            agent_run_id=patch_attempt.id,
+            artifact_type=ArtifactType.PATCH,
+            filename=f"{attempt_id}-{index}.md",
+            content=f"# patch {index} from {attempt_id}",
+        )
+        for index in range(patch_artifact_count)
+    ]
+    runner._record_eval_result(
+        run,
+        patch_attempt,
+        "prepare_patch:artifacts_created",
+        EvalStatus.PASS,
+        "Patch artifact exists.",
+        patch_artifacts[0].id,
+        scope="step_structural",
+    )
+    handoff = storage.create_handoff(
+        Handoff(
+            id=handoff_id,
+            run_id=run.id,
+            from_agent_run_id=patch_attempt.id,
+            to_agent_id="agent-tester",
+            summary="Patch prepared.",
+            artifact_refs=[artifact.id for artifact in patch_artifacts],
+            next_objective="test_changes",
+        )
+    )
+    return patch_attempt, handoff
+
+
+def _completed_test_checkpoint(
+    storage: SQLiteStorage,
+    runner: WorkflowRunner,
+    run: Run,
+    *,
+    attempt_id: str,
+    patch_attempt: AgentRun,
+    patch_handoff: Handoff,
+) -> AgentRun:
+    test_attempt = storage.create_agent_run(
+        AgentRun(
+            id=attempt_id,
+            run_id=run.id,
+            agent_id="agent-tester",
+            step_name="test_changes",
+            input_context={
+                "dependency_lineage": {
+                    "prepare_patch": {
+                        "handoff_id": patch_handoff.id,
+                        "from_agent_run_id": patch_attempt.id,
+                    }
+                }
+            },
+            status=AgentRunStatus.COMPLETED,
+        )
+    )
+    test_artifact = runner.artifact_store.write_text(
+        run_id=run.id,
+        agent_run_id=test_attempt.id,
+        artifact_type=ArtifactType.TEST_REPORT,
+        filename=f"{attempt_id}.md",
+        content=f"# test report from {attempt_id}",
+    )
+    runner._record_eval_result(
+        run,
+        test_attempt,
+        "test_changes:artifacts_created",
+        EvalStatus.PASS,
+        "Test artifact exists.",
+        test_artifact.id,
+        scope="step_structural",
+    )
+    runner._record_eval_result(
+        run,
+        test_attempt,
+        "patched_local_test_command",
+        EvalStatus.PASS,
+        "The patched workspace tests passed.",
+        test_artifact.id,
+        scope="step_executor",
+    )
+    return test_attempt
+
+
 class FailingFirstStepEvalExecutor:
     def execute(
         self,
@@ -1608,6 +2228,51 @@ class PassingEvalExecutor:
             artifacts=output.artifacts,
             eval_results=[
                 EvalResult(run_id=run.id, check_name=f"{step.name}:quality_gate", status=EvalStatus.PASS)
+            ],
+        )
+
+
+class DuplicateRequiredEvalExecutor:
+    def execute(
+        self,
+        *,
+        task: Task,
+        run: Run,
+        step: WorkflowStep,
+        agent: AgentDefinition,
+        context: dict[str, Any],
+    ) -> AgentStepOutput:
+        output = _step_output(step, _artifact_type_for_step(step))
+        return AgentStepOutput(
+            summary=output.summary,
+            artifacts=output.artifacts,
+            eval_results=[
+                EvalResult(run_id=run.id, check_name=f"{step.name}:quality_gate", status=EvalStatus.PASS),
+                EvalResult(run_id=run.id, check_name=f"{step.name}:quality_gate", status=EvalStatus.PASS),
+            ],
+        )
+
+
+class StructuralNameEvalExecutor:
+    def execute(
+        self,
+        *,
+        task: Task,
+        run: Run,
+        step: WorkflowStep,
+        agent: AgentDefinition,
+        context: dict[str, Any],
+    ) -> AgentStepOutput:
+        output = _step_output(step, _artifact_type_for_step(step))
+        return AgentStepOutput(
+            summary=output.summary,
+            artifacts=output.artifacts,
+            eval_results=[
+                EvalResult(
+                    run_id=run.id,
+                    check_name=f"{step.name}:artifacts_created",
+                    status=EvalStatus.PASS,
+                )
             ],
         )
 

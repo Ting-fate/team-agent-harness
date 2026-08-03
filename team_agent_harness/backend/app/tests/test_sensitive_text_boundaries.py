@@ -5,6 +5,7 @@ import pytest
 from app.core.model_routing import ModelRoutingError, apply_model_routing_config, load_model_routing_config
 from app.core.model_runtime import _safe_provider_error_summary
 from app.core.role_cards import RoleCardError, read_role_card
+from app.core.sensitive_text import contains_secret_like_text, redact_secret_like_text
 from app.core.skill_library import SkillLibrary
 from app.packs.code_rd import get_code_rd_pack
 
@@ -16,6 +17,41 @@ PRIVATE_KEY_TEXT = "\n".join(
         "-----END " + "PRIVATE KEY-----",
     )
 )
+
+
+def test_output_only_markers_are_redacted_without_rejecting_normal_documents() -> None:
+    text = "payload=ordinary-observability-data short_key=sk-demo"
+
+    assert contains_secret_like_text(text) is False
+    assert redact_secret_like_text(text) == "payload=[REDACTED] short_key=sk-[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "max_tokens=4096",
+        "token_budget=1000",
+        "password_policy=rotate",
+        "api_key_name=OPENAI_API_KEY",
+    ),
+)
+def test_secret_related_configuration_names_are_not_treated_as_secret_values(text: str) -> None:
+    assert contains_secret_like_text(text) is False
+    assert redact_secret_like_text(text) == text
+
+
+def test_authorization_assignment_is_detected_and_redacted() -> None:
+    text = "Authorization=Basic not-a-real-credential"
+
+    assert contains_secret_like_text(text) is True
+    assert redact_secret_like_text(text) == "Authorization=Basic [REDACTED]"
+
+
+def test_quoted_authorization_assignment_is_fully_redacted() -> None:
+    text = '"Authorization": "Bearer not-a-real-credential"'
+
+    assert contains_secret_like_text(text) is True
+    assert redact_secret_like_text(text) == '"Authorization": "[REDACTED]"'
 
 
 def test_existing_role_card_with_private_key_is_rejected_on_read(tmp_path) -> None:

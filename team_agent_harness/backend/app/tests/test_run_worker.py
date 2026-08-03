@@ -10,6 +10,8 @@ from app.core.models import (
     AgentRunStatus,
     AgentSessionStatus,
     ArtifactType,
+    EvalResult,
+    EvalStatus,
     Handoff,
     Run,
     RunLock,
@@ -49,6 +51,10 @@ class BlockingExecutor:
                     content=f"# {step.name}\n",
                 )
             ],
+            eval_results=[
+                EvalResult(run_id=run.id, check_name=check_name, status=EvalStatus.PASS)
+                for check_name in step.required_eval_checks
+            ],
         )
 
 
@@ -67,6 +73,10 @@ class RecordingExecutor:
                     filename=f"{step.name}.md",
                     content=f"# {step.name}\n",
                 )
+            ],
+            eval_results=[
+                EvalResult(run_id=run.id, check_name=check_name, status=EvalStatus.PASS)
+                for check_name in step.required_eval_checks
             ],
         )
 
@@ -88,6 +98,7 @@ class ApprovalBlockingExecutor(RecordingExecutor):
             summary=output.summary,
             artifacts=output.artifacts,
             risk_notes=["No unresolved test risk."],
+            eval_results=output.eval_results,
         )
 
 
@@ -812,6 +823,43 @@ def test_worker_retries_transient_queue_item_read_without_stopping(tmp_path, mon
         _wait_for_worker_unscheduled(state.run_worker, submitted["id"])
 
 
+def test_worker_recovers_storage_error_after_run_activation(tmp_path, monkeypatch) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    state = app.state.harness
+    original_get_task = state.storage.get_task
+    injected = False
+
+    def fail_once_after_run_activation(task_id):
+        nonlocal injected
+        if not injected and state.storage.list_runs_by_statuses({RunStatus.RUNNING}):
+            injected = True
+            raise StorageError("transient task read after run activation")
+        return original_get_task(task_id)
+
+    monkeypatch.setattr(state.storage, "get_task", fail_once_after_run_activation)
+
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Recover activated storage failure",
+                "goal": "Resume without leaving RUNNING/FAILED state behind.",
+                "workflow_pack": "code_rd",
+            },
+        ).json()
+        submitted = client.post(
+            "/runs",
+            json={"task_id": task["id"], "background": True},
+        ).json()
+        completed = _wait_for_terminal_run(client, submitted["id"])
+
+        assert injected is True
+        assert completed["status"] == RunStatus.COMPLETED.value
+        queue_items = state.storage.list_run_queue_items_for_run(submitted["id"])
+        assert queue_items[-1].status == RunQueueItemStatus.COMPLETED
+        assert state.run_worker.is_running is True
+
+
 def test_worker_stop_leaves_backlog_persisted_and_restartable(tmp_path) -> None:
     executor = BlockingExecutor()
     app = create_app(
@@ -894,6 +942,48 @@ def test_worker_retries_terminal_queue_write_without_state_contradiction(tmp_pat
             submitted["id"],
             [RunQueueItemStatus.COMPLETED],
         )
+        assert failures == 1
+        assert state.run_worker.is_running is True
+
+
+def test_worker_retries_transient_terminal_lock_release_failure(tmp_path, monkeypatch) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    state = app.state.harness
+    original_update = state.storage.update_run_lock
+    failures = 0
+
+    def fail_first_release(lock):
+        nonlocal failures
+        if lock.status == RunLockStatus.RELEASED and failures == 0:
+            failures += 1
+            raise StorageError("transient lock release failure")
+        return original_update(lock)
+
+    monkeypatch.setattr(state.storage, "update_run_lock", fail_first_release)
+
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Lock release retry",
+                "goal": "Release the run lock after a transient storage failure.",
+                "workflow_pack": "code_rd",
+            },
+        ).json()
+        submitted = client.post(
+            "/runs",
+            json={"task_id": task["id"], "background": True},
+        ).json()
+        completed = _wait_for_terminal_run(client, submitted["id"])
+
+        assert completed["status"] == RunStatus.COMPLETED.value
+        deadline = monotonic() + 1
+        while monotonic() < deadline:
+            locks = state.storage.list_run_locks_for_run(submitted["id"])
+            if locks and all(lock.status == RunLockStatus.RELEASED for lock in locks):
+                break
+            sleep(0.01)
+        assert locks and all(lock.status == RunLockStatus.RELEASED for lock in locks)
         assert failures == 1
         assert state.run_worker.is_running is True
 
@@ -1039,6 +1129,15 @@ def test_worker_terminalizes_legacy_partial_runtime_intent_on_startup(
             },
         ).json()
         run = client.post("/runs", json={"task_id": task["id"]}).json()
+        if job_step == "test_changes":
+            initial_jobs = client.get(f"/runs/{run['id']}/runtime-jobs").json()
+            prepare_patch_job = next(
+                job for job in initial_jobs if job["step_name"] == "prepare_patch"
+            )
+            approve_patch = client.post(
+                f"/runs/{run['id']}/runtime-jobs/{prepare_patch_job['id']}/approve"
+            )
+            assert approve_patch.status_code == 200
         patch_job = next(
             job
             for job in client.get(f"/runs/{run['id']}/runtime-jobs").json()
@@ -1130,6 +1229,170 @@ def test_worker_terminalizes_queue_item_when_workflow_pack_is_missing(tmp_path) 
         persisted_queue_item = state.storage.get_run_queue_item(queue_item.id)
         assert persisted_queue_item is not None
         assert persisted_queue_item.status == RunQueueItemStatus.FAILED
+
+
+def test_worker_missing_pack_terminalizes_open_runtime_state(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    state = app.state.harness
+
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Missing pack with approval state",
+                "goal": "Cancel every open runtime record when configuration disappears.",
+                "workflow_pack": "code_rd_institutional",
+            },
+        ).json()
+        waiting = client.post("/runs", json={"task_id": task["id"]}).json()
+        assert waiting["status"] == RunStatus.WAITING.value
+        run = state.storage.get_run(waiting["id"])
+        assert run is not None
+        open_agent_run_ids = [
+            agent_run.id
+            for agent_run in state.storage.list_agent_runs_for_run(run.id)
+            if agent_run.status not in {
+                AgentRunStatus.COMPLETED,
+                AgentRunStatus.FAILED,
+                AgentRunStatus.CANCELLED,
+            }
+        ]
+        open_session_ids = [
+            session.id
+            for session in state.storage.list_agent_sessions_for_run(run.id)
+            if session.status not in {
+                AgentSessionStatus.COMPLETED,
+                AgentSessionStatus.FAILED,
+                AgentSessionStatus.REJECTED,
+                AgentSessionStatus.CANCELLED,
+            }
+        ]
+        open_job_ids = [
+            job.id
+            for job in state.storage.list_runtime_jobs_for_run(run.id)
+            if job.status not in {
+                RuntimeJobStatus.COMPLETED,
+                RuntimeJobStatus.FAILED,
+                RuntimeJobStatus.REJECTED,
+                RuntimeJobStatus.CANCELLED,
+            }
+        ]
+        assert open_agent_run_ids and open_session_ids and open_job_ids
+        state.storage.update_run(run.model_copy(update={"status": RunStatus.QUEUED}))
+        queue_item = state.storage.create_run_queue_item(
+            RunQueueItem(
+                id="missing-pack-open-runtime-queue",
+                run_id=run.id,
+                action="background_approved_resume",
+                metadata={"background_worker_started": True},
+            )
+        )
+        state.run_worker.packs.pop("code_rd_institutional")
+
+        state.run_worker._execute(queue_item)
+
+        assert state.storage.get_run(run.id).status == RunStatus.FAILED  # type: ignore[union-attr]
+        assert all(
+            state.storage.get_agent_run(agent_run_id).status == AgentRunStatus.CANCELLED  # type: ignore[union-attr]
+            for agent_run_id in open_agent_run_ids
+        )
+        assert all(
+            state.storage.get_agent_session(session_id).status == AgentSessionStatus.CANCELLED  # type: ignore[union-attr]
+            for session_id in open_session_ids
+        )
+        assert all(
+            state.storage.get_runtime_job(job_id).status == RuntimeJobStatus.CANCELLED  # type: ignore[union-attr]
+            for job_id in open_job_ids
+        )
+
+
+def test_worker_rolls_back_missing_pack_terminal_state_when_queue_write_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    state = app.state.harness
+    task = state.storage.create_task(
+        Task(
+            id="missing-pack-task",
+            title="Missing pack",
+            goal="Keep run and queue state atomic.",
+            workflow_pack="missing-pack",
+        )
+    )
+    run = state.storage.create_run(Run(id="missing-pack-run", task_id=task.id))
+    queue_item = state.storage.create_run_queue_item(
+        RunQueueItem(
+            id="missing-pack-queue",
+            run_id=run.id,
+            action="background_start_run",
+            metadata={"background_worker_started": True},
+        )
+    )
+    original_update = state.storage.update_run_queue_item
+
+    def fail_terminal_queue_write(item):
+        if item.id == queue_item.id and item.status == RunQueueItemStatus.FAILED:
+            raise StorageError("terminal queue write failed")
+        return original_update(item)
+
+    monkeypatch.setattr(state.storage, "update_run_queue_item", fail_terminal_queue_write)
+
+    with pytest.raises(StorageError, match="terminal queue write failed"):
+        state.run_worker._execute(queue_item)
+
+    persisted_run = state.storage.get_run(run.id)
+    persisted_queue_item = state.storage.get_run_queue_item(queue_item.id)
+    assert persisted_run is not None
+    assert persisted_queue_item is not None
+    assert persisted_run.status == RunStatus.QUEUED
+    assert persisted_run.finished_at is None
+    assert persisted_queue_item.status == RunQueueItemStatus.QUEUED
+
+
+def test_run_loop_retries_atomic_terminalization_after_unhandled_queue_write_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    state = app.state.harness
+    task = state.storage.create_task(
+        Task(
+            id="missing-pack-task",
+            title="Missing pack",
+            goal="Retry the full terminal transaction from the real worker loop.",
+            workflow_pack="missing-pack",
+        )
+    )
+    run = state.storage.create_run(Run(id="missing-pack-run", task_id=task.id))
+    queue_item = state.storage.create_run_queue_item(
+        RunQueueItem(
+            id="missing-pack-queue",
+            run_id=run.id,
+            action="background_start_run",
+            metadata={"background_worker_started": True},
+        )
+    )
+    original_update = state.storage.update_run_queue_item
+    terminal_attempts = 0
+
+    def fail_first_terminal_queue_write(item):
+        nonlocal terminal_attempts
+        if item.id == queue_item.id and item.status == RunQueueItemStatus.FAILED:
+            terminal_attempts += 1
+            if terminal_attempts == 1:
+                raise RuntimeError("first terminal queue write failed")
+        return original_update(item)
+
+    monkeypatch.setattr(state.storage, "update_run_queue_item", fail_first_terminal_queue_write)
+
+    with TestClient(app) as client:
+        failed = _wait_for_terminal_run(client, run.id)
+        persisted_queue_item = state.storage.get_run_queue_item(queue_item.id)
+        assert failed["status"] == RunStatus.FAILED.value
+        assert persisted_queue_item is not None
+        assert persisted_queue_item.status == RunQueueItemStatus.FAILED
+        assert terminal_attempts >= 2
 
 
 def test_worker_terminalizes_run_when_executor_factory_fails(tmp_path) -> None:

@@ -88,6 +88,22 @@ def test_artifact_store_writes_file_metadata_and_trace(seeded_storage) -> None:
     assert trace_events[0].payload["artifact_id"] == artifact.id
 
 
+def test_artifact_excerpt_rejects_content_changed_after_metadata_persisted(seeded_storage) -> None:
+    db, run, agent_run, tmp_path = seeded_storage
+    store = ArtifactStore(tmp_path / "artifacts", db, TraceLogger(db))
+    artifact = store.write_text(
+        run_id=run.id,
+        agent_run_id=agent_run.id,
+        artifact_type=ArtifactType.PATCH,
+        filename="patch.md",
+        content="# original patch\n",
+    )
+    (store.root_dir / artifact.path).write_text("# tampered patch\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactStoreError, match="content hash"):
+        store.read_text_excerpt(artifact, max_chars=8)
+
+
 def test_artifact_store_rejects_unsafe_filenames(seeded_storage) -> None:
     db, run, agent_run, tmp_path = seeded_storage
     store = ArtifactStore(tmp_path / "artifacts", db, TraceLogger(db))

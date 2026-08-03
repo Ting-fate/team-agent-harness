@@ -12,7 +12,7 @@ import stat
 from threading import RLock
 from typing import Any
 
-from app.core.artifacts import ArtifactStore
+from app.core.artifacts import ArtifactStore, ArtifactStoreError
 from app.core.local_code_executor import (
     _DEFAULT_TEST_TIMEOUT_SECONDS,
     _EXCLUDED_DIR_NAMES,
@@ -20,10 +20,11 @@ from app.core.local_code_executor import (
     _is_sensitive_name,
     _positive_int,
     _prepare_workspace,
+    _require_host_test_execution_opt_in,
     _resolve_repository_path,
     _run_test_command,
 )
-from app.core.models import Artifact, ArtifactType, Run, Task, TraceEventType
+from app.core.models import AgentRunStatus, Artifact, ArtifactType, Run, Task, TraceEventType
 from app.core.trace import TraceLogger
 
 
@@ -42,6 +43,7 @@ _WRITEBACK_APPROVAL_LOCK = RLock()
 class _DiffLine:
     kind: str
     text: str
+    no_newline: bool = False
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,33 @@ class WritebackService:
             )
             return plan.public_dict(dry_run_status="ready")
 
+    def prepare_patched_workspace(
+        self,
+        *,
+        run: Run,
+        task: Task,
+        artifact: Artifact,
+        workspace_path: Path,
+    ) -> dict[str, Any]:
+        plan = self._build_plan(run=run, task=task, artifact=artifact)
+        workspace_path = Path(workspace_path).expanduser().resolve()
+        self._validate_isolated_workspace(workspace_path, plan.repository_path)
+        _prepare_workspace(plan.repository_path, workspace_path)
+        self._apply_plan_to_workspace(plan, workspace_path)
+        return plan.public_dict(dry_run_status="applied_to_isolated_workspace")
+
+    def _validate_isolated_workspace(self, workspace_path: Path, repository_path: Path) -> None:
+        workspace_path = workspace_path.expanduser().resolve()
+        repository_path = repository_path.expanduser().resolve()
+        if workspace_path == self.workspace_root or not workspace_path.is_relative_to(self.workspace_root):
+            raise WritebackError("Patched workspace must stay below the configured workspace root.")
+        if (
+            _same_path(workspace_path, repository_path)
+            or repository_path.is_relative_to(workspace_path)
+            or workspace_path.is_relative_to(repository_path)
+        ):
+            raise WritebackError("Patched workspace and source repository must be disjoint.")
+
     def approve(
         self,
         *,
@@ -198,20 +227,31 @@ class WritebackService:
                     raise WritebackConflict(f"Base hash mismatch for {change.path}; original repository changed.")
 
             workspace_path = self.workspace_root / run.id / plan.writeback_id / "repo"
+            self._validate_isolated_workspace(workspace_path, source_path)
             _prepare_workspace(source_path, workspace_path)
             self._apply_plan_to_workspace(plan, workspace_path)
 
             command = task.inputs.get("test_command")
+            _require_host_test_execution_opt_in(task.inputs.get("allow_host_test_execution"))
             timeout_seconds = _positive_int(
                 task.inputs.get("test_timeout_seconds"),
                 default=_DEFAULT_TEST_TIMEOUT_SECONDS,
                 maximum=900,
             )
-            test_result = _run_test_command(command, workspace_path, timeout_seconds)
+            test_result = _run_test_command(
+                command,
+                workspace_path,
+                timeout_seconds,
+                source_path=source_path,
+            )
             if not test_result.command:
                 raise WritebackError("test_command is required before writeback approval.")
-            if test_result.command and test_result.exit_code != 0:
+            if test_result.command and not test_result.passed:
                 raise WritebackConflict(f"Patched workspace tests did not pass: {test_result.summary}")
+
+            post_test_patch_hash, post_test_writeback_id = self._patch_identity(run=run, artifact=artifact)
+            if post_test_patch_hash != patch_hash or post_test_writeback_id != writeback_id:
+                raise WritebackConflict("Patch identity changed while writeback tests were running.")
 
             transaction_path, transaction = self._prepare_transaction(run=run, artifact=artifact, plan=plan)
             file_patches = self._validate_transaction_identity(transaction_path, transaction)
@@ -276,8 +316,8 @@ class WritebackService:
             return result
 
     def _patch_identity(self, *, run: Run, artifact: Artifact) -> tuple[str, str]:
-        _validate_patch_artifact(run, artifact)
-        artifact_content = self.artifact_store.read_text(artifact)
+        _validate_patch_artifact(run, artifact, storage=self.artifact_store.storage)
+        artifact_content = _read_verified_patch_artifact(self.artifact_store, artifact)
         diff_text = _extract_unified_diff(artifact_content)
         patch_hash = sha256(diff_text.encode("utf-8")).hexdigest()
         writeback_id = sha256(f"{run.id}:{artifact.id}:{patch_hash}".encode("utf-8")).hexdigest()[:24]
@@ -331,9 +371,9 @@ class WritebackService:
         return None
 
     def _build_plan(self, *, run: Run, task: Task, artifact: Artifact) -> WritebackPlan:
-        _validate_patch_artifact(run, artifact)
+        _validate_patch_artifact(run, artifact, storage=self.artifact_store.storage)
         source_path = _resolve_repository_path(task.inputs.get("repository_path"))
-        artifact_content = self.artifact_store.read_text(artifact)
+        artifact_content = _read_verified_patch_artifact(self.artifact_store, artifact)
         diff_text = _extract_unified_diff(artifact_content)
         patch_hash = sha256(diff_text.encode("utf-8")).hexdigest()
         file_patches = _parse_unified_diff(diff_text)
@@ -360,6 +400,10 @@ class WritebackService:
     def _apply_plan_to_workspace(self, plan: WritebackPlan, workspace_path: Path) -> None:
         for change in plan.files:
             target = _safe_repo_file(workspace_path, change.path, focus_paths=None)
+            if _content_hash(_read_utf8_exact(target)) != change.base_hash:
+                raise WritebackConflict(
+                    f"Base hash mismatch for {change.path}; isolated workspace does not match the patch base."
+                )
             target.write_text(change.new_content, encoding="utf-8", newline="")
 
     def _apply_plan_to_source(
@@ -661,21 +705,51 @@ class WritebackService:
         return self.workspace_root / "_transactions" / writeback_id
 
 
-def _validate_patch_artifact(run: Run, artifact: Artifact) -> None:
+def _validate_patch_artifact(run: Run, artifact: Artifact, *, storage: Any) -> None:
     if artifact.run_id != run.id:
         raise WritebackError("Patch artifact does not belong to the run.")
     if artifact.type != ArtifactType.PATCH:
         raise WritebackError("writeback requires a patch artifact.")
+    source_attempt = storage.get_agent_run(artifact.agent_run_id)
+    if (
+        source_attempt is None
+        or source_attempt.run_id != run.id
+        or source_attempt.step_name != "prepare_patch"
+        or source_attempt.status != AgentRunStatus.COMPLETED
+    ):
+        raise WritebackError("writeback requires a patch from a completed prepare_patch attempt.")
+    completed_attempts = [
+        candidate
+        for candidate in storage.list_agent_runs_for_run(run.id)
+        if candidate.step_name == "prepare_patch"
+        and candidate.status == AgentRunStatus.COMPLETED
+    ]
+    if not completed_attempts or completed_attempts[-1].id != source_attempt.id:
+        raise WritebackError(
+            "writeback patch must belong to the current completed prepare_patch attempt."
+        )
+
+
+def _read_verified_patch_artifact(artifact_store: ArtifactStore, artifact: Artifact) -> str:
+    try:
+        return artifact_store.read_text_verified(artifact)
+    except ArtifactStoreError as exc:
+        raise WritebackError("Patch artifact content does not match durable metadata.") from exc
 
 
 def _extract_unified_diff(content: str) -> str:
-    fenced = re.findall(r"```(?:diff|patch)\s*\n(.*?)```", content, flags=re.IGNORECASE | re.DOTALL)
+    fenced = re.findall(
+        r"^[ \t]*```(?:diff|patch)[ \t]*\r?\n(.*?)^[ \t]*```[ \t]*$",
+        content,
+        flags=re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
     for candidate in fenced:
-        diff = candidate.strip()
-        if not diff:
+        if not candidate.strip():
             continue
-        if "diff --git " in diff or ("\n--- " in f"\n{diff}" and "\n+++ " in f"\n{diff}"):
-            return diff + "\n"
+        if "diff --git " in candidate or (
+            "\n--- " in f"\n{candidate}" and "\n+++ " in f"\n{candidate}"
+        ):
+            return candidate
     raise WritebackError("Patch artifact does not contain a fenced unified diff.")
 
 
@@ -780,6 +854,9 @@ def _parse_hunk(lines: list[str], start_index: int) -> tuple[_DiffHunk, int]:
         if line.startswith("@@ ") or line.startswith("diff --git ") or line.startswith("--- "):
             break
         if line.startswith("\\ No newline at end of file"):
+            if not hunk_lines or hunk_lines[-1].no_newline:
+                raise WritebackError("Unified diff no-newline marker is misplaced.")
+            hunk_lines[-1] = replace(hunk_lines[-1], no_newline=True)
             index += 1
             continue
         if not line or line[0] not in {" ", "+", "-"}:
@@ -900,32 +977,47 @@ def _apply_file_patch(file_patch: _FilePatch, original: str) -> str:
     output: list[str] = []
     cursor = 0
     for hunk in file_patch.hunks:
-        target_index = hunk.old_start - 1
+        target_index = _hunk_start_index(hunk.old_start, hunk.old_count)
         if target_index < cursor or target_index > len(original_lines):
             raise WritebackConflict(f"Patch does not apply cleanly to {file_patch.path}.")
         output.extend(original_lines[cursor:target_index])
+        if _hunk_start_index(hunk.new_start, hunk.new_count) != len(output):
+            raise WritebackConflict(f"Patch does not apply cleanly to {file_patch.path}.")
         cursor = target_index
         for diff_line in hunk.lines:
             if diff_line.kind == " ":
-                _assert_source_line(file_patch.path, original_lines, cursor, diff_line.text)
+                _assert_source_line(file_patch.path, original_lines, cursor, diff_line)
                 output.append(original_lines[cursor])
                 cursor += 1
             elif diff_line.kind == "-":
-                _assert_source_line(file_patch.path, original_lines, cursor, diff_line.text)
+                _assert_source_line(file_patch.path, original_lines, cursor, diff_line)
                 cursor += 1
             elif diff_line.kind == "+":
-                output.append(diff_line.text)
+                output.append(
+                    diff_line.text.rstrip("\r\n") if diff_line.no_newline else diff_line.text
+                )
             else:
                 raise WritebackError("Unsupported diff line kind.")
     output.extend(original_lines[cursor:])
     return "".join(output)
 
 
-def _assert_source_line(path: str, original_lines: list[str], cursor: int, expected: str) -> None:
+def _assert_source_line(
+    path: str,
+    original_lines: list[str],
+    cursor: int,
+    expected: _DiffLine,
+) -> None:
     if cursor >= len(original_lines):
         raise WritebackConflict(f"Patch does not apply cleanly to {path}.")
-    if _line_body(original_lines[cursor]) != _line_body(expected):
+    actual = original_lines[cursor]
+    actual_has_newline = actual.endswith(("\r", "\n"))
+    if _line_body(actual) != _line_body(expected.text) or actual_has_newline == expected.no_newline:
         raise WritebackConflict(f"Patch does not apply cleanly to {path}.")
+
+
+def _hunk_start_index(start: int, count: int) -> int:
+    return start if count == 0 else start - 1
 
 
 def _line_body(value: str) -> str:

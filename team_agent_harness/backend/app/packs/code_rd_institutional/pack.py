@@ -183,9 +183,14 @@ def get_code_rd_institutional_pack() -> WorkflowPack:
             WorkflowStep(
                 name="test_changes",
                 agent_role="TestExecutor",
-                required_artifacts=[ArtifactType.SOURCE_SUMMARY.value, ArtifactType.DESIGN_DOC.value, ArtifactType.RESEARCH_NOTE.value],
+                required_artifacts=[
+                    ArtifactType.SOURCE_SUMMARY.value,
+                    ArtifactType.DESIGN_DOC.value,
+                    ArtifactType.RESEARCH_NOTE.value,
+                    ArtifactType.PATCH.value,
+                ],
                 allowed_tools=["read_file", "run_test_command", "write_artifact"],
-                depends_on=["dispatch_work"],
+                depends_on=["prepare_patch"],
                 phase="execution",
                 context_policy=ContextPolicy(artifact_excerpt_chars=16000, max_artifacts=6, max_upstream_handoffs=4),
                 produces_artifact_type=ArtifactType.TEST_REPORT.value,
@@ -201,6 +206,8 @@ def get_code_rd_institutional_pack() -> WorkflowPack:
                     resume_strategy="latest_artifact_and_trace",
                     requires_approval=True,
                 ),
+                requires_eval_pass=True,
+                required_eval_checks=["patched_local_test_command"],
                 ownership={
                     "artifacts": [ArtifactType.TEST_REPORT.value],
                     "workspaces": ["test_changes"],

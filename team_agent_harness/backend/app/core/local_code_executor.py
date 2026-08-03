@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from hashlib import sha256
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
@@ -10,12 +11,15 @@ import shlex
 import stat
 import subprocess
 import sys
-from typing import Any, BinaryIO, Iterator
+import xml.etree.ElementTree as ElementTree
+from typing import Any, BinaryIO, Iterator, Protocol
+from uuid import uuid4
 
 if os.name == "nt":
     import ctypes
     from ctypes import wintypes
 
+from app.core.artifacts import ArtifactStore, ArtifactStoreError
 from app.core.model_runtime import (
     ModelGateway,
     ModelMessage,
@@ -24,8 +28,18 @@ from app.core.model_runtime import (
     context_message_from_envelope,
     default_reasoning_effort_for_model,
 )
-from app.core.models import AgentDefinition, ArtifactType, EvalResult, EvalStatus, Run, Task
+from app.core.models import (
+    AgentDefinition,
+    AgentRunStatus,
+    Artifact,
+    ArtifactType,
+    EvalResult,
+    EvalStatus,
+    Run,
+    Task,
+)
 from app.core.runner import AgentArtifactOutput, AgentStepOutput, WorkflowRunnerError
+from app.core.sensitive_text import redact_secret_like_text
 from app.packs.base import WorkflowStep
 
 
@@ -96,6 +110,58 @@ _MAX_COMMAND_OUTPUT_CHARS = 20_000
 _DEFAULT_TEST_TIMEOUT_SECONDS = 120
 _MAX_WORKSPACE_COPY_FILES = 20_000
 _MAX_WORKSPACE_COPY_BYTES = 500_000_000
+_NON_EXECUTING_PYTEST_OPTIONS = {
+    "--cache-show",
+    "--co",
+    "--collect-only",
+    "--fixtures",
+    "--fixtures-per-test",
+    "--funcargs",
+    "--help",
+    "--markers",
+    "--setup-only",
+    "--setup-plan",
+    "--trace-config",
+    "--version",
+}
+_ALLOWED_PYTEST_FLAG_OPTIONS = {
+    "--disable-warnings",
+    "--exitfirst",
+    "--failed-first",
+    "--last-failed",
+    "--new-first",
+    "--no-header",
+    "--no-summary",
+    "--quiet",
+    "--stepwise",
+    "--stepwise-skip",
+    "--strict-config",
+    "--strict-markers",
+    "--verbose",
+}
+_ALLOWED_PYTEST_VALUE_OPTIONS = {
+    "--capture",
+    "--color",
+    "--durations",
+    "--durations-min",
+    "--maxfail",
+    "--tb",
+    "--verbosity",
+}
+_TEST_ENVIRONMENT_ALLOWLIST = {
+    "COMSPEC",
+    "LANG",
+    "LC_ALL",
+    "NUMBER_OF_PROCESSORS",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "SYSTEMROOT",
+    "TZ",
+    "WINDIR",
+}
 
 
 @dataclass(frozen=True)
@@ -106,14 +172,30 @@ class RepositorySnapshot:
     skipped: list[str] = field(default_factory=list)
 
 
+class PatchWorkspacePreparer(Protocol):
+    def prepare_patched_workspace(
+        self,
+        *,
+        run: Run,
+        task: Task,
+        artifact: Artifact,
+        workspace_path: Path,
+    ) -> dict[str, Any]:
+        ...
+
+
 class LocalCodeExecutor:
     def __init__(
         self,
         *,
         model_gateway: ModelGateway | None = None,
+        artifact_store: ArtifactStore | None = None,
+        patch_workspace_preparer: PatchWorkspacePreparer | None = None,
         workspace_root: str | Path = "output/local_code_workspaces",
     ) -> None:
         self.model_gateway = model_gateway or ModelGateway()
+        self.artifact_store = artifact_store
+        self.patch_workspace_preparer = patch_workspace_preparer
         self.workspace_root = Path(workspace_root).expanduser().resolve()
 
     def supports(self, task: Task, step: WorkflowStep) -> bool:
@@ -132,9 +214,59 @@ class LocalCodeExecutor:
         agent: AgentDefinition,
         context: dict[str, Any],
     ) -> AgentStepOutput:
+        try:
+            return self._execute(
+                task=task,
+                run=run,
+                step=step,
+                agent=agent,
+                context=context,
+            )
+        except Exception as exc:
+            sanitized = _sanitize_local_executor_error(
+                exc,
+                repository_value=task.inputs.get("repository_path"),
+                workspace_root=self.workspace_root,
+            )
+            if sanitized == str(exc):
+                raise
+            raise WorkflowRunnerError(sanitized) from exc
+
+    def _execute(
+        self,
+        *,
+        task: Task,
+        run: Run,
+        step: WorkflowStep,
+        agent: AgentDefinition,
+        context: dict[str, Any],
+    ) -> AgentStepOutput:
         source_path = _resolve_repository_path(task.inputs.get("repository_path"))
         workspace_path = self._workspace_path(run, step)
-        _prepare_workspace(source_path, workspace_path)
+        _validate_isolated_workspace(source_path, workspace_path)
+        patch_artifact: Artifact | None = None
+        patch_details: dict[str, Any] = {}
+        if step.name == "prepare_patch":
+            _prepare_workspace(source_path, workspace_path)
+        elif step.name == "test_changes":
+            _require_test_command(task.inputs.get("test_command"))
+            _require_host_test_execution_opt_in(task.inputs.get("allow_host_test_execution"))
+            patch_artifact = self._patch_artifact_for_test(
+                run=run,
+                step=step,
+                agent=agent,
+                context=context,
+            )
+            if self.patch_workspace_preparer is None:
+                raise WorkflowRunnerError("Patched workspace preparation is not configured.")
+            patch_details = self.patch_workspace_preparer.prepare_patched_workspace(
+                run=run,
+                task=task,
+                artifact=patch_artifact,
+                workspace_path=workspace_path,
+            )
+        else:
+            raise WorkflowRunnerError(f"Local code executor does not support step: {step.name}")
         snapshot = _snapshot_repository(
             source_path=source_path,
             workspace_path=workspace_path,
@@ -143,12 +275,108 @@ class LocalCodeExecutor:
 
         if step.name == "prepare_patch":
             return self._prepare_patch(task, run, step, agent, context, snapshot)
-        if step.name == "test_changes":
-            return self._test_changes(task, run, step, agent, context, snapshot)
-        raise WorkflowRunnerError(f"Local code executor does not support step: {step.name}")
+        return self._test_changes(
+            task,
+            run,
+            step,
+            agent,
+            context,
+            snapshot,
+            patch_artifact,
+            patch_details,
+        )
 
     def _workspace_path(self, run: Run, step: WorkflowStep) -> Path:
-        return self.workspace_root / run.id / step.name / "repo"
+        workspace_path = (self.workspace_root / run.id / step.name / "repo").resolve()
+        if not workspace_path.is_relative_to(self.workspace_root) or workspace_path == self.workspace_root:
+            raise WorkflowRunnerError("Local code workspace path must stay under workspace_root.")
+        return workspace_path
+
+    def _patch_artifact_for_test(
+        self,
+        *,
+        run: Run,
+        step: WorkflowStep,
+        agent: AgentDefinition,
+        context: dict[str, Any],
+    ) -> Artifact:
+        if self.artifact_store is None:
+            raise WorkflowRunnerError("Artifact storage is not configured for patched workspace testing.")
+        handoff_payload = context.get("previous_handoff")
+        if not isinstance(handoff_payload, dict):
+            raise WorkflowRunnerError("test_changes requires a completed prepare_patch handoff.")
+        handoff_id = handoff_payload.get("id")
+        if not isinstance(handoff_id, str) or not handoff_id:
+            raise WorkflowRunnerError("test_changes patch handoff is missing its canonical id.")
+        handoff = self.artifact_store.storage.get_handoff(handoff_id)
+        if handoff is None:
+            raise WorkflowRunnerError("test_changes patch handoff was not found in durable storage.")
+        if (
+            handoff.run_id != run.id
+            or handoff.next_objective != step.name
+            or handoff.to_agent_id != agent.id
+        ):
+            raise WorkflowRunnerError("test_changes received a patch handoff for a different run or step.")
+        source_agent_run_id = handoff.from_agent_run_id
+        artifact_refs = handoff.artifact_refs
+        if (
+            not artifact_refs
+            or any(not isinstance(artifact_id, str) or not artifact_id for artifact_id in artifact_refs)
+            or len(set(artifact_refs)) != len(artifact_refs)
+        ):
+            raise WorkflowRunnerError("test_changes patch handoff has invalid artifact references.")
+
+        source_agent_run = self.artifact_store.storage.get_agent_run(source_agent_run_id)
+        if (
+            source_agent_run is None
+            or source_agent_run.run_id != run.id
+            or source_agent_run.step_name != "prepare_patch"
+            or source_agent_run.status != AgentRunStatus.COMPLETED
+        ):
+            raise WorkflowRunnerError("test_changes patch must come from a completed prepare_patch attempt.")
+        completed_patch_attempts = [
+            candidate
+            for candidate in self.artifact_store.storage.list_agent_runs_for_run(run.id)
+            if candidate.step_name == "prepare_patch"
+            and candidate.status == AgentRunStatus.COMPLETED
+        ]
+        if not completed_patch_attempts or completed_patch_attempts[-1].id != source_agent_run.id:
+            raise WorkflowRunnerError("test_changes patch must come from the current prepare_patch attempt.")
+        dependency_lineage = context.get("dependency_lineage")
+        lineage_entry = (
+            dependency_lineage.get("prepare_patch")
+            if isinstance(dependency_lineage, dict)
+            else None
+        )
+        if not isinstance(lineage_entry, dict) or (
+            lineage_entry.get("handoff_id") != handoff.id
+            or lineage_entry.get("from_agent_run_id") != source_agent_run.id
+        ):
+            raise WorkflowRunnerError("test_changes dependency lineage does not match its patch handoff.")
+
+        referenced_artifacts: list[Artifact] = []
+        for artifact_id in artifact_refs:
+            artifact = self.artifact_store.storage.get_artifact(artifact_id)
+            if (
+                artifact is None
+                or artifact.run_id != run.id
+                or artifact.agent_run_id != source_agent_run.id
+            ):
+                raise WorkflowRunnerError(
+                    "test_changes patch handoff references an artifact outside its completed attempt."
+                )
+            referenced_artifacts.append(artifact)
+        patch_artifacts = [artifact for artifact in referenced_artifacts if artifact.type == ArtifactType.PATCH]
+        if len(patch_artifacts) != 1:
+            raise WorkflowRunnerError("test_changes requires exactly one patch artifact from prepare_patch.")
+        patch_artifact = patch_artifacts[0]
+        try:
+            self.artifact_store.read_text_verified(patch_artifact)
+        except ArtifactStoreError as exc:
+            raise WorkflowRunnerError(
+                "test_changes patch artifact content hash does not match durable metadata."
+            ) from exc
+        return patch_artifact
 
     def _prepare_patch(
         self,
@@ -200,38 +428,75 @@ class LocalCodeExecutor:
         agent: AgentDefinition,
         context: dict[str, Any],
         snapshot: RepositorySnapshot,
+        patch_artifact: Artifact | None,
+        patch_details: dict[str, Any],
     ) -> AgentStepOutput:
-        command = task.inputs.get("test_command")
+        if patch_artifact is None:
+            raise WorkflowRunnerError("test_changes requires a patch artifact.")
+        command = _require_test_command(task.inputs.get("test_command"))
         timeout_seconds = _positive_int(
             task.inputs.get("test_timeout_seconds"),
             default=_DEFAULT_TEST_TIMEOUT_SECONDS,
             maximum=900,
         )
-        test_result = _run_test_command(command, snapshot.workspace_path, timeout_seconds)
-        model_request = _model_request(
-            task=task,
-            step=step,
-            agent=agent,
-            context={
-                **context,
-                "test_command": command,
-                "test_exit_code": test_result.exit_code,
-            },
-            snapshot=snapshot,
-            instruction=(
-                "Review the local test result. Summarize pass/fail status, likely causes, "
-                "and residual risk. Do not claim any patch was applied."
-            ),
-            extra=f"\n\n## Test Result\n\n{test_result.markdown()}\n",
-            max_tokens=_max_tokens(agent, default=3000),
+        source_hashes_before = _source_hashes_for_test(snapshot, patch_details)
+        _validate_source_hashes_match_patch_base(source_hashes_before, patch_details)
+        test_result = _run_test_command(
+            command,
+            snapshot.workspace_path,
+            timeout_seconds,
+            source_path=snapshot.source_path,
         )
-        model_response = self.model_gateway.complete(model_request)
-        content = _test_artifact_content(task, run, snapshot, test_result, model_response)
-        eval_status = EvalStatus.PASS if test_result.exit_code == 0 else EvalStatus.WARN
-        if test_result.exit_code is None:
-            eval_status = EvalStatus.WARN
+        if _source_hashes_for_test(snapshot, patch_details) != source_hashes_before:
+            raise WorkflowRunnerError(
+                "Source repository patch targets changed while the host test command was running."
+            )
+        if self.artifact_store is None:
+            raise WorkflowRunnerError("Artifact storage is not configured for patched workspace testing.")
+        try:
+            self.artifact_store.read_text_verified(patch_artifact)
+        except ArtifactStoreError as exc:
+            raise WorkflowRunnerError(
+                "test_changes patch artifact content hash does not match durable metadata."
+            ) from exc
+        model_request: ModelRequest | None = None
+        model_response: ModelResponse | None = None
+        if test_result.passed:
+            model_request = _model_request(
+                task=task,
+                step=step,
+                agent=agent,
+                context={
+                    **context,
+                    "test_command": command,
+                    "test_exit_code": test_result.exit_code,
+                    "tested_patch_artifact_id": patch_artifact.id,
+                    "tested_patch_hash": patch_details.get("patch_hash"),
+                    "patched_files": patch_details.get("files_changed", []),
+                },
+                snapshot=snapshot,
+                instruction=(
+                    "Review the successful local test result and summarize residual risk. "
+                    "The patch was applied only to the isolated workspace; do not claim the "
+                    "original repository was modified."
+                ),
+                extra=f"\n\n## Test Result\n\n{test_result.markdown()}\n",
+                max_tokens=_max_tokens(agent, default=3000),
+            )
+            model_response = self.model_gateway.complete(model_request)
+        content = _test_artifact_content(
+            task,
+            run,
+            snapshot,
+            patch_artifact,
+            patch_details,
+            test_result,
+            model_response,
+        )
+        eval_status = EvalStatus.PASS if test_result.passed else EvalStatus.FAIL
+        safe_summary = _snapshot_safe_text(test_result.summary, snapshot)
         return AgentStepOutput(
-            summary=test_result.summary,
+            summary=safe_summary,
             artifacts=[
                 AgentArtifactOutput(
                     type=ArtifactType.TEST_REPORT,
@@ -241,16 +506,15 @@ class LocalCodeExecutor:
                 )
             ],
             risk_notes=[
-                "Tests ran in an isolated workspace copy, not the original repository."
-                if test_result.command
-                else "No test_command was provided; no local tests were executed.",
+                "Tests ran in a disjoint working copy under the current host user; this is not an OS security sandbox.",
+                "Patch-target files in the source repository were hash-checked before and after the test command.",
             ],
             eval_results=[
                 EvalResult(
                     run_id=run.id,
-                    check_name="local_test_command",
+                    check_name="patched_local_test_command",
                     status=eval_status,
-                    message=test_result.summary,
+                    message=safe_summary,
                 )
             ],
             model_request=model_request,
@@ -265,6 +529,23 @@ class TestCommandResult:
     stdout: str = ""
     stderr: str = ""
     timed_out: bool = False
+    execution_verified: bool | None = None
+    total_tests: int = 0
+    skipped_tests: int = 0
+    failed_tests: int = 0
+    error_tests: int = 0
+    verification_error: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return bool(
+            self.command
+            and not self.timed_out
+            and self.exit_code == 0
+            and self.execution_verified is not False
+            and self.failed_tests == 0
+            and self.error_tests == 0
+        )
 
     @property
     def summary(self) -> str:
@@ -272,7 +553,9 @@ class TestCommandResult:
             return "No test command provided; local tests were not run."
         if self.timed_out:
             return f"Test command timed out after execution: {self.command}"
-        if self.exit_code == 0:
+        if self.exit_code == 0 and self.verification_error:
+            return f"Test command rejected because {self.verification_error}: {self.command}"
+        if self.passed:
             return f"Test command passed: {self.command}"
         return f"Test command failed with exit code {self.exit_code}: {self.command}"
 
@@ -281,6 +564,10 @@ class TestCommandResult:
             f"- Command: `{self.command or 'not provided'}`\n"
             f"- Exit code: `{self.exit_code if self.exit_code is not None else 'not run'}`\n"
             f"- Timed out: `{self.timed_out}`\n\n"
+            f"- Execution evidence verified: `{self.execution_verified}`\n"
+            f"- Test cases: total `{self.total_tests}`, skipped `{self.skipped_tests}`, "
+            f"failed `{self.failed_tests}`, errors `{self.error_tests}`\n"
+            f"- Evidence error: `{self.verification_error or 'none'}`\n\n"
             "### stdout\n\n"
             f"```text\n{self.stdout}\n```\n\n"
             "### stderr\n\n"
@@ -293,10 +580,21 @@ def _resolve_repository_path(value: Any) -> Path:
         raise WorkflowRunnerError("repository_path must be a non-empty local directory path.")
     path = Path(value).expanduser().resolve()
     if not path.exists() or not path.is_dir():
-        raise WorkflowRunnerError(f"repository_path is not a directory: {path}")
+        raise WorkflowRunnerError("repository_path does not reference an existing local directory.")
     if path == Path(path.anchor):
         raise WorkflowRunnerError("repository_path must not be a drive root.")
     return path
+
+
+def _validate_isolated_workspace(source_path: Path, workspace_path: Path) -> None:
+    if (
+        source_path == workspace_path
+        or source_path.is_relative_to(workspace_path)
+        or workspace_path.is_relative_to(source_path)
+    ):
+        raise WorkflowRunnerError(
+            "Local code workspace and source repository must be disjoint."
+        )
 
 
 def _prepare_workspace(source_path: Path, workspace_path: Path) -> None:
@@ -868,19 +1166,28 @@ def _model_request(
     return ModelRequest(
         provider=provider,
         model=model,
-        system_prompt=agent.system_prompt,
+        system_prompt=_snapshot_safe_text(agent.system_prompt, snapshot),
         messages=[
-            ModelMessage(role="user", content=f"Task: {task.title}\nGoal: {task.goal}"),
-            ModelMessage(role="user", content=context_message_from_envelope(context)),
             ModelMessage(
                 role="user",
-                content=(
-                    f"Step: {step.name}\n"
-                    f"Instruction: {instruction}\n"
-                    f"Constraints: {task.constraints}\n"
-                    f"Acceptance criteria: {task.acceptance_criteria}\n"
-                    f"Repository context:\n{_snapshot_markdown(snapshot)}"
-                    f"{extra}"
+                content=_snapshot_safe_text(f"Task: {task.title}\nGoal: {task.goal}", snapshot),
+            ),
+            ModelMessage(
+                role="user",
+                content=context_message_from_envelope(_model_safe_context(context, snapshot)),
+            ),
+            ModelMessage(
+                role="user",
+                content=_snapshot_safe_text(
+                    (
+                        f"Step: {step.name}\n"
+                        f"Instruction: {instruction}\n"
+                        f"Constraints: {task.constraints}\n"
+                        f"Acceptance criteria: {task.acceptance_criteria}\n"
+                        f"Repository context:\n{_snapshot_markdown(snapshot)}"
+                        f"{extra}"
+                    ),
+                    snapshot,
                 ),
             ),
         ],
@@ -889,7 +1196,7 @@ def _model_request(
         reasoning_effort=reasoning_effort,
         tools_allowed=step.allowed_tools,
         metadata={
-            "task_title": task.title,
+            "task_title": _snapshot_safe_text(task.title, snapshot),
             "step_name": step.name,
             "agent_id": agent.id,
             "agent_role": agent.role,
@@ -902,8 +1209,8 @@ def _model_request(
 
 def _snapshot_markdown(snapshot: RepositorySnapshot) -> str:
     parts = [
-        f"- Source repository: `{snapshot.source_path}`",
-        f"- Isolated workspace: `{snapshot.workspace_path}`",
+        f"- Repository label: `{snapshot.source_path.name}`",
+        "- Workspace: disjoint local working copy",
         f"- Included files: `{len(snapshot.files)}`",
     ]
     if snapshot.skipped:
@@ -923,16 +1230,16 @@ def _patch_artifact_content(
     return (
         "# Local Code Patch Proposal\n\n"
         f"- Run: `{run.id}`\n"
-        f"- Task: `{task.title}`\n"
-        f"- Source repository: `{snapshot.source_path}`\n"
-        f"- Isolated workspace: `{snapshot.workspace_path}`\n"
-        "- Original repository modified: `false`\n\n"
+        f"- Task: `{_snapshot_safe_text(task.title, snapshot)}`\n"
+        f"- Repository label: `{snapshot.source_path.name}`\n"
+        "- Workspace: disjoint local working copy\n"
+        "- Source repository write requested: `false`\n\n"
         "## Included Repository Files\n\n"
         + "\n".join(f"- `{path}`" for path in sorted(snapshot.files))
         + "\n\n## Skipped Files\n\n"
         + ("\n".join(f"- {item}" for item in snapshot.skipped) if snapshot.skipped else "- None")
         + "\n\n## Model Patch Proposal\n\n"
-        + _redact(model_response.text)
+        + _snapshot_safe_text(model_response.text, snapshot)
         + "\n"
     )
 
@@ -941,31 +1248,76 @@ def _test_artifact_content(
     task: Task,
     run: Run,
     snapshot: RepositorySnapshot,
+    patch_artifact: Artifact,
+    patch_details: dict[str, Any],
     test_result: TestCommandResult,
-    model_response: ModelResponse,
+    model_response: ModelResponse | None,
 ) -> str:
+    changed_files = patch_details.get("files_changed")
+    changed_files_text = ", ".join(
+        str(item.get("path"))
+        for item in changed_files
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    ) if isinstance(changed_files, list) else ""
     return (
         "# Local Code Test Report\n\n"
         f"- Run: `{run.id}`\n"
-        f"- Task: `{task.title}`\n"
-        f"- Source repository: `{snapshot.source_path}`\n"
-        f"- Isolated workspace: `{snapshot.workspace_path}`\n"
-        "- Original repository modified: `false`\n\n"
+        f"- Task: `{_snapshot_safe_text(task.title, snapshot)}`\n"
+        f"- Repository label: `{snapshot.source_path.name}`\n"
+        "- Workspace: disjoint local working copy\n"
+        f"- Tested patch artifact: `{patch_artifact.id}`\n"
+        f"- Tested patch hash: `{patch_details.get('patch_hash', 'unknown')}`\n"
+        f"- Patched files: `{changed_files_text or 'unknown'}`\n"
+        "- Patch applied to isolated workspace: `true`\n"
+        "- Source patch-target hashes unchanged during test: `true`\n"
+        "- Host process security sandbox: `false`\n\n"
         "## Command Result\n\n"
-        f"Summary: {test_result.summary}\n\n"
-        + test_result.markdown()
+        f"Summary: {_snapshot_safe_text(test_result.summary, snapshot)}\n\n"
+        + _snapshot_safe_text(test_result.markdown(), snapshot)
         + "\n## Model Test Review\n\n"
-        + _redact(model_response.text)
+        + (
+            _snapshot_safe_text(model_response.text, snapshot)
+            if model_response is not None
+            else "Skipped because the deterministic local test command did not pass."
+        )
         + "\n"
     )
 
 
-def _run_test_command(command: Any, workspace_path: Path, timeout_seconds: int) -> TestCommandResult:
+def _require_test_command(command: Any) -> str:
+    if command is None or command == "":
+        raise WorkflowRunnerError("test_command is required for patched workspace testing.")
+    if not isinstance(command, str):
+        raise WorkflowRunnerError("test_command must be a string.")
+    _parse_allowed_test_command(command)
+    return command
+
+
+def _require_host_test_execution_opt_in(value: Any) -> None:
+    if value is not True:
+        raise WorkflowRunnerError(
+            "allow_host_test_execution=true is required because patched tests run with the current host user; "
+            "the disjoint working copy is not an OS security sandbox."
+        )
+
+
+def _run_test_command(
+    command: Any,
+    workspace_path: Path,
+    timeout_seconds: int,
+    *,
+    source_path: Path | None = None,
+) -> TestCommandResult:
     if command is None or command == "":
         return TestCommandResult(command=None, exit_code=None)
     if not isinstance(command, str):
         raise WorkflowRunnerError("test_command must be a string.")
     args = _parse_allowed_test_command(command)
+    runtime_root = _test_runtime_root(workspace_path)
+    evidence_path = runtime_root / f"pytest-evidence-{uuid4().hex}.xml"
+    separator_index = args.index("--") if "--" in args else len(args)
+    args[separator_index:separator_index] = ["--junitxml", str(evidence_path)]
+    environment = _sanitized_environment(workspace_path)
     try:
         completed = subprocess.run(
             args,
@@ -974,23 +1326,83 @@ def _run_test_command(command: Any, workspace_path: Path, timeout_seconds: int) 
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
-            env=_sanitized_environment(),
+            env=environment,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
         return TestCommandResult(
             command=command,
             exit_code=None,
-            stdout=_truncate_output(_redact(exc.stdout or "")),
-            stderr=_truncate_output(_redact(exc.stderr or "")),
+            stdout=_sanitize_test_output(exc.stdout or "", workspace_path, evidence_path, source_path),
+            stderr=_sanitize_test_output(exc.stderr or "", workspace_path, evidence_path, source_path),
             timed_out=True,
+            execution_verified=False,
+            verification_error="pytest execution timed out before evidence could be accepted",
         )
+    try:
+        evidence = _read_pytest_evidence(evidence_path)
+    finally:
+        evidence_path.unlink(missing_ok=True)
     return TestCommandResult(
         command=command,
         exit_code=completed.returncode,
-        stdout=_truncate_output(_redact(completed.stdout)),
-        stderr=_truncate_output(_redact(completed.stderr)),
+        stdout=_sanitize_test_output(completed.stdout, workspace_path, evidence_path, source_path),
+        stderr=_sanitize_test_output(completed.stderr, workspace_path, evidence_path, source_path),
+        **evidence,
     )
+
+
+def _read_pytest_evidence(evidence_path: Path) -> dict[str, Any]:
+    try:
+        root = ElementTree.parse(evidence_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return {
+            "execution_verified": False,
+            "verification_error": "pytest did not produce valid independent test-case evidence",
+        }
+
+    tag = root.tag.rsplit("}", 1)[-1]
+    if tag == "testsuite":
+        suites = [root]
+    elif tag == "testsuites":
+        suites = [child for child in root if child.tag.rsplit("}", 1)[-1] == "testsuite"]
+    else:
+        suites = []
+    try:
+        total = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+        skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+        failed = sum(int(suite.attrib.get("failures", "0")) for suite in suites)
+        errors = sum(int(suite.attrib.get("errors", "0")) for suite in suites)
+    except ValueError:
+        return {
+            "execution_verified": False,
+            "verification_error": "pytest test-case evidence contained invalid counters",
+        }
+    non_skipped = total - skipped
+    verification_error = None
+    if non_skipped <= 0:
+        verification_error = "pytest reported no non-skipped tests"
+    elif failed or errors:
+        verification_error = "pytest evidence reported failed or errored tests"
+    return {
+        "execution_verified": verification_error is None,
+        "total_tests": total,
+        "skipped_tests": skipped,
+        "failed_tests": failed,
+        "error_tests": errors,
+        "verification_error": verification_error,
+    }
+
+
+def _sanitize_test_output(
+    value: str,
+    workspace_path: Path,
+    evidence_path: Path,
+    source_path: Path | None = None,
+) -> str:
+    paths = (workspace_path, evidence_path) if source_path is None else (workspace_path, evidence_path, source_path)
+    sanitized = _redact_paths(value, *paths)
+    return _truncate_output(_redact(sanitized))
 
 
 def _parse_allowed_test_command(command: str) -> list[str]:
@@ -1011,10 +1423,53 @@ def _parse_allowed_test_command(command: str) -> list[str]:
     else:
         raise WorkflowRunnerError("test_command is not allowed. Use pytest or python -m pytest.")
 
-    for argument in pytest_args:
+    index = 0
+    while index < len(pytest_args):
+        argument = pytest_args[index]
+        long_option, separator, attached_value = argument.partition("=")
+        normalized_long_option = long_option.lower()
+        if argument in {"-V", "-VV", "-h"} or normalized_long_option in _NON_EXECUTING_PYTEST_OPTIONS:
+            raise WorkflowRunnerError("test_command must execute tests, not only inspect or collect them.")
+        if normalized_long_option == "--pyargs":
+            raise WorkflowRunnerError("test_command option is not allowed: --pyargs")
+        if argument == "--":
+            for target in pytest_args[index + 1 :]:
+                if _pytest_argument_can_escape_workspace(target):
+                    raise WorkflowRunnerError("test_command paths must stay inside the isolated workspace.")
+            break
+        if argument.startswith("--"):
+            if normalized_long_option in {"--basetemp", "--confcutdir", "--rootdir"}:
+                raise WorkflowRunnerError("test_command paths must stay inside the isolated workspace.")
+            if normalized_long_option in _ALLOWED_PYTEST_FLAG_OPTIONS and not separator:
+                index += 1
+                continue
+            if normalized_long_option in _ALLOWED_PYTEST_VALUE_OPTIONS:
+                if not separator:
+                    index += 1
+                    if index >= len(pytest_args) or pytest_args[index].startswith("-"):
+                        raise WorkflowRunnerError(f"test_command option requires a value: {long_option}")
+                elif not attached_value:
+                    raise WorkflowRunnerError(f"test_command option requires a value: {long_option}")
+                index += 1
+                continue
+            raise WorkflowRunnerError(f"test_command option is not allowed: {long_option}")
+        if argument.startswith("-") and argument != "-":
+            if argument in {"-k", "-m", "-r"}:
+                index += 1
+                if index >= len(pytest_args):
+                    raise WorkflowRunnerError(f"test_command option requires a value: {argument}")
+                index += 1
+                continue
+            if re.fullmatch(r"-(?:q+|v+|s|x)", argument) or re.fullmatch(
+                r"-r[fEsxXapPw]+", argument
+            ):
+                index += 1
+                continue
+            raise WorkflowRunnerError(f"test_command option is not allowed: {argument}")
         if _pytest_argument_can_escape_workspace(argument):
             raise WorkflowRunnerError("test_command paths must stay inside the isolated workspace.")
-    return [sys.executable, "-m", "pytest", *pytest_args]
+        index += 1
+    return [sys.executable, "-m", "pytest", "-o", "addopts=", *pytest_args]
 
 
 def _pytest_argument_can_escape_workspace(argument: str) -> bool:
@@ -1023,7 +1478,8 @@ def _pytest_argument_can_escape_workspace(argument: str) -> bool:
         return True
     if "=" in value:
         value = value.split("=", 1)[1].strip().strip("\"'")
-    if not value or ("/" not in value and "\\" not in value and not PureWindowsPath(value).drive):
+    value = value.split("::", 1)[0]
+    if not value:
         return False
     windows_path = PureWindowsPath(value)
     posix_path = PurePosixPath(value)
@@ -1036,14 +1492,108 @@ def _pytest_argument_can_escape_workspace(argument: str) -> bool:
     )
 
 
-def _sanitized_environment() -> dict[str, str]:
-    sanitized = {}
-    for key, value in os.environ.items():
-        normalized = key.lower()
-        if any(marker in normalized for marker in _SENSITIVE_NAME_MARKERS):
-            continue
-        sanitized[key] = value
+def _sanitized_environment(workspace_path: Path) -> dict[str, str]:
+    sanitized = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in _TEST_ENVIRONMENT_ALLOWLIST
+    }
+    runtime_root = _test_runtime_root(workspace_path)
+    home_path = runtime_root / "home"
+    temp_path = runtime_root / "temp"
+    home_path.mkdir(parents=True, exist_ok=True)
+    temp_path.mkdir(parents=True, exist_ok=True)
+    sanitized.update(
+        {
+            "ALL_PROXY": "http://127.0.0.1:9",
+            "APPDATA": str(home_path / "AppData" / "Roaming"),
+            "HOME": str(home_path),
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "LOCALAPPDATA": str(home_path / "AppData" / "Local"),
+            "NO_PROXY": "",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TEMP": str(temp_path),
+            "TMP": str(temp_path),
+            "TMPDIR": str(temp_path),
+            "USERPROFILE": str(home_path),
+        }
+    )
     return sanitized
+
+
+def _test_runtime_root(workspace_path: Path) -> Path:
+    runtime_root = (workspace_path.parent / ".team-agent-test-runtime").resolve()
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    return runtime_root
+
+
+def _model_safe_context(context: dict[str, Any], snapshot: RepositorySnapshot) -> dict[str, Any]:
+    safe_context = {**context}
+    task_payload = context.get("task")
+    if isinstance(task_payload, dict):
+        safe_task = {**task_payload}
+        task_inputs = task_payload.get("inputs")
+        if isinstance(task_inputs, dict):
+            safe_task["inputs"] = {
+                key: value
+                for key, value in task_inputs.items()
+                if key not in {"repository_path", "confirm_repository_path"}
+            }
+        safe_context["task"] = safe_task
+    return _redact_context_value(safe_context, snapshot.source_path, snapshot.workspace_path)
+
+
+def _redact_context_value(value: Any, *paths: Path) -> Any:
+    if isinstance(value, str):
+        return _redact_paths(_redact(value), *paths)
+    if isinstance(value, dict):
+        return {key: _redact_context_value(item, *paths) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_context_value(item, *paths) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_context_value(item, *paths) for item in value)
+    return value
+
+
+def _source_hashes_for_test(
+    snapshot: RepositorySnapshot,
+    patch_details: dict[str, Any],
+) -> dict[str, str]:
+    relative_paths = set(snapshot.files)
+    changed_files = patch_details.get("files_changed")
+    if isinstance(changed_files, list):
+        relative_paths.update(
+            item["path"]
+            for item in changed_files
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+        )
+    hashes: dict[str, str] = {}
+    source_root = snapshot.source_path.resolve()
+    for relative_path in sorted(relative_paths):
+        candidate = (source_root / Path(*PurePosixPath(relative_path).parts)).resolve()
+        if not candidate.is_relative_to(source_root) or not candidate.is_file() or _is_unsafe_copy_entry(candidate):
+            raise WorkflowRunnerError(
+                f"Source repository patch target could not be verified safely: {relative_path}"
+            )
+        hashes[relative_path] = sha256(candidate.read_bytes()).hexdigest()
+    return hashes
+
+
+def _validate_source_hashes_match_patch_base(
+    source_hashes: dict[str, str],
+    patch_details: dict[str, Any],
+) -> None:
+    expected = patch_details.get("base_hashes")
+    if not isinstance(expected, dict) or not expected or any(
+        not isinstance(path, str) or not isinstance(content_hash, str)
+        for path, content_hash in expected.items()
+    ):
+        raise WorkflowRunnerError("Patched workspace did not provide valid source base hashes.")
+    if any(source_hashes.get(path) != content_hash for path, content_hash in expected.items()):
+        raise WorkflowRunnerError(
+            "Source repository patch targets no longer match the patch base used for isolated testing."
+        )
 
 
 def _truncate_output(value: str) -> str:
@@ -1053,16 +1603,46 @@ def _truncate_output(value: str) -> str:
 
 
 def _redact(value: str) -> str:
+    return redact_secret_like_text(value)
+
+
+def _snapshot_safe_text(value: str, snapshot: RepositorySnapshot) -> str:
+    return _redact_paths(_redact(value), snapshot.source_path, snapshot.workspace_path)
+
+
+def _redact_paths(value: str, *paths: Path) -> str:
     redacted = value
-    redacted = redacted.replace("\x00", "")
-    redacted = re.sub(r"(?i)(Authorization\s*:\s*Bearer\s+)[^\s,;]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(Bearer\s+)[^\s,;]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(api[_-]?key\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(token\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(secret\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(payload\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"sk-[A-Za-z0-9_-]+", "sk-[REDACTED]", redacted)
+    variants: set[str] = set()
+    for path in paths:
+        resolved = str(path.resolve())
+        variants.add(resolved)
+        if "\\" in resolved:
+            variants.add(resolved.replace("\\", "/"))
+        if resolved.startswith("\\\\?\\"):
+            without_prefix = resolved[4:]
+            variants.add(without_prefix)
+            variants.add(without_prefix.replace("\\", "/"))
+    for variant in sorted(variants, key=len, reverse=True):
+        redacted = re.sub(re.escape(variant), "[LOCAL_PATH]", redacted, flags=re.IGNORECASE)
     return redacted
+
+
+def _sanitize_local_executor_error(
+    exc: Exception,
+    *,
+    repository_value: Any,
+    workspace_root: Path,
+) -> str:
+    message = _redact(str(exc))
+    if isinstance(repository_value, str) and repository_value.strip():
+        repository_path = Path(repository_value).expanduser().resolve()
+        message = re.sub(
+            re.escape(str(repository_path)),
+            "[REPOSITORY_PATH]",
+            message,
+            flags=re.IGNORECASE,
+        )
+    return _redact_paths(message, workspace_root)
 
 
 def _optional_float(value: Any) -> float | None:

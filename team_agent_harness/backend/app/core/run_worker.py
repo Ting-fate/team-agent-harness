@@ -406,13 +406,26 @@ class RunWorker:
                     self._stop_requested.wait(RUN_QUEUE_READ_RETRY_SECONDS)
             except Exception as exc:
                 if queue_item is not None:
-                    self._terminalize_unhandled_failure(queue_item)
-                    self._record(
-                        "background_run_failed",
-                        queue_item.run_id,
-                        queue_item.id,
-                        exc.__class__.__name__,
-                    )
+                    try:
+                        self._terminalize_unhandled_failure(queue_item)
+                    except Exception as terminal_exc:
+                        self._record(
+                            "background_run_terminalization_retry",
+                            queue_item.run_id,
+                            queue_item.id,
+                            terminal_exc.__class__.__name__,
+                        )
+                        if not self._stop_requested.is_set():
+                            self._queue.put(wake_item)
+                            keep_scheduled = True
+                            self._stop_requested.wait(RUN_QUEUE_READ_RETRY_SECONDS)
+                    else:
+                        self._record(
+                            "background_run_failed",
+                            queue_item.run_id,
+                            queue_item.id,
+                            exc.__class__.__name__,
+                        )
             finally:
                 if not keep_scheduled:
                     pending_wake_item = None
@@ -437,7 +450,14 @@ class RunWorker:
         run = self.storage.get_run(queue_item.run_id)
         if run is None:
             return
+        if run.status == RunStatus.RUNNING and queue_item.status in {
+            RunQueueItemStatus.RUNNING,
+            RunQueueItemStatus.FAILED,
+        }:
+            run, queue_item = self._requeue_interrupted_segment(run, queue_item)
         if run.status != RunStatus.QUEUED:
+            if run.status in {RunStatus.WAITING, RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+                RunCoordinator(self.storage, self.trace_logger).release_orphaned_locks(run.id)
             if queue_item.status in {RunQueueItemStatus.QUEUED, RunQueueItemStatus.RUNNING}:
                 RunCoordinator(self.storage, self.trace_logger).reconcile_queue_item(queue_item)
             return
@@ -446,16 +466,20 @@ class RunWorker:
         if task is None or pack is None:
             now = utc_now()
             failed = run.model_copy(update={"status": RunStatus.FAILED, "finished_at": now})
-            self.storage.update_run(failed)
-            self.storage.update_run_queue_item(
-                queue_item.model_copy(
-                    update={
-                        "status": RunQueueItemStatus.FAILED,
-                        "updated_at": now,
-                        "message": "Background run configuration is unavailable.",
-                    }
-                )
+            failed_queue_item = queue_item.model_copy(
+                update={
+                    "status": RunQueueItemStatus.FAILED,
+                    "updated_at": now,
+                    "message": "Background run configuration is unavailable.",
+                }
             )
+            with self.storage.transaction():
+                RuntimeController(self.storage, self.trace_logger).terminalize_open_runtime_state(
+                    run.id,
+                    reason="background_run_configuration_unavailable",
+                )
+                self.storage.update_run(failed)
+                self.storage.update_run_queue_item(failed_queue_item)
             self._record("background_run_failed", run.id, queue_item.id, "configuration")
             return
 
@@ -478,6 +502,30 @@ class RunWorker:
             result.status.value,
         )
 
+    def _requeue_interrupted_segment(
+        self,
+        run: Run,
+        queue_item: RunQueueItem,
+    ) -> tuple[Run, RunQueueItem]:
+        task = self.storage.get_task(run.task_id)
+        pack = self.packs.get(task.workflow_pack) if task is not None else None
+        with self.storage.transaction():
+            requeued_run = self.runner_factory().requeue_interrupted_run(run.id, pack)
+            current_item = self.storage.get_run_queue_item(queue_item.id)
+            if current_item is None:
+                raise RunWorkerError(f"Run queue item disappeared during storage recovery: {queue_item.id}")
+            requeued_item = self.storage.update_run_queue_item(
+                current_item.model_copy(
+                    update={
+                        "status": RunQueueItemStatus.QUEUED,
+                        "updated_at": utc_now(),
+                        "message": "Retrying local worker segment after a transient storage failure.",
+                    }
+                )
+            )
+        self._record("background_run_storage_retry", run.id, queue_item.id)
+        return requeued_run, requeued_item
+
     def _record(
         self,
         action: str,
@@ -498,14 +546,12 @@ class RunWorker:
             return
 
     def _terminalize_unhandled_failure(self, queue_item: RunQueueItem) -> None:
-        try:
+        now = utc_now()
+        with self.storage.transaction():
             RuntimeController(self.storage, self.trace_logger).terminalize_open_runtime_state(
                 queue_item.run_id,
                 reason="background_worker_internal_error",
             )
-        except Exception:
-            pass
-        try:
             current_item = self.storage.get_run_queue_item(queue_item.id)
             if current_item is not None and current_item.status in {
                 RunQueueItemStatus.QUEUED,
@@ -515,14 +561,11 @@ class RunWorker:
                     current_item.model_copy(
                         update={
                             "status": RunQueueItemStatus.FAILED,
-                            "updated_at": utc_now(),
+                            "updated_at": now,
                             "message": "Background worker stopped this queue segment after an internal error.",
                         }
                     )
                 )
-        except Exception:
-            pass
-        try:
             current_run = self.storage.get_run(queue_item.run_id)
             if current_run is not None and current_run.status in {
                 RunStatus.QUEUED,
@@ -531,11 +574,9 @@ class RunWorker:
             }:
                 self.storage.update_run(
                     current_run.model_copy(
-                        update={"status": RunStatus.FAILED, "finished_at": utc_now()}
+                        update={"status": RunStatus.FAILED, "finished_at": now}
                     )
                 )
-        except Exception:
-            pass
 
 
 def _background_approval_submission(

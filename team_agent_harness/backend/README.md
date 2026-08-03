@@ -19,7 +19,7 @@ This directory includes the original MVP phases plus the durable local worker an
 - Mocked multi-model profile assignment inside each workflow pack, so one run can show two or more model profiles cooperating through agent-level `model_config`.
 - Provider catalog and explicit opt-in OpenAI-compatible adapters for OpenAI, DeepSeek, and an optional LiteLLM Proxy gateway; mock remains the default, while Anthropic and local providers are still skeleton-only.
 - Server-side model routing config that can assign selected agents to `mock`, `openai`, `deepseek`, or `litellm_proxy` without storing API keys in the app.
-- Single-process workflow runner with deterministic mocked agent execution, dependency-aware ready-set step scheduling, dependency-edge handoffs for DAG packs, bounded context envelope construction, workflow-level intake/context/skill-route trace events, structural checkpoint evaluation, step eval/artifact gate enforcement, ready-batch/ownership conflict checks, conservative opt-in parallel executor dispatch for safe DAG batches, failure trace recording, run/agent-run status updates, local runtime session/job metadata recording for `session` and `acp` steps, and local approval gates.
+- Single-process workflow runner with deterministic mocked agent execution, dependency-aware ready-set step scheduling, dependency-edge handoffs for DAG packs, explicit dependency lineage on completed DAG attempts, bounded context envelope construction, workflow-level intake/context/skill-route trace events, scoped structural/executor/pack evaluation, named step eval and artifact gate enforcement, ready-batch/ownership conflict checks, conservative opt-in parallel executor dispatch for safe DAG batches, failure trace recording, run/agent-run status updates, local runtime session/job metadata recording for `session` and `acp` steps, and local approval gates.
 - Durable local `RunWorker` plus run coordinator. UI and operator CLI submissions return after persistence, execute outside the initiating HTTP request, maintain a per-run lock heartbeat, and recover interrupted runs from completed step checkpoints on service restart.
 - Mocked Code R&D workflow pack with Clarifier, Architect, Coder, Tester, Reviewer, and Finalizer steps.
 - Mocked Institutional Code R&D workflow pack with GPT as the trusted main thread, DeepSeek V4 Pro long-context reading/review roles, GPT implementation/test executor branches that require local approval before their mocked/model step execution proceeds, DeepSeek final risk review, and GPT final approval.
@@ -51,20 +51,22 @@ The worker is intentionally local and single-process:
 - SQLite run/queue state is authoritative; the in-memory queue is only a wake-up signal.
 - Graceful shutdown stops accepting work, waits up to 30 seconds for only the active worker segment, and leaves the queued backlog persisted for the next start. If the bound is reached, SQLite stays open until process exit so the still-finishing daemon segment is not handed a closed connection.
 - Startup schedules persisted `queued` runs, releases orphaned locks for every run state, repairs the `queued` run / `running` queue-item crash window, and requeues orphaned `running` runs.
-- A step becomes a completed `AgentRun` checkpoint only after its eval gate and all outgoing handoffs are persisted. Recovery invalidates pre-fix completion markers missing structural eval or required handoff evidence, then creates a new attempt without deleting old artifacts or records.
+- A step becomes a completed `AgentRun` checkpoint only after its eval gate and every declared outgoing edge has exactly one valid handoff. For explicit DAG dependencies, the consuming `AgentRun.input_context` records the exact dependency attempt and handoff ids. Recovery rejects missing, duplicate, extra, mis-targeted, or cross-attempt handoffs; lineage keys must exactly equal `depends_on`, while dependency-free steps must not claim lineage. Every artifact file owned by the checkpoint is streamed through its durable content hash before reuse. An invalid latest checkpoint and its older completed fallbacks are cancelled so the step is rerun without deleting artifacts or records.
+- Only validated handoffs from the latest completed attempt of each declared dependency enter downstream context. Every referenced artifact must belong to that attempt and the handoff must include its declared produced artifact. Structural artifact checks, executor-supplied checks, and pack evals use separate trace scopes; a required named executor check must have exactly one `PASS` result.
 - A persisted `waiting` run with an `approved` runtime job is requeued automatically on startup. Retrying a background approval reuses its active queue segment, and retrying an already-completed approval returns the persisted result without advancing a newer job.
 - Retry artifact filenames gain an `attempt-N` suffix, so existing artifact files and records are never overwritten or deleted.
+- A transient storage failure after a run becomes `running` is recovered through the normal interrupted-run checkpoint path; the run and active queue segment return to `queued` together before retry. Missing task/pack configuration atomically terminalizes open runtime state, run state, and queue state.
 - A hard crash during an external model request can repeat that interrupted request after restart. Exactly-once external execution is not guaranteed.
 
-Run locks store a heartbeat every five seconds. Stale-lock recovery prefers the latest valid timezone-aware heartbeat over the original acquisition time, so long-running work is not falsely reclaimed. Transient queue reads and queue-status writes are retried; unresolved wake-ups stay persisted and terminal run state repairs a stale non-terminal queue item on restart. Background trace failures remain isolated from worker execution.
+Run locks store a heartbeat every five seconds. Stale-lock recovery prefers the latest valid timezone-aware heartbeat over the original acquisition time, so long-running work is not falsely reclaimed. Transient queue reads, queue-status writes, and terminal lock-release writes are retried; a retried terminal wake-up also releases any orphaned acquired lock before it returns. Unresolved wake-ups stay persisted and terminal run state repairs a stale non-terminal queue item on restart. Background trace failures remain isolated from worker execution.
 
 Each `WorkflowStep` has a typed `context_policy`:
 
 - `artifact_excerpt_chars`: total artifact excerpt character budget.
 - `max_artifacts`: maximum completed-attempt artifact refs/texts retained.
-- `max_upstream_handoffs`: maximum structured upstream handoffs retained.
+- `max_upstream_handoffs`: maximum structured upstream handoffs retained; schema validation requires it to be at least the number of declared dependencies.
 
-Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step at 100K excerpt characters, 300K encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are read through a bounded prefix API; artifacts and handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. The active local `research-planner` route uses `max_tokens=1000`; every `deepseek-v4-pro` route uses at least `max_tokens=4096` because a real Research reader still reached `finish_reason=length` at 2048 tokens. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
+Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step at 100K excerpt characters, 300K encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are streamed through a full hash verification while retaining only the bounded excerpt; tampered artifacts and artifacts or handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. The active local `research-planner` route uses `max_tokens=1000`; every `deepseek-v4-pro` route uses at least `max_tokens=4096` because a real Research reader still reached `finish_reason=length` at 2048 tokens. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
 
 ## Main/Subagent Mental Model
 
@@ -467,19 +469,23 @@ Example task inputs:
 {
   "repository_path": "E:\\your-project",
   "focus_paths": ["app", "tests"],
-  "test_command": "python -m pytest -q"
+  "test_command": "python -m pytest -q",
+  "allow_host_test_execution": true
 }
 ```
 
 Current safety behavior:
 
-- The original repository is not modified.
-- The executor copies the repository into `output/local_code_workspaces/<run_id>/<step_name>/repo`, so `prepare_patch` and `test_changes` use isolated workspace copies.
+- The Harness itself never writes the source repository during `prepare_patch` or `test_changes`. The test process still runs with the current host user's permissions, so the working copy is not an OS security sandbox. Use only trusted repositories/providers or add an external VM/container boundary.
+- Host pytest is denied unless the task explicitly sets `allow_host_test_execution=true`. The executor copies the repository into `output/local_code_workspaces/<run_id>/<step_name>/repo`; source and workspace paths must be disjoint, and neither may contain the other.
 - Copying is rejected before `copytree` when the filtered repository exceeds 20,000 files or 500 MB.
 - `.env`, secret-like files, symlinks, hard-linked files, Windows junctions and other reparse points, `.git`, `.venv`, `node_modules`, cache folders, generated output folders, binary files, and large files are skipped.
 - `prepare_patch` produces a patch proposal artifact only; it does not apply the patch.
-- `test_changes` runs only allowlisted test commands: `pytest ...` or `python -m pytest ...`. Both forms are forced through the Harness interpreter, and absolute, parent-directory, or pytest response-file targets outside the isolated workspace are rejected.
-- Test commands run in the isolated workspace copy with secret-like environment variables removed.
+- `test_changes` accepts exactly one `PATCH` artifact through the canonical handoff from the current completed `prepare_patch` attempt. It verifies the artifact's stored byte hash, reparses the fenced unified diff without stripping significant trailing whitespace, copies the source repository into the test workspace, checks the copied base hashes, and applies that exact patch before taking the test snapshot or starting pytest. Immediately before pytest, every source patch target must still match the patch-declared base hash; the same targets are checked again after pytest.
+- The test report records the patch artifact id, patch hash, changed files, and working-copy application state. Patch bytes are verified again after pytest and every later artifact excerpt read, closing the test-to-review tamper window. A missing or tampered artifact, invalid diff, base mismatch, missing/non-executing test command, timeout, or non-zero test exit fails the step and prevents downstream review.
+- `test_changes` runs a conservative pytest-core option allowlist through the Harness interpreter. Collect/setup/help/version modes (including `-VV`), `--pyargs`, response files, unknown plugin options, absolute/parent paths, and path-changing options are rejected. Host `PYTEST_ADDOPTS` and project `addopts` are overridden. The Harness also parses a separate JUnit report and requires at least one non-skipped test case with zero failures/errors, so an all-skipped run or a simple `conftest.py` exit-code override cannot produce a passing checkpoint.
+- Test commands receive an environment-variable allowlist with private HOME/TEMP directories. Source/workspace absolute paths are removed from task/context model payloads, pytest output, model review text, artifacts, summaries, and persisted executor errors. Secret-like assignments, credentialed connection URLs, common provider tokens, JWTs, and private-key blocks are redacted from repository context, test output, model review text, and runner error summaries. Embedded credentials can still exist in the copied repository and remain readable by host pytest; do not use untrusted repositories without a VM/container boundary. Proxy variables provide best-effort egress reduction, but they do not block raw sockets and are not a network sandbox.
+- Institutional mock execution does not synthesize a successful test result when `repository_path` or `test_command` is absent. It fails the required `patched_local_test_command` gate instead.
 
 ## Explicit Writeback
 
@@ -487,7 +493,7 @@ Generated code is still not written back by normal runtime-job approval. `POST /
 
 To apply a generated patch to the original repository, use the separate writeback API:
 
-1. Run `code_rd_institutional` with `repository_path`, `focus_paths`, and `test_command`.
+1. Run `code_rd_institutional` with `repository_path`, `focus_paths`, `test_command`, and `allow_host_test_execution=true`.
 2. Approve the `prepare_patch` runtime job so the patch artifact is created.
 3. Preview the writeback:
 
@@ -526,7 +532,8 @@ Writeback safety limits:
 - The MVP only supports modifying existing text files.
 - Create, delete, rename, binary, absolute-path, parent-directory, symlink, sensitive-file, and excluded-directory patches are rejected.
 - `focus_paths` are enforced again during writeback.
-- Before writing, the executor applies the patch to an isolated workspace and runs the allowlisted `test_command`.
+- Preview and approval accept only a PATCH owned by the latest completed `prepare_patch` attempt for that run; artifacts from failed, cancelled, or superseded attempts are rejected. Approval revalidates the same ownership and artifact hash after the potentially long test command, before it creates a source-write transaction.
+- Before writing, the executor applies the exact fenced diff bytes, including significant final-line whitespace and EOF newline semantics, to a disjoint working copy and runs the allowlisted `test_command` under the same explicit host-execution opt-in.
 - The original file hash must still match the preview `base_hashes`; otherwise writeback returns a conflict and does not overwrite local edits.
 - Approval is serialized in the supported single-process runtime. A repeated concurrent approval returns the persisted completed result instead of applying the patch twice.
 - Multi-file source updates use atomic replacements and roll back already-written files in reverse order if a later write fails.
@@ -556,6 +563,9 @@ If editable install dependency resolution is slow, install the minimal current t
 
 ### Current Verification Record
 
+- On 2026-08-03 the patched-test, dependency-provenance, credential-redaction, and worker-recovery hardening passed the full backend suite with `643 passed, 5 skipped, 1 warning`. The warning is the existing Starlette `TestClient` compatibility deprecation for the installed `httpx`; it does not affect the live Uvicorn path. Live and recovery paths reject mixed-attempt/duplicate/extra handoffs, multiple canonical PATCH artifacts, inexact lineage, and missing/tampered checkpoint files. Pytest requires independent test-case evidence instead of trusting exit code alone; writeback rejects stale attempts; storage retry and missing-pack paths preserve atomic runtime/run/queue terminal state. EOF diff semantics and the 20 consecutive real-loop terminalization retry repetitions remain covered.
+- A fresh temporary-database live smoke queued and completed all six mock steps, persisted six artifacts and a final artifact, completed its queue item, released its lock, recorded no error trace, and released the service port after shutdown.
+- A fresh two-process forced-restart smoke killed the first service with the run, first agent attempt, queue item, and lock all persisted as active. The second service cancelled only the interrupted attempt, completed its retry plus the remaining steps, preserved `cancelled/completed` queue history, released both locks, produced six completed checkpoints and six artifacts, recorded `interrupted_run_requeued` with no error trace, and released both service ports. A separate terminal-window interruption was also recovered on the next startup from `completed + running queue + acquired lock` to a completed queue and released locks.
 - On 2026-07-28 the full backend suite passed with `569 passed, 5 skipped`; `python -m compileall -q app scripts`, `pip check` in both project environments, JavaScript syntax, and all project PowerShell parse checks also passed. The desktop bootstrap also completed a real dependency reconciliation and then reused both environments without reinstalling them on its second run.
 - A temporary-database 100-run stress completed 100/100 runs, 600/600 agent checkpoints, and 600 artifacts with no error trace, active lock, queue, session, job, or SQLite integrity failure. A run lasting beyond the production five-second heartbeat interval advanced its heartbeat.
 - A separate forced-process restart preserved the completed first checkpoint, cancelled and retried only the interrupted second step, wrote its retry artifact with `attempt-2`, completed the recovered run, and released both old and new locks. The recovery phase took 2.141 seconds in the deterministic test.
@@ -607,7 +617,7 @@ Create a task without starting it:
   --title "代码审查任务" `
   --goal "审查目标项目的核心变更，输出问题、风险和建议。" `
   --workflow-pack code_rd_institutional `
-  --input-json '{"repository_path":"E:\\your-project","focus_paths":["app","tests"],"test_command":"python -m pytest -q"}'
+  --input-json '{"repository_path":"E:\\your-project","focus_paths":["app","tests"],"test_command":"python -m pytest -q","allow_host_test_execution":true}'
 ```
 
 Start a run:

@@ -45,6 +45,7 @@ from app.core.models import (
     Artifact,
     ArtifactType,
     EvalResult,
+    EvalStatus,
     HarnessModel,
     Handoff,
     Run,
@@ -830,9 +831,24 @@ class PackMappedExecutor:
         skill_library: SkillLibrary | None = None,
     ) -> None:
         self.model_gateway = model_gateway or ModelGateway()
-        self.local_code_executor = LocalCodeExecutor(model_gateway=self.model_gateway)
         self.artifact_store = artifact_store
         self.trace_logger = trace_logger
+        local_workspace_root = Path("output/local_code_workspaces")
+        patch_workspace_preparer = (
+            WritebackService(
+                artifact_store=artifact_store,
+                trace_logger=trace_logger,
+                workspace_root=local_workspace_root,
+            )
+            if artifact_store is not None and trace_logger is not None
+            else None
+        )
+        self.local_code_executor = LocalCodeExecutor(
+            model_gateway=self.model_gateway,
+            artifact_store=artifact_store,
+            patch_workspace_preparer=patch_workspace_preparer,
+            workspace_root=local_workspace_root,
+        )
         self.web_tool_provider = web_tool_provider or WebToolProvider()
         self.browser_tool_provider = browser_tool_provider or BrowserToolProvider()
         self.skill_library = skill_library
@@ -863,6 +879,33 @@ class PackMappedExecutor:
                 step=step,
                 agent=agent,
                 context=context,
+            )
+
+        if task.workflow_pack == "code_rd_institutional" and step.name == "test_changes":
+            message = (
+                "Patched local tests were not run; repository_path and test_command are required "
+                "for the Institutional test gate."
+            )
+            return AgentStepOutput(
+                summary=message,
+                artifacts=[
+                    AgentArtifactOutput(
+                        type=ArtifactType.TEST_REPORT,
+                        filename="test_changes.md",
+                        content=f"# test_changes\n\n{message}\nRun: {run.id}\n",
+                    )
+                ],
+                risk_notes=[
+                    "No patched workspace was prepared and no local test command was executed.",
+                ],
+                eval_results=[
+                    EvalResult(
+                        run_id=run.id,
+                        check_name="patched_local_test_command",
+                        status=EvalStatus.FAIL,
+                        message=message,
+                    )
+                ],
             )
 
         artifact_type = _artifact_type_for_step(task.workflow_pack, step)

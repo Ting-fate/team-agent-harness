@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 from hashlib import sha256
 from pathlib import Path
 
@@ -73,14 +74,52 @@ class ArtifactStore:
         self._ensure_under_root(artifact_path)
         return artifact_path.read_text(encoding="utf-8")
 
+    def read_text_verified(self, artifact: Artifact) -> str:
+        artifact_path = (self.root_dir / artifact.path).resolve()
+        self._ensure_under_root(artifact_path)
+        try:
+            content = artifact_path.read_bytes()
+        except OSError as exc:
+            raise ArtifactStoreError("artifact content could not be read") from exc
+        if artifact.content_hash is None or sha256(content).hexdigest() != artifact.content_hash:
+            raise ArtifactStoreError("artifact content hash does not match durable metadata")
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ArtifactStoreError("text artifact is not valid UTF-8") from exc
+
     def read_text_excerpt(self, artifact: Artifact, *, max_chars: int) -> tuple[str, bool]:
         if max_chars < 0:
             raise ArtifactStoreError("max_chars must be non-negative")
         artifact_path = (self.root_dir / artifact.path).resolve()
         self._ensure_under_root(artifact_path)
-        with artifact_path.open(encoding="utf-8") as handle:
-            content = handle.read(max_chars + 1)
-        return content[:max_chars], len(content) > max_chars
+        digest = sha256()
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        excerpt = ""
+        truncated = False
+        try:
+            with artifact_path.open("rb") as handle:
+                while chunk := handle.read(64 * 1024):
+                    digest.update(chunk)
+                    decoded = decoder.decode(chunk)
+                    remaining = max_chars + 1 - len(excerpt)
+                    if remaining > 0:
+                        excerpt += decoded[:remaining]
+                    if len(decoded) > remaining:
+                        truncated = True
+                decoded = decoder.decode(b"", final=True)
+                remaining = max_chars + 1 - len(excerpt)
+                if remaining > 0:
+                    excerpt += decoded[:remaining]
+                if len(decoded) > remaining:
+                    truncated = True
+        except OSError as exc:
+            raise ArtifactStoreError("artifact content could not be read") from exc
+        except UnicodeDecodeError as exc:
+            raise ArtifactStoreError("text artifact is not valid UTF-8") from exc
+        if artifact.content_hash is None or digest.hexdigest() != artifact.content_hash:
+            raise ArtifactStoreError("artifact content hash does not match durable metadata")
+        return excerpt[:max_chars], truncated or len(excerpt) > max_chars
 
     def _artifact_path(self, run_id: str, filename: str) -> Path:
         self._ensure_simple_segment(run_id, "run_id")

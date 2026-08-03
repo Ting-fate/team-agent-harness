@@ -526,11 +526,11 @@ function searchableRunText(run) {
 }
 
 function runNeedsAttention(run) {
-  return isFailedRunStatus(run.status) || ["approval_required", "waiting_approval", "recorded"].includes(run.status);
+  return isFailedRunStatus(run.status) || ["waiting", "approval_required", "waiting_approval", "recorded"].includes(run.status);
 }
 
 function runNeedsOperatorAction(run) {
-  return ["approval_required", "waiting_approval", "recorded"].includes(run.status);
+  return ["waiting", "approval_required", "waiting_approval", "recorded"].includes(run.status);
 }
 
 function taskMatchesRecordFilter(task) {
@@ -1848,7 +1848,12 @@ function renderRuntimeJobActions(job) {
   }
   const isPending = state.pendingRuntimeActions.has(job.id);
   const disabled = isPending ? "disabled" : "";
-  const pendingLabel = isPending ? "处理中..." : "本地审批动作：只记录本地审批意图，不启动外部执行器。";
+  const hostTestJob = isHostTestJob(job);
+  const pendingLabel = isPending
+    ? "处理中..."
+    : hostTestJob
+      ? "批准后会以当前用户权限运行 pytest；工作副本不是系统安全沙箱。"
+      : "批准后会恢复本地工作流；不会启动外部 ACP 执行器。";
   return `
     <div class="runtime-actions" data-runtime-job-actions="${escapeHtml(job.id)}">
       <span>${escapeHtml(pendingLabel)}</span>
@@ -2391,14 +2396,27 @@ async function runTask(taskId, options = {}) {
   await refreshData();
 }
 
-function confirmRuntimeIntent(action) {
+function isHostTestJob(job) {
+  return Boolean(
+    job?.step_name === "test_changes" &&
+    state.selectedRunDetail?.task?.inputs?.repository_path
+  );
+}
+
+function confirmRuntimeIntent(action, jobId) {
   const labels = {
     approve: "批准",
     reject: "拒绝",
     cancel: "取消",
   };
+  const job = (state.selectedRunDetail?.runtime_jobs || []).find((item) => item.id === jobId);
+  if (action === "approve" && isHostTestJob(job)) {
+    return window.confirm(
+      "确认运行补丁测试？\n\npytest 将以当前 Windows 用户权限执行模型生成补丁后的代码。工作副本不会限制该进程访问其他本机文件或原始网络；这不是系统安全沙箱。仅对可信仓库和模型渠道批准。"
+    );
+  }
   return window.confirm(
-    `确认${labels[action] || action}这个本地任务？\n\n这只会记录本地审批意图，不会启动外部工程执行器，不会执行命令行，也不会把代码发送给外部工程执行器。`
+    `确认${labels[action] || action}这个本地任务？\n\n批准会恢复本地工作流，但不会启动外部 ACP 执行器。后续步骤仍会按任务配置调用模型或本地能力。`
   );
 }
 
@@ -2414,7 +2432,7 @@ async function submitRuntimeAction(runId, jobId, action) {
   if (state.pendingRuntimeActions.has(jobId)) {
     return;
   }
-  if (!confirmRuntimeIntent(action)) {
+  if (!confirmRuntimeIntent(action, jobId)) {
     showToast("已取消本地审批动作。");
     return;
   }
@@ -2473,7 +2491,7 @@ async function submitWritebackAction(artifactId, action) {
     }
     const fileList = preview.files_changed.map((file) => `- ${file.path}`).join("\n");
     const confirmed = window.confirm(
-      `确认写回原仓库？\n\n目标：${repositoryPath}\n文件：\n${fileList}\n\n系统会先在隔离副本应用 patch 并运行 test_command；通过后才写回。此操作会修改你的原项目文件。`
+      `确认写回原仓库？\n\n目标：${repositoryPath}\n文件：\n${fileList}\n\n系统会先在工作副本应用 patch，并以当前用户权限运行 test_command；该进程不是系统安全沙箱。测试通过后才写回，此操作会修改你的原项目文件。`
     );
     if (!confirmed) {
       showToast("已取消写回。");

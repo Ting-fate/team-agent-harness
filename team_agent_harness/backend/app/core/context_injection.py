@@ -105,6 +105,7 @@ class ContextInjector:
             "required_artifacts": step.required_artifacts,
             "previous_agent_run_id": previous_agent_run.id if previous_agent_run else None,
             "previous_handoff": previous_handoff_payload,
+            "dependency_lineage": agent_run.input_context.get("dependency_lineage"),
             "depends_on": step.depends_on,
             "phase": step.phase,
             "coordination_role": step.coordination_role,

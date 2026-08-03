@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-import re
 from threading import Event, Thread
 from time import sleep
 from typing import TypeVar
@@ -16,6 +15,7 @@ from app.core.models import (
     RunStatus,
     utc_now,
 )
+from app.core.sensitive_text import redact_secret_like_text
 from app.core.storage import SQLiteStorage, StorageError
 from app.core.trace import TraceLogger
 
@@ -312,7 +312,14 @@ class RunCoordinator:
         released = current.model_copy(
             update={"status": RunLockStatus.RELEASED, "released_at": utc_now()}
         )
-        self.storage.update_run_lock(released)
+        for attempt in range(RUN_QUEUE_WRITE_ATTEMPTS):
+            try:
+                self.storage.update_run_lock(released)
+                break
+            except StorageError:
+                if attempt + 1 >= RUN_QUEUE_WRITE_ATTEMPTS:
+                    raise
+                sleep(RUN_QUEUE_WRITE_RETRY_SECONDS)
         return released
 
 
@@ -328,11 +335,4 @@ def _queue_status_for_run_status(status: RunStatus) -> RunQueueItemStatus:
 
 
 def _redact_message(message: str) -> str:
-    redacted = message
-    redacted = re.sub(r"(?i)(Authorization\s*:\s*Bearer\s+)[^\s,;]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(Bearer\s+)[^\s,;]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(api[_-]?key\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(token\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"(?i)(secret\s*=\s*)[^\s,;&]+", r"\1[REDACTED]", redacted)
-    redacted = re.sub(r"sk-[A-Za-z0-9_-]+", "sk-[REDACTED]", redacted)
-    return redacted
+    return redact_secret_like_text(message)

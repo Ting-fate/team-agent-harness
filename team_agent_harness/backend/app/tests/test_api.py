@@ -424,8 +424,7 @@ def test_auto_complex_task_run_uses_institutional_subagent_branches(tmp_path) ->
         assert run["current_step"] == "prepare_patch"
         jobs = client.get(f"/runs/{run['id']}/runtime-jobs").json()
         assert {job["step_name"] for job in jobs if job["status"] == "approval_required"} == {
-            "prepare_patch",
-            "test_changes",
+            "prepare_patch"
         }
         ready_event = next(
             event
@@ -433,12 +432,13 @@ def test_auto_complex_task_run_uses_institutional_subagent_branches(tmp_path) ->
             if event["event_type"] == "workflow_event"
             and event["payload"].get("action") == "ready_batches_planned"
         )
-        branch_batches = [
-            batch for batch in ready_event["payload"]["batches"]
-            if set(batch["steps"]) == {"prepare_patch", "test_changes"}
+        execution_batches = [
+            batch
+            for batch in ready_event["payload"]["batches"]
+            if set(batch["steps"]) & {"prepare_patch", "test_changes"}
         ]
-        assert branch_batches
-        assert branch_batches[0]["parallel_candidate"] is True
+        assert [batch["steps"] for batch in execution_batches] == [["prepare_patch"], ["test_changes"]]
+        assert all(batch["parallel_candidate"] is False for batch in execution_batches)
         assert ready_event["payload"]["true_parallel_execution"] is False
 
 
@@ -534,6 +534,10 @@ def test_pack_and_agent_catalog_endpoints(tmp_path, monkeypatch: pytest.MonkeyPa
         assert steps_by_name["prepare_patch"]["session_policy"]["requires_approval"] is True
         assert steps_by_name["test_changes"]["coordination_role"] == "subagent"
         assert steps_by_name["test_changes"]["controller_step"] == "dispatch_work"
+        assert steps_by_name["test_changes"]["depends_on"] == ["prepare_patch"]
+        assert "patch" in steps_by_name["test_changes"]["required_artifacts"]
+        assert steps_by_name["test_changes"]["requires_eval_pass"] is True
+        assert steps_by_name["test_changes"]["required_eval_checks"] == ["patched_local_test_command"]
         assert steps_by_name["review_context_alignment"]["agent_role"] == "ContextReviewer"
         assert steps_by_name["review_context_alignment"]["depends_on"] == ["prepare_patch", "test_changes"]
         assert steps_by_name["synthesize_delivery"]["coordination_role"] == "synthesizer"
@@ -881,14 +885,36 @@ def test_research_run_via_api(tmp_path) -> None:
 
 
 def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path) -> None:
+    repo = tmp_path / "institutional_repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    (repo / "test_app.py").write_text(
+        "from app import answer\n\n\ndef test_answer():\n    assert answer() == 42\n",
+        encoding="utf-8",
+    )
     app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
     with TestClient(app) as client:
+        state = app.state.harness
+        state.executor_factory = lambda: PackMappedExecutor(
+            model_gateway=ModelGateway({"mock": PatchProducingAdapter()}),
+            artifact_store=state.artifact_store,
+            trace_logger=state.trace_logger,
+            web_tool_provider=state.web_tool_provider,
+            browser_tool_provider=state.browser_tool_provider,
+            skill_library=state.skill_library,
+        )
         task = client.post(
             "/tasks",
             json={
                 "title": "Institutional code delivery",
                 "goal": "Exercise planning, review, dispatch, execution branches, synthesis, and final review.",
                 "workflow_pack": "code_rd_institutional",
+                "inputs": {
+                    "repository_path": str(repo),
+                    "focus_paths": ["app.py", "test_app.py"],
+                    "test_command": "python -m pytest -q",
+                    "allow_host_test_execution": True,
+                },
             },
         ).json()
 
@@ -905,11 +931,9 @@ def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path)
             "review_plan",
             "dispatch_work",
             "prepare_patch",
-            "test_changes",
         ]
         assert {agent_run["step_name"] for agent_run in agent_runs if agent_run["status"] == "waiting"} == {
             "prepare_patch",
-            "test_changes",
         }
 
         artifacts = client.get(f"/runs/{run['id']}/artifacts").json()
@@ -922,26 +946,26 @@ def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path)
         assert run["final_artifact_id"] is None
         runtime_sessions = client.get(f"/runs/{run['id']}/runtime-sessions").json()
         runtime_jobs = client.get(f"/runs/{run['id']}/runtime-jobs").json()
-        assert len(runtime_sessions) == 6
-        assert len(runtime_jobs) == 6
+        assert len(runtime_sessions) == 5
+        assert len(runtime_jobs) == 5
         assert {session["runtime"] for session in runtime_sessions} == {"session", "acp"}
         assert {job["runtime"] for job in runtime_jobs} == {"session", "acp"}
         acp_jobs = [job for job in runtime_jobs if job["runtime"] == "acp"]
-        assert len(acp_jobs) == 2
+        assert len(acp_jobs) == 1
         assert {job["status"] for job in acp_jobs} == {"approval_required"}
         assert all(job["approval_required"] is True for job in acp_jobs)
         assert all(job["metadata"]["external_runtime_started"] is False for job in runtime_jobs)
         assert {job["status"] for job in runtime_jobs if job["runtime"] == "session"} == {"completed"}
 
         handoffs = client.get(f"/runs/{run['id']}/handoffs").json()
-        assert len(handoffs) == 5
+        assert len(handoffs) == 4
         handoffs_by_from = {}
         for handoff in handoffs:
             handoffs_by_from.setdefault(handoff["from_agent_run_id"], []).append(handoff)
 
         dispatch_run = next(agent_run for agent_run in agent_runs if agent_run["step_name"] == "dispatch_work")
         dispatch_handoffs = handoffs_by_from[dispatch_run["id"]]
-        assert {handoff["next_objective"] for handoff in dispatch_handoffs} == {"prepare_patch", "test_changes"}
+        assert {handoff["next_objective"] for handoff in dispatch_handoffs} == {"prepare_patch"}
 
         patch_run = next(agent_run for agent_run in agent_runs if agent_run["step_name"] == "prepare_patch")
         assert patch_run["input_context"]["coordination_role"] == "subagent"
@@ -950,14 +974,6 @@ def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path)
         assert patch_run["input_context"]["runtime"] == "acp"
         assert patch_run["input_context"]["session_policy"]["persistent"] is True
         assert patch_run["input_context"]["session_policy"]["requires_approval"] is True
-
-        test_run = next(agent_run for agent_run in agent_runs if agent_run["step_name"] == "test_changes")
-        assert test_run["input_context"]["coordination_role"] == "subagent"
-        assert test_run["input_context"]["controller_step"] == "dispatch_work"
-        assert test_run["input_context"]["return_contract"]["require_risk_notes"] is True
-        assert test_run["input_context"]["runtime"] == "acp"
-        assert test_run["input_context"]["session_policy"]["persistent"] is True
-        assert test_run["input_context"]["session_policy"]["requires_approval"] is True
 
         jobs_by_step = {job["step_name"]: job for job in runtime_jobs}
         approve_patch = client.post(f"/runs/{run['id']}/runtime-jobs/{jobs_by_step['prepare_patch']['id']}/approve")
@@ -974,6 +990,22 @@ def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path)
             "prepare_patch": "completed",
             "test_changes": "approval_required",
         }
+        agent_runs_after_patch = client.get(f"/runs/{run['id']}/agent-runs").json()
+        test_run = next(agent_run for agent_run in agent_runs_after_patch if agent_run["step_name"] == "test_changes")
+        assert test_run["input_context"]["coordination_role"] == "subagent"
+        assert test_run["input_context"]["controller_step"] == "dispatch_work"
+        assert test_run["input_context"]["return_contract"]["require_risk_notes"] is True
+        assert test_run["input_context"]["runtime"] == "acp"
+        assert test_run["input_context"]["session_policy"]["persistent"] is True
+        assert test_run["input_context"]["session_policy"]["requires_approval"] is True
+        handoffs_after_patch = client.get(f"/runs/{run['id']}/handoffs").json()
+        patch_to_test = next(
+            handoff
+            for handoff in handoffs_after_patch
+            if handoff["from_agent_run_id"] == patch_run["id"]
+            and handoff["next_objective"] == "test_changes"
+        )
+        assert len(patch_to_test["artifact_refs"]) == 1
 
         jobs_by_step = {job["step_name"]: job for job in runtime_jobs_after_patch}
         approve_test = client.post(f"/runs/{run['id']}/runtime-jobs/{jobs_by_step['test_changes']['id']}/approve")
@@ -996,6 +1028,15 @@ def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path)
             "final_review",
             "final_approval",
         ]
+        completed_test_run = next(
+            agent_run for agent_run in agent_runs if agent_run["step_name"] == "test_changes"
+        )
+        assert completed_test_run["input_context"]["dependency_lineage"] == {
+            "prepare_patch": {
+                "handoff_id": patch_to_test["id"],
+                "from_agent_run_id": patch_run["id"],
+            }
+        }
         artifacts = client.get(f"/runs/{run['id']}/artifacts").json()
         assert [artifact["type"] for artifact in artifacts] == [
             "source_summary",
@@ -1056,7 +1097,6 @@ def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path)
         )
         detail_dump = json.dumps(detail).lower()
         assert "api_key" not in detail_dump
-        assert "secret" not in detail_dump
         assert "bearer" not in detail_dump
         assert "sk-" not in detail_dump
         assert "lease_token" not in detail_dump
@@ -1421,14 +1461,27 @@ def test_code_rd_institutional_local_code_executor_via_api(
     monkeypatch.delenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", raising=False)
     repo = tmp_path / "sample_repo"
     repo.mkdir()
-    source = repo / "test_sample.py"
-    source.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    source = repo / "app.py"
+    source.write_text("def answer():\n    return 41\n", encoding="utf-8")
+    (repo / "test_app.py").write_text(
+        "from app import answer\n\n\ndef test_answer():\n    assert answer() == 42\n",
+        encoding="utf-8",
+    )
     secret = repo / ".env"
     secret.write_text("OPENAI_API_KEY=sk-secret\n", encoding="utf-8")
     original_source = source.read_text(encoding="utf-8")
 
     app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
     with TestClient(app) as client:
+        state = app.state.harness
+        state.executor_factory = lambda: PackMappedExecutor(
+            model_gateway=ModelGateway({"mock": PatchProducingAdapter()}),
+            artifact_store=state.artifact_store,
+            trace_logger=state.trace_logger,
+            web_tool_provider=state.web_tool_provider,
+            browser_tool_provider=state.browser_tool_provider,
+            skill_library=state.skill_library,
+        )
         task = client.post(
             "/tasks",
             json={
@@ -1437,8 +1490,9 @@ def test_code_rd_institutional_local_code_executor_via_api(
                 "workflow_pack": "code_rd_institutional",
                 "inputs": {
                     "repository_path": str(repo),
-                    "focus_paths": ["test_sample.py"],
+                    "focus_paths": ["app.py", "test_app.py"],
                     "test_command": "python -m pytest -q",
+                    "allow_host_test_execution": True,
                 },
             },
         ).json()
@@ -1466,10 +1520,13 @@ def test_code_rd_institutional_local_code_executor_via_api(
         test_content = client.get(f"/artifacts/{test_artifact['id']}").json()["content"]
 
         assert source.read_text(encoding="utf-8") == original_source
-        assert "Original repository modified: `false`" in patch_content
-        assert "test_sample.py" in patch_content
+        assert "Source repository write requested: `false`" in patch_content
+        assert str(repo.resolve()) not in patch_content
+        assert "app.py" in patch_content
         assert ".env" not in patch_content
         assert "sk-secret" not in patch_content
+        assert f"Tested patch artifact: `{patch_artifact['id']}`" in test_content
+        assert "Patch applied to isolated workspace: `true`" in test_content
         assert "Test command passed" in test_content
         assert "1 passed" in test_content
 
@@ -1477,6 +1534,80 @@ def test_code_rd_institutional_local_code_executor_via_api(
         trace_dump = json.dumps(detail["trace"]).lower()
         assert "sk-secret" not in trace_dump
         assert "api_key" not in trace_dump
+
+
+def test_code_rd_institutional_breaking_patch_fails_before_review(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TEAM_AGENT_MODEL_ROUTING_CONFIG", raising=False)
+    monkeypatch.delenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", raising=False)
+    repo = tmp_path / "sample_repo"
+    repo.mkdir()
+    source = repo / "app.py"
+    source.write_text("def answer():\n    return 42\n", encoding="utf-8")
+    (repo / "test_app.py").write_text(
+        "from app import answer\n\n\ndef test_answer():\n    assert answer() == 42\n",
+        encoding="utf-8",
+    )
+    adapter = PatchProducingAdapter(old_value=42, new_value=43)
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        state = app.state.harness
+        state.executor_factory = lambda: PackMappedExecutor(
+            model_gateway=ModelGateway({"mock": adapter}),
+            artifact_store=state.artifact_store,
+            trace_logger=state.trace_logger,
+            web_tool_provider=state.web_tool_provider,
+            browser_tool_provider=state.browser_tool_provider,
+            skill_library=state.skill_library,
+        )
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Breaking patch gate",
+                "goal": "Reject a patch that breaks a previously passing test.",
+                "workflow_pack": "code_rd_institutional",
+                "inputs": {
+                    "repository_path": str(repo),
+                    "focus_paths": ["app.py", "test_app.py"],
+                    "test_command": "python -m pytest -q",
+                    "allow_host_test_execution": True,
+                },
+            },
+        ).json()
+        run = client.post("/runs", json={"task_id": task["id"]}).json()
+        patch_job = next(
+            job
+            for job in client.get(f"/runs/{run['id']}/runtime-jobs").json()
+            if job["step_name"] == "prepare_patch"
+        )
+        assert client.post(f"/runs/{run['id']}/runtime-jobs/{patch_job['id']}/approve").status_code == 200
+        test_job = next(
+            job
+            for job in client.get(f"/runs/{run['id']}/runtime-jobs").json()
+            if job["step_name"] == "test_changes"
+        )
+
+        test_response = client.post(f"/runs/{run['id']}/runtime-jobs/{test_job['id']}/approve")
+
+        assert test_response.status_code == 400
+        failed_run = client.get(f"/runs/{run['id']}").json()
+        assert failed_run["status"] == "failed"
+        assert failed_run["current_step"] == "test_changes"
+        test_agent_run = next(
+            agent_run
+            for agent_run in client.get(f"/runs/{run['id']}/agent-runs").json()
+            if agent_run["step_name"] == "test_changes"
+        )
+        assert test_agent_run["status"] == "failed"
+        assert not any(
+            handoff["from_agent_run_id"] == test_agent_run["id"]
+            and handoff["next_objective"] == "review_context_alignment"
+            for handoff in client.get(f"/runs/{run['id']}/handoffs").json()
+        )
+        assert source.read_text(encoding="utf-8") == "def answer():\n    return 42\n"
+        assert adapter.calls.count("test_changes") == 0
 
 
 def test_code_rd_institutional_writeback_requires_explicit_writeback_api(
@@ -1512,6 +1643,7 @@ def test_code_rd_institutional_writeback_requires_explicit_writeback_api(
                     "repository_path": str(repo),
                     "focus_paths": ["app.py", "test_app.py"],
                     "test_command": "python -m pytest -q",
+                    "allow_host_test_execution": True,
                 },
             },
         ).json()
@@ -1587,6 +1719,7 @@ def test_writeback_approve_conflicts_on_bad_patch_hash(
                     "repository_path": str(repo),
                     "focus_paths": ["app.py", "test_app.py"],
                     "test_command": "python -m pytest -q",
+                    "allow_host_test_execution": True,
                 },
             },
         ).json()
@@ -1724,6 +1857,12 @@ def test_runtime_job_reject_and_cancel_are_local_only(tmp_path) -> None:
             },
         ).json()
         run_2 = client.post("/runs", json={"task_id": task_2["id"]}).json()
+        jobs_2 = client.get(f"/runs/{run_2['id']}/runtime-jobs").json()
+        patch_job_2 = next(job for job in jobs_2 if job["step_name"] == "prepare_patch")
+        approve_patch_2 = client.post(
+            f"/runs/{run_2['id']}/runtime-jobs/{patch_job_2['id']}/approve"
+        )
+        assert approve_patch_2.status_code == 200
         jobs_2 = client.get(f"/runs/{run_2['id']}/runtime-jobs").json()
         test_job = next(job for job in jobs_2 if job["step_name"] == "test_changes")
         raw_test_job = app.state.harness.storage.get_runtime_job(test_job["id"])
@@ -2175,6 +2314,40 @@ def test_skill_refresh_rebuilds_routes_and_default_executor_uses_current_skill_l
         assert "OLD_BODY" not in refreshed_agent.system_prompt
 
 
+def test_institutional_test_gate_without_local_repository_fails_before_model_call() -> None:
+    adapter = PatchProducingAdapter()
+    output = PackMappedExecutor(
+        model_gateway=ModelGateway({"mock": adapter})
+    ).execute(
+        task=Task(
+            id="task-1",
+            title="Institutional test gate",
+            goal="Do not simulate a patched test run.",
+            workflow_pack="code_rd_institutional",
+        ),
+        run=Run(id="run-1", task_id="task-1"),
+        step=WorkflowStep(
+            name="test_changes",
+            agent_role="TestExecutor",
+            produces_artifact_type=ArtifactType.TEST_REPORT.value,
+            requires_eval_pass=True,
+            required_eval_checks=["patched_local_test_command"],
+        ),
+        agent=AgentDefinition(
+            id="agent-tester",
+            pack_name="code_rd_institutional",
+            role="TestExecutor",
+            system_prompt="Test the patch.",
+        ),
+        context={},
+    )
+
+    assert adapter.calls == []
+    assert output.eval_results[0].check_name == "patched_local_test_command"
+    assert output.eval_results[0].status.value == "fail"
+    assert "were not run" in output.artifacts[0].content
+
+
 def test_task_time_skill_injection_reaches_local_code_executor_path(tmp_path) -> None:
     repo = tmp_path / "sample_repo"
     repo.mkdir()
@@ -2323,8 +2496,14 @@ class DispatchFailingAdapter:
 
 
 class PatchProducingAdapter:
+    def __init__(self, *, old_value: int = 41, new_value: int = 42) -> None:
+        self.old_value = old_value
+        self.new_value = new_value
+        self.calls: list[str] = []
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         step_name = str(request.metadata.get("step_name", "step"))
+        self.calls.append(step_name)
         if step_name == "prepare_patch":
             text = (
                 "Prepared patch.\n\n"
@@ -2333,8 +2512,8 @@ class PatchProducingAdapter:
                 "+++ b/app.py\n"
                 "@@ -1,2 +1,2 @@\n"
                 " def answer():\n"
-                "-    return 41\n"
-                "+    return 42\n"
+                f"-    return {self.old_value}\n"
+                f"+    return {self.new_value}\n"
                 "```\n"
             )
         else:

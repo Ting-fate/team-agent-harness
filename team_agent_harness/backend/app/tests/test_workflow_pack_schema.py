@@ -105,6 +105,27 @@ def test_workflow_step_context_policy_serializes_and_rejects_negative_budgets() 
         ContextPolicy(artifact_excerpt_chars=100001)
 
 
+def test_workflow_pack_requires_context_capacity_for_every_declared_dependency() -> None:
+    with pytest.raises(ValidationError, match="max_upstream_handoffs"):
+        WorkflowPack(
+            name="demo",
+            description="Dependency handoffs must not be silently dropped.",
+            agents=[_agent("Planner"), _agent("Reviewer")],
+            steps=[
+                WorkflowStep(name="first", agent_role="Planner", produces_artifact_type="research_note"),
+                WorkflowStep(name="second", agent_role="Planner", produces_artifact_type="source_summary"),
+                WorkflowStep(
+                    name="review",
+                    agent_role="Reviewer",
+                    depends_on=["first", "second"],
+                    context_policy=ContextPolicy(max_upstream_handoffs=1),
+                    produces_artifact_type="final_report",
+                ),
+            ],
+            final_artifact_type="final_report",
+        )
+
+
 def test_workflow_pack_rejects_empty_agents_or_steps() -> None:
     with pytest.raises(ValidationError):
         WorkflowPack(
@@ -395,6 +416,7 @@ def test_workflow_step_gate_fields_are_serialized_and_validate_artifact_types() 
                 agent_role="Writer",
                 depends_on=["plan"],
                 requires_eval_pass=True,
+                required_eval_checks=["patched_local_test_command"],
                 requires_artifact=["research_note"],
                 ownership={"files": ["app/api.py"], "artifacts": ["final_report"]},
                 produces_artifact_type="final_report",
@@ -406,6 +428,7 @@ def test_workflow_step_gate_fields_are_serialized_and_validate_artifact_types() 
     dumped = pack.model_dump(mode="json")
     write_step = dumped["steps"][1]
     assert write_step["requires_eval_pass"] is True
+    assert write_step["required_eval_checks"] == ["patched_local_test_command"]
     assert write_step["requires_artifact"] == ["research_note"]
     assert write_step["ownership"]["files"] == ["app/api.py"]
 
@@ -425,6 +448,40 @@ def test_workflow_step_gate_fields_are_serialized_and_validate_artifact_types() 
             final_artifact_type="final_report",
         )
 
+
+@pytest.mark.parametrize(
+    ("required_eval_checks", "requires_eval_pass", "message"),
+    [
+        (["patched_local_test_command"], False, "requires requires_eval_pass=true"),
+        (["patched_local_test_command", "patched_local_test_command"], True, "duplicate"),
+        (["   "], True, "blank"),
+        (["write:artifacts_created"], True, "structural artifact check"),
+    ],
+)
+def test_workflow_pack_rejects_invalid_required_eval_checks(
+    required_eval_checks: list[str],
+    requires_eval_pass: bool,
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        WorkflowPack(
+            name="demo",
+            description="Demo pack.",
+            agents=[_agent("Writer")],
+            steps=[
+                WorkflowStep(
+                    name="write",
+                    agent_role="Writer",
+                    requires_eval_pass=requires_eval_pass,
+                    required_eval_checks=required_eval_checks,
+                    produces_artifact_type="final_report",
+                )
+            ],
+            final_artifact_type="final_report",
+        )
+
+
+def test_workflow_pack_rejects_acp_runtime_without_approval() -> None:
     with pytest.raises(ValidationError, match="ACP runtime steps must require approval"):
         WorkflowPack(
             name="demo",

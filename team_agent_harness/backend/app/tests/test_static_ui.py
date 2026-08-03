@@ -215,7 +215,7 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "拒绝意图" in js_response.text
     assert "取消任务" in js_response.text
     assert "只记录本地审批意图" in js_response.text
-    assert "不启动外部执行器" in js_response.text
+    assert "不会启动外部 ACP 执行器" in js_response.text
     assert "submitRuntimeAction" in js_response.text
     assert 'action === "approve" ? "?background=true" : ""' in js_response.text
     assert "预览写回" in js_response.text
@@ -228,7 +228,8 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "/writeback/approve" in js_response.text
     assert "expected_base_hashes" in js_response.text
     assert "confirm_patch_hash" in js_response.text
-    assert "系统会先在隔离副本应用 patch 并运行 test_command" in js_response.text
+    assert "pytest 将以当前 Windows 用户权限执行模型生成补丁后的代码" in js_response.text
+    assert "该进程不是系统安全沙箱" in js_response.text
     assert "此操作会修改你的原项目文件" in js_response.text
     assert "startAcp" not in js_response.text
     assert "Start ACP" not in js_response.text
@@ -290,6 +291,9 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "taskActivityGroup" in js_response.text
     assert "preferredRun" in js_response.text
     assert "isActiveRunStatus" in js_response.text
+    assert js_response.text.count(
+        '["waiting", "approval_required", "waiting_approval", "recorded"].includes(run.status)'
+    ) == 2
     assert "updateAutoRefresh" in js_response.text
     assert "record-group" in js_response.text
     assert "当前所选" in js_response.text

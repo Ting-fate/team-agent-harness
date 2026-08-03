@@ -51,6 +51,7 @@ class WorkflowStep(HarnessModel):
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     context_policy: ContextPolicy = Field(default_factory=ContextPolicy)
     requires_eval_pass: bool = False
+    required_eval_checks: list[str] = Field(default_factory=list)
     requires_artifact: list[str] = Field(default_factory=list)
     ownership: dict[str, list[str]] = Field(default_factory=dict)
 
@@ -95,6 +96,26 @@ class WorkflowPack(HarnessModel):
         self_dependencies = sorted(step.name for step in self.steps if step.name in step.depends_on)
         if self_dependencies:
             raise ValueError(f"Steps cannot depend on themselves: {', '.join(self_dependencies)}")
+
+        duplicate_dependency_steps = sorted(
+            step.name for step in self.steps if _duplicates(step.depends_on)
+        )
+        if duplicate_dependency_steps:
+            raise ValueError(
+                "Steps declare duplicate dependencies: "
+                f"{', '.join(duplicate_dependency_steps)}"
+            )
+
+        undersized_handoff_context_steps = sorted(
+            step.name
+            for step in self.steps
+            if step.context_policy.max_upstream_handoffs < len(step.depends_on)
+        )
+        if undersized_handoff_context_steps:
+            raise ValueError(
+                "max_upstream_handoffs must retain every declared dependency handoff: "
+                f"{', '.join(undersized_handoff_context_steps)}"
+            )
 
         missing_controller_steps = sorted(
             step.name
@@ -147,6 +168,47 @@ class WorkflowPack(HarnessModel):
             raise ValueError(
                 "ACP runtime steps must require approval: "
                 f"{', '.join(acp_without_approval_steps)}"
+            )
+
+        invalid_required_eval_steps = sorted(
+            step.name
+            for step in self.steps
+            if step.required_eval_checks and not step.requires_eval_pass
+        )
+        if invalid_required_eval_steps:
+            raise ValueError(
+                "required_eval_checks requires requires_eval_pass=true: "
+                f"{', '.join(invalid_required_eval_steps)}"
+            )
+        duplicate_required_eval_steps = sorted(
+            step.name
+            for step in self.steps
+            if _duplicates(step.required_eval_checks)
+        )
+        if duplicate_required_eval_steps:
+            raise ValueError(
+                "Steps declare duplicate required_eval_checks: "
+                f"{', '.join(duplicate_required_eval_steps)}"
+            )
+        blank_required_eval_steps = sorted(
+            step.name
+            for step in self.steps
+            if any(not check_name.strip() for check_name in step.required_eval_checks)
+        )
+        if blank_required_eval_steps:
+            raise ValueError(
+                "Steps declare blank required_eval_checks: "
+                f"{', '.join(blank_required_eval_steps)}"
+            )
+        structural_required_eval_steps = sorted(
+            step.name
+            for step in self.steps
+            if f"{step.name}:artifacts_created" in step.required_eval_checks
+        )
+        if structural_required_eval_steps:
+            raise ValueError(
+                "required_eval_checks cannot reuse the structural artifact check: "
+                f"{', '.join(structural_required_eval_steps)}"
             )
 
         cycle = _dependency_cycle(self.steps)
