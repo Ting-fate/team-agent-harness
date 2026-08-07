@@ -35,6 +35,50 @@ class ContextPolicy(HarnessModel):
     max_context_bytes: int = Field(default=300_000, ge=10_000, le=3_000_000)
 
 
+class AgentLoopPolicy(HarnessModel):
+    enabled: bool = False
+    max_steps: int = Field(default=1, ge=1, le=12)
+    max_tool_calls: int = Field(default=0, ge=0, le=32)
+    max_total_tokens: int = Field(default=32_000, ge=1, le=1_000_000)
+    timeout_seconds: float = Field(default=180.0, gt=0, le=3600)
+    max_repeated_tool_calls: int = Field(default=2, ge=1, le=5)
+    max_observation_chars: int = Field(default=20_000, ge=100, le=100_000)
+    max_cost_usd: float | None = Field(default=None, gt=0, le=10_000)
+
+
+class StepAcceptanceCriterion(HarnessModel):
+    name: str = Field(min_length=1, max_length=100)
+    kind: Literal[
+        "artifact_nonempty",
+        "artifact_min_chars",
+        "artifact_contains",
+        "source_refs_present",
+        "executor_eval_pass",
+    ]
+    artifact_type: ArtifactType | None = None
+    min_chars: int | None = Field(default=None, ge=1, le=1_000_000)
+    marker: str | None = Field(default=None, min_length=1, max_length=500)
+    check_name: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_criterion(self) -> "StepAcceptanceCriterion":
+        artifact_kinds = {
+            "artifact_nonempty",
+            "artifact_min_chars",
+            "artifact_contains",
+            "source_refs_present",
+        }
+        if self.kind in artifact_kinds and self.artifact_type is None:
+            raise ValueError(f"{self.kind} requires artifact_type.")
+        if self.kind == "artifact_min_chars" and self.min_chars is None:
+            raise ValueError("artifact_min_chars requires min_chars.")
+        if self.kind == "artifact_contains" and self.marker is None:
+            raise ValueError("artifact_contains requires marker.")
+        if self.kind == "executor_eval_pass" and self.check_name is None:
+            raise ValueError("executor_eval_pass requires check_name.")
+        return self
+
+
 class WorkflowStep(HarnessModel):
     name: str = Field(min_length=1)
     agent_role: str = Field(min_length=1)
@@ -50,6 +94,10 @@ class WorkflowStep(HarnessModel):
     runtime: Literal["model", "session", "acp"] = "model"
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     context_policy: ContextPolicy = Field(default_factory=ContextPolicy)
+    agent_loop: AgentLoopPolicy = Field(default_factory=AgentLoopPolicy)
+    execution_source: Literal["workflow_pack", "planner", "operator"] = "workflow_pack"
+    objective: str | None = Field(default=None, min_length=1, max_length=10_000)
+    acceptance_criteria: list[StepAcceptanceCriterion] = Field(default_factory=list, max_length=16)
     requires_eval_pass: bool = False
     required_eval_checks: list[str] = Field(default_factory=list)
     requires_artifact: list[str] = Field(default_factory=list)
@@ -63,6 +111,8 @@ class WorkflowPack(HarnessModel):
     steps: list[WorkflowStep] = Field(min_length=1)
     eval_checks: list[EvalCheck] = Field(default_factory=list)
     final_artifact_type: str = Field(min_length=1)
+    max_parallel_steps: int = Field(default=8, ge=1, le=32)
+    allow_dynamic_execution_plans: bool = True
 
     @model_validator(mode="after")
     def validate_pack(self) -> "WorkflowPack":
@@ -170,6 +220,22 @@ class WorkflowPack(HarnessModel):
                 f"{', '.join(acp_without_approval_steps)}"
             )
 
+        invalid_agent_loop_steps = sorted(
+            step.name
+            for step in self.steps
+            if step.agent_loop.enabled
+            and (
+                step.agent_loop.max_steps < 2
+                or step.agent_loop.max_tool_calls < 1
+                or not step.allowed_tools
+            )
+        )
+        if invalid_agent_loop_steps:
+            raise ValueError(
+                "Enabled agent loops require tools, max_steps>=2, and max_tool_calls>=1: "
+                f"{', '.join(invalid_agent_loop_steps)}"
+            )
+
         invalid_required_eval_steps = sorted(
             step.name
             for step in self.steps
@@ -189,6 +255,16 @@ class WorkflowPack(HarnessModel):
             raise ValueError(
                 "Steps declare duplicate required_eval_checks: "
                 f"{', '.join(duplicate_required_eval_steps)}"
+            )
+        duplicate_acceptance_criteria_steps = sorted(
+            step.name
+            for step in self.steps
+            if _duplicates([criterion.name for criterion in step.acceptance_criteria])
+        )
+        if duplicate_acceptance_criteria_steps:
+            raise ValueError(
+                "Steps declare duplicate acceptance criterion names: "
+                f"{', '.join(duplicate_acceptance_criteria_steps)}"
             )
         blank_required_eval_steps = sorted(
             step.name

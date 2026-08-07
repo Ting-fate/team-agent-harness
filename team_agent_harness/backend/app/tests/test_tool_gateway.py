@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from app.core.models import AgentDefinition, AgentRun, Run, Task, TraceEventType
@@ -101,6 +103,53 @@ def test_gateway_rejects_missing_required_fields(tool_env) -> None:
     assert logger.list_for_run(context.run_id)[0].payload["error_type"] == "ToolValidationError"
 
 
+def test_gateway_exposes_and_enforces_the_same_typed_schema(tool_env) -> None:
+    _, _, gateway, context, _ = tool_env
+
+    specs = gateway.model_tool_specs(frozenset({"read_file"}))
+
+    assert specs == [
+        {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file within the workspace.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "maxLength": 4096}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    with pytest.raises(ToolValidationError, match="Unexpected fields"):
+        gateway.call_tool(context, "read_file", {"path": "README.md", "extra": True})
+    with pytest.raises(ToolValidationError, match="Invalid field type"):
+        gateway.call_tool(context, "read_file", {"path": 7})
+
+
+def test_gateway_requires_explicit_side_effect_approval_in_agent_loop_mode(tool_env) -> None:
+    _, _, gateway, context, _ = tool_env
+    guarded_context = ToolContext(
+        run_id=context.run_id,
+        agent_run_id=context.agent_run_id,
+        agent=context.agent,
+        allowed_tools=frozenset({"run_test_command"}),
+        enforce_side_effect_approval=True,
+    )
+
+    with pytest.raises(ToolPermissionError, match="Explicit side effect approval"):
+        gateway.call_tool(guarded_context, "run_test_command", {"command": "pytest -q"})
+
+    approved_context = ToolContext(
+        **{
+            **guarded_context.__dict__,
+            "approved_side_effect_tools": frozenset({"run_test_command"}),
+        }
+    )
+    assert gateway.call_tool(approved_context, "run_test_command", {"command": "pytest -q"})[
+        "status"
+    ] == "mocked"
+
+
 def test_gateway_rejects_unknown_tool(tool_env) -> None:
     _, logger, gateway, context, _ = tool_env
 
@@ -165,7 +214,31 @@ def test_list_and_search_skip_symlink_escape(tool_env) -> None:
     searched = gateway.call_tool(context, "search_files", {"query": "outside secret"})
 
     assert "secret-link.txt" not in listed["files"]
-    assert searched == {"matches": []}
+    assert searched == {"matches": [], "truncated": False}
+
+
+def test_file_tools_reject_hard_link_to_file_outside_workspace(tool_env) -> None:
+    _, logger, gateway, context, workspace = tool_env
+    outside = workspace.parent / "outside-source.txt"
+    outside.write_text("outside hard-link marker", encoding="utf-8")
+    link = workspace / "innocent.txt"
+    try:
+        os.link(outside, link)
+    except OSError:
+        pytest.skip("Hard-link creation is not available in this environment")
+
+    assert link.stat().st_nlink > 1
+    with pytest.raises(ToolPermissionError, match="Hard-linked"):
+        gateway.call_tool(context, "read_file", {"path": "innocent.txt"})
+
+    listed = gateway.call_tool(context, "list_files", {})
+    searched = gateway.call_tool(context, "search_files", {"query": "outside hard-link marker"})
+    assert "innocent.txt" not in listed["files"]
+    assert searched == {"matches": [], "truncated": False}
+    errors = [
+        event for event in logger.list_for_run(context.run_id) if event.event_type == TraceEventType.ERROR
+    ]
+    assert errors[-1].payload["error_type"] == "ToolPermissionError"
 
 
 def test_list_and_search_file_tools(tool_env) -> None:
@@ -174,8 +247,59 @@ def test_list_and_search_file_tools(tool_env) -> None:
     listed = gateway.call_tool(context, "list_files", {})
     searched = gateway.call_tool(context, "search_files", {"query": "research"})
 
-    assert listed == {"files": ["README.md", "notes.txt"]}
-    assert searched == {"matches": [{"path": "notes.txt"}]}
+    assert listed == {"files": ["README.md", "notes.txt"], "truncated": False}
+    assert searched == {"matches": [{"path": "notes.txt"}], "truncated": False}
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".env",
+        ".env.local",
+        "credentials.json",
+        "private.pem",
+        "secrets/provider.json",
+        ".secrets/provider.json",
+        "credentials/provider.json",
+        ".token",
+        "token.txt",
+        "passwords.csv",
+        "api_key.json",
+        ".htpasswd",
+        ".ssh/id_ed25519",
+        ".git/config",
+        ".venv/site.py",
+    ],
+)
+def test_file_tools_hide_sensitive_workspace_paths(tool_env, relative_path: str) -> None:
+    _, _, gateway, context, workspace = tool_env
+    sensitive = workspace / relative_path
+    sensitive.parent.mkdir(parents=True, exist_ok=True)
+    sensitive.write_text("sensitive-marker", encoding="utf-8")
+
+    with pytest.raises(ToolPermissionError, match="Sensitive workspace paths"):
+        gateway.call_tool(context, "read_file", {"path": relative_path})
+
+    listed = gateway.call_tool(context, "list_files", {})
+    searched = gateway.call_tool(context, "search_files", {"query": "sensitive-marker"})
+    assert relative_path not in listed["files"]
+    assert searched["matches"] == []
+
+
+def test_sensitive_name_filter_does_not_hide_source_names_with_embedded_markers(tool_env) -> None:
+    _, _, gateway, context, workspace = tool_env
+    expected = ["password_policy.py", "secret_scanner.py", "tokenizer.py"]
+    for filename in expected:
+        (workspace / filename).write_text("bounded-filter-marker", encoding="utf-8")
+
+    listed = gateway.call_tool(context, "list_files", {})
+    searched = gateway.call_tool(context, "search_files", {"query": "bounded-filter-marker"})
+
+    assert all(filename in listed["files"] for filename in expected)
+    assert searched["matches"] == [{"path": filename} for filename in expected]
+    assert gateway.call_tool(context, "read_file", {"path": "tokenizer.py"}) == {
+        "content": "bounded-filter-marker"
+    }
 
 
 def test_write_artifact_tool_uses_artifact_store_and_redacts_content_trace(tool_env) -> None:
@@ -190,6 +314,7 @@ def test_write_artifact_tool_uses_artifact_store_and_redacts_content_trace(tool_
     artifacts = db.list_artifacts_for_run(context.run_id)
     assert len(artifacts) == 1
     assert result["artifact_id"] == artifacts[0].id
+    assert "path" not in result
     events = logger.list_for_run(context.run_id)
     tool_call = [event for event in events if event.event_type == TraceEventType.TOOL_CALL][0]
     assert tool_call.payload["input"]["content_length"] == len("# Result")

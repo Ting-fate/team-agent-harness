@@ -19,7 +19,7 @@
 
 - Do not edit `.env.local`, credentials, SQLite schema/data, `data/artifacts/`, or existing run output unless the operator explicitly asks.
 - Do not delete old artifacts or attempt records during recovery or cleanup.
-- Do not initialize or repair Git automatically. The workspace contains a `.git` directory, but Git currently reports that this is not a repository.
+- Git is initialized and `main` tracks `origin/main`. Do not commit, push, rewrite history, or otherwise manage Git unless the operator explicitly asks.
 - Generated browser verification files belong under `team_agent_harness/backend/output/playwright/`.
 
 ## Working Directory And Verification

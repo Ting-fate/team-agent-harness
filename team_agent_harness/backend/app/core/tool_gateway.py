@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import os
 from pathlib import Path
-from typing import Any
+import stat
+from typing import Any, Literal
 
 from app.core.models import AgentDefinition, TraceEventType
 from app.core.artifacts import ArtifactStore
@@ -27,12 +29,82 @@ class ToolValidationError(ToolGatewayError):
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
 
 
+_MAX_WORKSPACE_FILE_BYTES = 1_000_000
+_MAX_WORKSPACE_LIST_RESULTS = 2_000
+_MAX_WORKSPACE_SEARCH_RESULTS = 200
+_IGNORED_WORKSPACE_DIRECTORIES = {
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "venv",
+}
+_SENSITIVE_WORKSPACE_DIRECTORIES = {
+    ".aws",
+    ".azure",
+    ".credentials",
+    ".gnupg",
+    ".secrets",
+    ".ssh",
+    "credentials",
+    "secrets",
+}
+_SENSITIVE_WORKSPACE_FILENAMES = {
+    ".git-credentials",
+    ".htpasswd",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials.json",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+    "service-account.json",
+    "service_account.json",
+}
+_SENSITIVE_WORKSPACE_STEMS = {
+    "api_key",
+    "api_keys",
+    "apikey",
+    "apikeys",
+    "credential",
+    "credentials",
+    "passwd",
+    "password",
+    "passwords",
+    "private_key",
+    "private_keys",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+}
+_SENSITIVE_WORKSPACE_SUFFIXES = {
+    ".jks",
+    ".kdbx",
+    ".key",
+    ".keystore",
+    ".p12",
+    ".pem",
+    ".pfx",
+    ".ppk",
+}
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
     description: str
     required_fields: frozenset[str]
     handler: ToolHandler
+    input_schema: dict[str, Any] | None = None
+    side_effect: Literal["none", "local_write", "local_execute", "external_write"] = "none"
     real_web_call_enabled: Callable[[], bool] | None = None
 
 
@@ -43,6 +115,8 @@ class ToolContext:
     agent: AgentDefinition
     allowed_tools: frozenset[str]
     real_web_access_confirmed: bool = False
+    enforce_side_effect_approval: bool = False
+    approved_side_effect_tools: frozenset[str] = frozenset()
 
 
 class ToolGateway:
@@ -57,6 +131,19 @@ class ToolGateway:
 
     def list_tools(self) -> list[ToolDefinition]:
         return list(self._tools.values())
+
+    def model_tool_specs(self, allowed_tools: frozenset[str]) -> list[dict[str, Any]]:
+        specs = []
+        for tool_name in sorted(allowed_tools):
+            definition = self._get_tool(tool_name)
+            specs.append(
+                {
+                    "name": definition.name,
+                    "description": definition.description,
+                    "input_schema": _tool_input_schema(definition),
+                }
+            )
+        return specs
 
     def call_tool(self, context: ToolContext, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -130,6 +217,12 @@ class ToolGateway:
         if tool_name not in context.agent.tool_permissions:
             raise ToolPermissionError(f"Tool not allowed for agent {context.agent.role}: {tool_name}")
         if (
+            context.enforce_side_effect_approval
+            and definition.side_effect != "none"
+            and tool_name not in context.approved_side_effect_tools
+        ):
+            raise ToolPermissionError(f"Explicit side effect approval is required for tool: {tool_name}")
+        if (
             definition.real_web_call_enabled is not None
             and definition.real_web_call_enabled()
             and not context.real_web_access_confirmed
@@ -139,9 +232,12 @@ class ToolGateway:
             )
 
     def _validate_payload(self, definition: ToolDefinition, payload: dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            raise ToolValidationError(f"Tool payload must be an object: {definition.name}")
         missing = sorted(definition.required_fields - set(payload))
         if missing:
             raise ToolValidationError(f"Missing required fields for {definition.name}: {', '.join(missing)}")
+        _validate_input_schema(definition.name, payload, _tool_input_schema(definition))
 
 
 def create_mock_gateway(
@@ -161,22 +257,25 @@ def create_mock_gateway(
             description="Read a UTF-8 text file within the workspace.",
             required_fields=frozenset({"path"}),
             handler=lambda payload: {"content": _read_workspace_file(workspace_root, payload["path"])},
+            input_schema=_object_schema({"path": _string_schema(max_length=4096)}, required={"path"}),
         )
     )
     gateway.register_tool(
         ToolDefinition(
             name="list_files",
-            description="List files under the workspace root.",
+            description="List source files under the workspace root, excluding sensitive and generated paths.",
             required_fields=frozenset(),
-            handler=lambda payload: {"files": _list_workspace_files(workspace_root)},
+            handler=lambda payload: _list_workspace_files(workspace_root),
+            input_schema=_object_schema({}),
         )
     )
     gateway.register_tool(
         ToolDefinition(
             name="search_files",
-            description="Search workspace text files by substring.",
+            description="Search bounded workspace source files by substring, excluding sensitive paths.",
             required_fields=frozenset({"query"}),
-            handler=lambda payload: {"matches": _search_workspace_files(workspace_root, payload["query"])},
+            handler=lambda payload: _search_workspace_files(workspace_root, payload["query"]),
+            input_schema=_object_schema({"query": _string_schema(max_length=10_000)}, required={"query"}),
         )
     )
     gateway.register_tool(
@@ -185,6 +284,8 @@ def create_mock_gateway(
             description="Mock test command execution.",
             required_fields=frozenset({"command"}),
             handler=_run_test_command_mock,
+            input_schema=_object_schema({"command": _string_schema(max_length=200)}, required={"command"}),
+            side_effect="local_execute",
         )
     )
     gateway.register_tool(
@@ -193,6 +294,7 @@ def create_mock_gateway(
             description="Mock web search.",
             required_fields=frozenset({"query"}),
             handler=lambda payload: {"results": [{"title": "Mock result", "query": payload["query"]}]},
+            input_schema=_object_schema({"query": _string_schema(max_length=10_000)}, required={"query"}),
         )
     )
     gateway.register_tool(
@@ -201,6 +303,13 @@ def create_mock_gateway(
             description="Search the public web through the configured provider.",
             required_fields=frozenset({"query"}),
             handler=web_tool_provider.search,
+            input_schema=_object_schema(
+                {
+                    "query": _string_schema(max_length=10_000),
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                required={"query"},
+            ),
             real_web_call_enabled=lambda: (
                 web_tool_provider.provider_name != "mock" and web_tool_provider.real_calls_enabled
             ),
@@ -212,6 +321,7 @@ def create_mock_gateway(
             description="Mock page fetch.",
             required_fields=frozenset({"url"}),
             handler=lambda payload: {"url": payload["url"], "content": "mock page content"},
+            input_schema=_object_schema({"url": _string_schema(max_length=4096)}, required={"url"}),
         )
     )
     gateway.register_tool(
@@ -220,6 +330,7 @@ def create_mock_gateway(
             description="Fetch a public http(s) page through the configured provider.",
             required_fields=frozenset({"url"}),
             handler=web_tool_provider.fetch_page,
+            input_schema=_fetch_schema(),
             real_web_call_enabled=lambda: (
                 web_tool_provider.provider_name != "mock" and web_tool_provider.real_calls_enabled
             ),
@@ -231,6 +342,13 @@ def create_mock_gateway(
             description="Search the public web through the configured local browser bridge.",
             required_fields=frozenset({"query"}),
             handler=browser_tool_provider.search,
+            input_schema=_object_schema(
+                {
+                    "query": _string_schema(max_length=10_000),
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                required={"query"},
+            ),
             real_web_call_enabled=lambda: (
                 browser_tool_provider.provider_name != "mock"
                 and browser_tool_provider.real_calls_enabled
@@ -243,6 +361,7 @@ def create_mock_gateway(
             description="Fetch a public http(s) page through the configured local browser bridge.",
             required_fields=frozenset({"url"}),
             handler=browser_tool_provider.fetch_page,
+            input_schema=_fetch_schema(),
             real_web_call_enabled=lambda: (
                 browser_tool_provider.provider_name != "mock"
                 and browser_tool_provider.real_calls_enabled
@@ -255,6 +374,20 @@ def create_mock_gateway(
             description="Write an artifact through ArtifactStore.",
             required_fields=frozenset({"filename", "content"}),
             handler=lambda payload: _write_artifact(artifact_store, payload),
+            input_schema=_object_schema(
+                {
+                    "filename": _string_schema(max_length=255),
+                    "content": _string_schema(max_length=1_000_000),
+                    "artifact_type": _string_schema(max_length=100),
+                    "source_refs": {
+                        "type": "array",
+                        "items": _string_schema(max_length=4096),
+                        "maxItems": 64,
+                    },
+                },
+                required={"filename", "content"},
+            ),
+            side_effect="local_write",
         )
     )
     return gateway
@@ -264,45 +397,206 @@ def _workspace_path(root: Path, raw_path: str) -> Path:
     candidate = Path(raw_path)
     if candidate.is_absolute():
         raise ToolPermissionError("Path must be relative to workspace root")
-    path = (root / candidate).resolve()
-    if not path.is_relative_to(root):
+    path = root / candidate
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root):
         raise ToolPermissionError("Path must stay within workspace root")
+    if _is_sensitive_workspace_path(root, path) or _is_sensitive_workspace_path(root, resolved):
+        raise ToolPermissionError("Sensitive workspace paths are not available to agents")
     return path
 
 
 def _read_workspace_file(root: Path, raw_path: str) -> str:
     path = _workspace_path(root, raw_path)
-    if not path.is_file():
-        raise ToolValidationError(f"Not a file: {raw_path}")
-    return path.read_text(encoding="utf-8")
+    content = _read_verified_workspace_bytes(root, path, raw_path)
+    try:
+        return content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeDecodeError as exc:
+        raise ToolValidationError(f"File is not UTF-8 text: {raw_path}") from exc
 
 
-def _list_workspace_files(root: Path) -> list[str]:
-    return sorted(
-        path.relative_to(root).as_posix()
-        for path in root.rglob("*")
-        if _is_workspace_file(root, path)
-    )
+def _list_workspace_files(root: Path) -> dict[str, Any]:
+    files: list[str] = []
+    truncated = False
+    for path in _iter_workspace_files(root):
+        if len(files) >= _MAX_WORKSPACE_LIST_RESULTS:
+            truncated = True
+            break
+        files.append(path.relative_to(root).as_posix())
+    return {"files": files, "truncated": truncated}
 
 
-def _search_workspace_files(root: Path, query: str) -> list[dict[str, str]]:
+def _search_workspace_files(root: Path, query: str) -> dict[str, Any]:
     matches: list[dict[str, str]] = []
-    for path in root.rglob("*"):
-        if not _is_workspace_file(root, path):
-            continue
+    truncated = False
+    for path in _iter_workspace_files(root):
         relative = path.relative_to(root).as_posix()
         try:
-            content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+            content = (
+                _read_verified_workspace_bytes(root, path, relative)
+                .decode("utf-8")
+                .replace("\r\n", "\n")
+                .replace("\r", "\n")
+            )
+        except (ToolGatewayError, UnicodeDecodeError, OSError):
             continue
         if query in content:
+            if len(matches) >= _MAX_WORKSPACE_SEARCH_RESULTS:
+                truncated = True
+                break
             matches.append({"path": relative})
-    return matches
+    return {"matches": matches, "truncated": truncated}
+
+
+def _iter_workspace_files(root: Path):
+    for directory, directory_names, filenames in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        directory_names[:] = sorted(
+            name
+            for name in directory_names
+            if name.lower() not in _IGNORED_WORKSPACE_DIRECTORIES
+            and name.lower() not in _SENSITIVE_WORKSPACE_DIRECTORIES
+            and _is_workspace_directory(root, directory_path / name)
+        )
+        for filename in sorted(filenames):
+            path = directory_path / filename
+            if _is_workspace_file(root, path):
+                yield path
 
 
 def _is_workspace_file(root: Path, path: Path) -> bool:
-    resolved = path.resolve()
-    return resolved.is_relative_to(root) and resolved.is_file()
+    try:
+        resolved = path.resolve(strict=True)
+        file_stat = os.stat(path, follow_symlinks=False)
+        _reject_workspace_link_components(root, path)
+    except (OSError, RuntimeError, ToolPermissionError, ValueError):
+        return False
+    return (
+        resolved.is_relative_to(root)
+        and stat.S_ISREG(file_stat.st_mode)
+        and not _is_reparse_point(file_stat)
+        and getattr(file_stat, "st_nlink", 0) == 1
+        and not _is_sensitive_workspace_path(root, path)
+        and not _is_sensitive_workspace_path(root, resolved)
+    )
+
+
+def _is_workspace_directory(root: Path, path: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        directory_stat = os.stat(path, follow_symlinks=False)
+        _reject_workspace_link_components(root, path)
+    except (OSError, RuntimeError, ToolPermissionError, ValueError):
+        return False
+    return (
+        resolved.is_relative_to(root)
+        and stat.S_ISDIR(directory_stat.st_mode)
+        and not _is_reparse_point(directory_stat)
+        and not _is_sensitive_workspace_path(root, path)
+        and not _is_sensitive_workspace_path(root, resolved)
+    )
+
+
+def _is_sensitive_workspace_path(root: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    parts = [part.lower() for part in relative.parts]
+    if any(part in _SENSITIVE_WORKSPACE_DIRECTORIES for part in parts[:-1]):
+        return True
+    if any(part in _IGNORED_WORKSPACE_DIRECTORIES for part in parts[:-1]):
+        return True
+    filename = parts[-1] if parts else ""
+    filename_stem = filename.lstrip(".").split(".", 1)[0]
+    return (
+        filename == ".env"
+        or filename.startswith(".env.")
+        or filename in _SENSITIVE_WORKSPACE_FILENAMES
+        or filename_stem in _SENSITIVE_WORKSPACE_STEMS
+        or Path(filename).suffix.lower() in _SENSITIVE_WORKSPACE_SUFFIXES
+    )
+
+
+def _read_verified_workspace_bytes(root: Path, path: Path, display_path: str) -> bytes:
+    _reject_workspace_link_components(root, path)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ToolValidationError(f"File could not be opened safely: {display_path}") from exc
+    try:
+        before = os.fstat(descriptor)
+        _validate_opened_workspace_file(root, path, before, display_path)
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            content = handle.read(_MAX_WORKSPACE_FILE_BYTES + 1)
+        after = os.fstat(descriptor)
+        _validate_opened_workspace_file(root, path, after, display_path)
+        if (
+            not os.path.samestat(before, after)
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise ToolValidationError(f"File changed while being read: {display_path}")
+        if len(content) > _MAX_WORKSPACE_FILE_BYTES:
+            raise ToolValidationError(f"File exceeds read limit: {display_path}")
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _validate_opened_workspace_file(
+    root: Path,
+    path: Path,
+    opened_stat: os.stat_result,
+    display_path: str,
+) -> None:
+    if not stat.S_ISREG(opened_stat.st_mode):
+        raise ToolValidationError(f"Not a file: {display_path}")
+    if _is_reparse_point(opened_stat):
+        raise ToolPermissionError("Linked workspace files are not available to agents")
+    if getattr(opened_stat, "st_nlink", 0) != 1:
+        raise ToolPermissionError("Hard-linked workspace files are not available to agents")
+    if opened_stat.st_size > _MAX_WORKSPACE_FILE_BYTES:
+        raise ToolValidationError(f"File exceeds read limit: {display_path}")
+    try:
+        current_stat = os.stat(path, follow_symlinks=False)
+        resolved = path.resolve(strict=True)
+        _reject_workspace_link_components(root, path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ToolPermissionError("Workspace file path changed during validation") from exc
+    if (
+        not resolved.is_relative_to(root)
+        or _is_sensitive_workspace_path(root, path)
+        or _is_sensitive_workspace_path(root, resolved)
+        or _is_reparse_point(current_stat)
+        or not os.path.samestat(opened_stat, current_stat)
+    ):
+        raise ToolPermissionError("Workspace file path changed during validation")
+
+
+def _reject_workspace_link_components(root: Path, path: Path) -> None:
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ToolPermissionError("Path must stay within workspace root") from exc
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            component_stat = os.stat(current, follow_symlinks=False)
+        except OSError as exc:
+            raise ToolPermissionError("Workspace path could not be validated safely") from exc
+        if stat.S_ISLNK(component_stat.st_mode) or _is_reparse_point(component_stat):
+            raise ToolPermissionError("Linked workspace paths are not available to agents")
+
+
+def _is_reparse_point(file_stat: os.stat_result) -> bool:
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(
+        reparse_attribute
+        and getattr(file_stat, "st_file_attributes", 0) & reparse_attribute
+    )
 
 
 def _write_artifact(artifact_store: ArtifactStore | None, payload: dict[str, Any]) -> dict[str, Any]:
@@ -316,7 +610,7 @@ def _write_artifact(artifact_store: ArtifactStore | None, payload: dict[str, Any
         content=payload["content"],
         source_refs=payload.get("source_refs", []),
     )
-    return {"artifact_id": artifact.id, "path": artifact.path, "content_hash": artifact.content_hash}
+    return {"artifact_id": artifact.id, "content_hash": artifact.content_hash}
 
 
 def _run_test_command_mock(payload: dict[str, Any]) -> dict[str, Any]:
@@ -343,3 +637,78 @@ def _summarize_tool_output(tool_name: str, result: dict[str, Any]) -> dict[str, 
     if tool_name in {"browser_search", "browser_fetch"}:
         return safe_browser_tool_output_summary(tool_name, result)
     return safe_tool_output_summary(tool_name, result)
+
+
+def _tool_input_schema(definition: ToolDefinition) -> dict[str, Any]:
+    if definition.input_schema is not None:
+        return definition.input_schema
+    return _object_schema(
+        {field: {} for field in sorted(definition.required_fields)},
+        required=set(definition.required_fields),
+    )
+
+
+def _object_schema(properties: dict[str, Any], *, required: set[str] | None = None) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": sorted(required or set()),
+        "additionalProperties": False,
+    }
+
+
+def _string_schema(*, max_length: int) -> dict[str, Any]:
+    return {"type": "string", "maxLength": max_length}
+
+
+def _fetch_schema() -> dict[str, Any]:
+    return _object_schema(
+        {
+            "url": _string_schema(max_length=4096),
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1_000_000},
+        },
+        required={"url"},
+    )
+
+
+def _validate_input_schema(tool_name: str, payload: dict[str, Any], schema: dict[str, Any]) -> None:
+    properties = schema.get("properties")
+    if schema.get("type") != "object" or not isinstance(properties, dict):
+        raise ToolValidationError(f"Invalid input schema for tool: {tool_name}")
+    if schema.get("additionalProperties") is False:
+        unexpected = sorted(set(payload) - set(properties))
+        if unexpected:
+            raise ToolValidationError(f"Unexpected fields for {tool_name}: {', '.join(unexpected)}")
+    for field_name, value in payload.items():
+        field_schema = properties.get(field_name)
+        if not isinstance(field_schema, dict):
+            continue
+        _validate_schema_value(tool_name, field_name, value, field_schema)
+
+
+def _validate_schema_value(tool_name: str, field_name: str, value: Any, schema: dict[str, Any]) -> None:
+    value_type = schema.get("type")
+    valid = (
+        value_type is None
+        or (value_type == "string" and isinstance(value, str))
+        or (value_type == "integer" and type(value) is int)
+        or (value_type == "boolean" and type(value) is bool)
+        or (value_type == "array" and isinstance(value, list))
+    )
+    if not valid:
+        raise ToolValidationError(f"Invalid field type for {tool_name}.{field_name}")
+    if isinstance(value, str) and isinstance(schema.get("maxLength"), int):
+        if len(value) > schema["maxLength"]:
+            raise ToolValidationError(f"Field is too long for {tool_name}.{field_name}")
+    if type(value) is int:
+        if isinstance(schema.get("minimum"), int) and value < schema["minimum"]:
+            raise ToolValidationError(f"Field is below minimum for {tool_name}.{field_name}")
+        if isinstance(schema.get("maximum"), int) and value > schema["maximum"]:
+            raise ToolValidationError(f"Field exceeds maximum for {tool_name}.{field_name}")
+    if isinstance(value, list):
+        if isinstance(schema.get("maxItems"), int) and len(value) > schema["maxItems"]:
+            raise ToolValidationError(f"Too many items for {tool_name}.{field_name}")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                _validate_schema_value(tool_name, f"{field_name}[{index}]", item, item_schema)

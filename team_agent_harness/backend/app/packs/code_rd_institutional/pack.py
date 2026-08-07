@@ -354,6 +354,7 @@ def get_code_rd_institutional_pack() -> WorkflowPack:
             ),
         ],
         final_artifact_type=ArtifactType.FINAL_REPORT.value,
+        allow_dynamic_execution_plans=False,
     )
 
 
@@ -371,5 +372,13 @@ def _agent(
         system_prompt=system_prompt,
         model_config={"provider": "mock", "model": model},
         tool_permissions=tool_permissions,
-        runtime_limits={"max_steps": 1},
+        runtime_limits={
+            "max_steps": 8,
+            "max_tool_calls": 16,
+            "max_total_tokens": 128_000,
+            "timeout_seconds": 900,
+            "max_repeated_tool_calls": 2,
+            "max_observation_chars": 20_000,
+            "max_cost_usd": 10,
+        },
     )

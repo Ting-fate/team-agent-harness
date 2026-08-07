@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -8,12 +9,18 @@ import subprocess
 import sys
 from threading import Barrier, Lock
 from time import sleep
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.core.local_code_executor import LocalCodeExecutor, TestCommandResult as LocalTestCommandResult
-from app.core.model_runtime import MockModelAdapter, ModelGateway
+from app.core.model_runtime import (
+    MockModelAdapter,
+    ModelGateway,
+    ModelRuntimeError,
+    OpenAICompatibleModelAdapter,
+)
 from app.core.models import AgentDefinition, AgentRun, AgentRunStatus, ArtifactType, EvalStatus, Handoff, Run, Task
 from app.core.runner import WorkflowRunnerError
 from app.core.writeback import WritebackConflict, WritebackError, WritebackService
@@ -52,6 +59,147 @@ def test_local_code_executor_prepares_patch_without_modifying_source(tmp_path) -
     assert output.model_response.mocked is True
     assert output.model_request is not None
     assert str(repo.resolve()) not in str(output.model_request)
+
+
+def test_local_code_executor_binder_failure_prevents_prepare_patch_model_call(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    adapter = CountingMockAdapter()
+
+    def fail_binder(run, request):
+        raise RuntimeError("durable request binding unavailable")
+
+    executor = LocalCodeExecutor(
+        model_gateway=ModelGateway({"mock": adapter}),
+        model_request_binder=fail_binder,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+    with pytest.raises(RuntimeError, match="durable request binding unavailable"):
+        executor.execute(
+            task=_task(repo),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("prepare_patch"),
+            agent=_agent(),
+            context={},
+        )
+
+    assert adapter.calls == 0
+
+
+def test_local_code_executor_recorder_failure_prevents_prepare_patch_http_call(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    client_calls: list[dict[str, object]] = []
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: client_calls.append(kwargs))
+        )
+    )
+
+    def bind_failing_recorder(run, request):
+        def fail_persistence(evidence):
+            raise RuntimeError("durable trace unavailable")
+
+        return replace(request, provider_attempt_recorder=fail_persistence)
+
+    executor = LocalCodeExecutor(
+        model_gateway=ModelGateway(
+            {
+                "openai": OpenAICompatibleModelAdapter(
+                    provider="openai",
+                    api_key_env="OPENAI_API_KEY",
+                    client=client,
+                    endpoint="chat_completions",
+                    retry_delay_seconds=0,
+                )
+            }
+        ),
+        model_request_binder=bind_failing_recorder,
+        workspace_root=tmp_path / "workspaces",
+    )
+    agent = _agent().model_copy(
+        update={"model_settings": {"provider": "openai", "model": "gpt-5"}}
+    )
+
+    with pytest.raises(ModelRuntimeError, match="could not be persisted"):
+        executor.execute(
+            task=_task(repo),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("prepare_patch"),
+            agent=agent,
+            context={"run_id": "run-1", "real_model_access_confirmed": True},
+        )
+
+    assert client_calls == []
+
+
+def test_local_code_executor_returns_bound_request_for_test_changes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def answer():\n    return 41\n", encoding="utf-8")
+    base_executor, context, storage = _executor_with_patch(
+        tmp_path,
+        _patch_artifact("app.py", "    return 41", "    return 42"),
+    )
+    adapter = CountingMockAdapter()
+    bound_requests = []
+
+    def bind_request(run, request):
+        bound_request = replace(
+            request,
+            metadata={**request.metadata, "bound_run_id": run.id},
+        )
+        bound_requests.append(bound_request)
+        return bound_request
+
+    executor = LocalCodeExecutor(
+        model_gateway=ModelGateway({"mock": adapter}),
+        artifact_store=base_executor.artifact_store,
+        patch_workspace_preparer=base_executor.patch_workspace_preparer,
+        model_request_binder=bind_request,
+        workspace_root=tmp_path / "workspaces",
+    )
+    from app.core import local_code_executor as executor_module
+
+    monkeypatch.setattr(
+        executor_module,
+        "_run_test_command",
+        lambda *args, **kwargs: LocalTestCommandResult(
+            command="python -m pytest -q",
+            exit_code=0,
+            execution_verified=True,
+            total_tests=1,
+        ),
+    )
+
+    try:
+        output = executor.execute(
+            task=_task(repo, inputs={"test_command": "python -m pytest -q"}),
+            run=Run(id="run-1", task_id="task-1"),
+            step=_step("test_changes"),
+            agent=_agent(),
+            context={**context, "agent_run_id": "agent-run-test"},
+        )
+    finally:
+        storage.close()
+
+    assert len(bound_requests) == 1
+    assert output.model_request is bound_requests[0]
+    assert output.model_request.metadata["bound_run_id"] == "run-1"
+    assert output.model_request.metadata["agent_run_id"] == "agent-run-test"
+    assert adapter.calls == 1
+    assert adapter.requests[0].metadata["bound_run_id"] == "run-1"
 
 
 def test_local_code_executor_redacts_source_paths_from_task_context_and_artifact(tmp_path) -> None:
@@ -93,17 +241,18 @@ def test_local_code_executor_redacts_credentials_from_normal_source_files(tmp_pa
     repo.mkdir()
     github_token = "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"
     aws_access_key = "AKIA" + "ABCDEFGHIJKLMNOP"
+    jwt_token = "eyJ" + "abcdefghijklmno.eyJpqrstuvwxyz012.abcdefghijklmnopqr"
     credentials = {
         "database_password": "db-password-should-not-leak",
         "github_token": github_token,
         "aws_access_key": aws_access_key,
-        "jwt": "eyJabcdefghijklmno.eyJpqrstuvwxyz012.abcdefghijklmnopqr",
+        "jwt": jwt_token,
     }
     (repo / "settings.py").write_text(
         "DATABASE_URL = \"postgresql://service:db-password-should-not-leak@db.invalid/app\"\n"
         f"GITHUB_TOKEN = \"{github_token}\"\n"
         f"AWS_ACCESS_KEY_ID = \"{aws_access_key}\"\n"
-        "JWT_VALUE = \"eyJabcdefghijklmno.eyJpqrstuvwxyz012.abcdefghijklmnopqr\"\n",
+        f"JWT_VALUE = \"{jwt_token}\"\n",
         encoding="utf-8",
     )
     executor = LocalCodeExecutor(
@@ -729,6 +878,19 @@ def test_local_code_executor_rejects_missing_repository_path(tmp_path) -> None:
             agent=_agent(),
             context={},
         )
+
+
+def test_local_code_executor_rejects_dynamic_plan_step_with_reserved_name(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    executor = LocalCodeExecutor(
+        model_gateway=ModelGateway({"mock": MockModelAdapter()}),
+        workspace_root=tmp_path / "workspaces",
+    )
+    task = _task(repo)
+    dynamic_step = _step("prepare_patch").model_copy(update={"execution_source": "operator"})
+
+    assert executor.supports(task, dynamic_step) is False
 
 
 def test_writeback_preview_and_approve_applies_verified_diff(tmp_path) -> None:

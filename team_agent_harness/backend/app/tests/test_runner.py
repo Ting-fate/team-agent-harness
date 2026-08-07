@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from app.core.artifacts import ArtifactStore
+from app.core.execution_plan import execution_plan_from_pack, execution_plan_hash
 from app.core.models import (
     AgentDefinition,
     AgentRun,
@@ -25,7 +26,7 @@ from app.core.models import (
     TraceEventType,
 )
 from app.core.registry import AgentRegistry
-from app.core.model_runtime import ModelRuntimeError
+from app.core.model_runtime import ModelRequest, ModelResponse, ModelRuntimeError
 from app.core.runner import (
     AgentArtifactOutput,
     AgentStepOutput,
@@ -35,7 +36,16 @@ from app.core.runner import (
 from app.core.runtime_control import RuntimeController
 from app.core.storage import SQLiteStorage, StorageError
 from app.core.trace import TraceLogger
-from app.packs.base import ContextPolicy, EvalCheck, ReturnContract, SessionPolicy, WorkflowPack, WorkflowStep
+from app.packs.base import (
+    ContextPolicy,
+    EvalCheck,
+    ReturnContract,
+    SessionPolicy,
+    StepAcceptanceCriterion,
+    WorkflowPack,
+    WorkflowStep,
+)
+from app.packs.code_rd import get_code_rd_pack
 
 
 @pytest.fixture
@@ -59,6 +69,37 @@ def runner_factory(tmp_path, storage: SQLiteStorage):
         )
 
     return make_runner
+
+
+def test_runner_rejects_persisted_plan_without_agent_snapshots(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    pack = get_code_rd_pack()
+    task = storage.create_task(
+        Task(
+            id="task-missing-plan-snapshots",
+            title="Resume frozen run",
+            goal="Never fall back to current Pack agents.",
+            workflow_pack=pack.name,
+        )
+    )
+    incomplete_plan = execution_plan_from_pack(pack).model_copy(
+        update={"agent_snapshots": []}
+    )
+    run = Run(
+        id="run-missing-plan-snapshots",
+        task_id=task.id,
+        execution_plan=incomplete_plan.model_dump(mode="json"),
+        execution_plan_hash=execution_plan_hash(incomplete_plan),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="missing agent snapshots"):
+        runner_factory().run(run, pack)
+
+    failed_run = storage.get_run(run.id)
+    assert failed_run is not None and failed_run.status == RunStatus.FAILED
+    assert storage.list_agent_runs_for_run(run.id) == []
 
 
 def test_runner_completes_two_step_workflow_with_artifacts_handoff_trace_and_eval(
@@ -122,6 +163,84 @@ def test_runner_completes_two_step_workflow_with_artifacts_handoff_trace_and_eva
     context_events = [event for event in workflow_events if event.payload.get("action") == "context_envelope_built"]
     assert len(context_events) == 2
     assert "state_breadcrumb" in context_events[0].payload["context_keys"]
+
+
+def test_runner_records_deterministic_step_acceptance_before_checkpoint(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    task = storage.create_task(Task(id="task-accept", title="Demo", goal="Accept", workflow_pack="demo"))
+    pack = _demo_pack()
+    pack = pack.model_copy(
+        update={
+            "steps": [
+                pack.steps[0],
+                pack.steps[1].model_copy(
+                    update={
+                        "acceptance_criteria": [
+                            StepAcceptanceCriterion(
+                                name="minimum-delivery",
+                                kind="artifact_min_chars",
+                                artifact_type=ArtifactType.FINAL_REPORT,
+                                min_chars=5,
+                            )
+                        ]
+                    }
+                ),
+            ]
+        }
+    )
+
+    final_run = runner_factory(DemoExecutor()).run(Run(id="run-accept", task_id=task.id), pack)
+
+    assert final_run.status == RunStatus.COMPLETED
+    acceptance = [
+        result
+        for result in storage.list_eval_results_for_run(final_run.id)
+        if result.check_name == "write:acceptance:minimum-delivery"
+    ]
+    assert len(acceptance) == 1
+    assert acceptance[0].status == EvalStatus.PASS
+
+
+def test_runner_fails_step_before_checkpoint_when_acceptance_is_not_met(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    task = storage.create_task(Task(id="task-reject", title="Demo", goal="Reject", workflow_pack="demo"))
+    pack = _demo_pack()
+    pack = pack.model_copy(
+        update={
+            "steps": [
+                pack.steps[0].model_copy(
+                    update={
+                        "acceptance_criteria": [
+                            StepAcceptanceCriterion(
+                                name="required-marker",
+                                kind="artifact_contains",
+                                artifact_type=ArtifactType.RESEARCH_NOTE,
+                                marker="verified-marker",
+                            )
+                        ]
+                    }
+                ),
+                pack.steps[1],
+            ]
+        }
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="failed acceptance criterion"):
+        runner_factory(DemoExecutor()).run(Run(id="run-reject", task_id=task.id), pack)
+
+    assert storage.get_run("run-reject").status == RunStatus.FAILED
+    assert storage.list_handoffs_for_run("run-reject") == []
+    acceptance = [
+        result
+        for result in storage.list_eval_results_for_run("run-reject")
+        if result.check_name == "plan:acceptance:required-marker"
+    ]
+    assert len(acceptance) == 1
+    assert acceptance[0].status == EvalStatus.FAIL
 
 
 def test_runner_persists_completed_only_after_runtime_cleanup_succeeds(
@@ -207,6 +326,56 @@ def test_default_runner_executor_records_mock_model_runtime_trace(
     assert model_responses[0].payload["mocked"] is True
     assert model_responses[0].payload["usage"]["output_tokens"] > 0
     assert model_responses[0].payload["latency_ms"] >= 1
+
+
+def test_runner_records_selected_fallback_identity_in_model_response_trace(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    class FallbackIdentityExecutor:
+        def execute(self, *, task, run, step, agent, context) -> AgentStepOutput:
+            return AgentStepOutput(
+                summary="Fallback completed.",
+                artifacts=[
+                    AgentArtifactOutput(
+                        type=ArtifactType.FINAL_REPORT,
+                        filename="write.md",
+                        content="Fallback completed.",
+                    )
+                ],
+                model_request=ModelRequest(
+                    provider="primary",
+                    model="primary-model",
+                    system_prompt="System",
+                    messages=[],
+                ),
+                model_response=ModelResponse(
+                    text="Fallback completed.",
+                    usage={"input_tokens": 2, "output_tokens": 3},
+                    raw_provider="fallback",
+                    selected_provider="fallback",
+                    selected_model="fallback-model",
+                    adapter="test",
+                    mocked=False,
+                ),
+            )
+
+    task = storage.create_task(
+        Task(id="task-fallback-trace", title="Trace", goal="Trace fallback.", workflow_pack="demo")
+    )
+    final_run = runner_factory(FallbackIdentityExecutor()).run(
+        Run(id="run-fallback-trace", task_id=task.id),
+        _single_step_pack(),
+    )
+
+    model_response = next(
+        event
+        for event in storage.list_trace_events_for_run(final_run.id)
+        if event.event_type == TraceEventType.MODEL_ACTION
+        and event.payload.get("action") == "model_response"
+    )
+    assert model_response.payload["provider"] == "fallback"
+    assert model_response.payload["model"] == "fallback-model"
 
 
 def test_runner_marks_run_and_current_agent_run_failed_when_executor_raises(
@@ -1252,6 +1421,50 @@ def test_parallel_batch_failure_marks_uncommitted_siblings_terminal(
         if event.event_type == TraceEventType.WORKFLOW_EVENT
     ]
     assert any(event.payload.get("action") == "parallel_step_batch_aborted" for event in workflow_events)
+
+
+def test_parallel_batch_failure_does_not_start_queued_branches(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    task = storage.create_task(
+        Task(
+            id="task-1",
+            title="Parallel cancellation task",
+            goal="Stop queued branches after the first failure.",
+            workflow_pack="demo",
+        )
+    )
+    executor = FailingQueuedBranchExecutor()
+
+    with pytest.raises(WorkflowRunnerError, match="branch_a boom"):
+        runner_factory(executor).run(
+            Run(id="run-1", task_id=task.id),
+            _wide_parallel_pack(),
+        )
+
+    assert "branch_a" in executor.calls
+    assert "branch_c" not in executor.calls
+    assert "branch_d" not in executor.calls
+    statuses = {
+        agent_run.step_name: agent_run.status
+        for agent_run in storage.list_agent_runs_for_run("run-1")
+    }
+    assert statuses == {
+        "start": AgentRunStatus.COMPLETED,
+        "branch_a": AgentRunStatus.FAILED,
+        "branch_b": AgentRunStatus.CANCELLED,
+        "branch_c": AgentRunStatus.CANCELLED,
+        "branch_d": AgentRunStatus.CANCELLED,
+    }
+    cancellation = next(
+        event
+        for event in storage.list_trace_events_for_run("run-1")
+        if event.payload.get("action") == "parallel_step_pending_cancelled"
+    )
+    cancelled_steps = set(cancellation.payload["steps"])
+    assert {"branch_c", "branch_d"}.issubset(cancelled_steps)
+    assert cancelled_steps.issubset({"branch_b", "branch_c", "branch_d"})
 
 
 def test_legacy_pack_without_dependencies_stays_serial(storage: SQLiteStorage, runner_factory) -> None:
@@ -2343,6 +2556,31 @@ class FailingParallelBranchExecutor(SlowParallelExecutor):
         return super().execute(task=task, run=run, step=step, agent=agent, context=context)
 
 
+class FailingQueuedBranchExecutor:
+    supports_parallel_execution = True
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._lock = Lock()
+
+    def execute(
+        self,
+        *,
+        task: Task,
+        run: Run,
+        step: WorkflowStep,
+        agent: AgentDefinition,
+        context: dict[str, Any],
+    ) -> AgentStepOutput:
+        with self._lock:
+            self.calls.append(step.name)
+        if step.name == "branch_a":
+            raise RuntimeError("branch_a boom")
+        if step.name == "branch_b":
+            time.sleep(0.05)
+        return _step_output(step, _declared_or_default_artifact_type(step))
+
+
 def _demo_pack(
     *,
     first_step_inputs: list[str] | None = None,
@@ -2441,6 +2679,59 @@ def _parallel_diamond_pack() -> WorkflowPack:
             )
         ],
         final_artifact_type="final_report",
+    )
+
+
+def _wide_parallel_pack() -> WorkflowPack:
+    branch_specs = [
+        ("branch_a", "Writer", "patch"),
+        ("branch_b", "Tester", "test_report"),
+        ("branch_c", "Architect", "design_doc"),
+        ("branch_d", "Searcher", "source_summary"),
+    ]
+    return WorkflowPack(
+        name="demo",
+        description="Wide parallel DAG with bounded workers.",
+        agents=[
+            AgentDefinition(id="agent-planner", pack_name="demo", role="Planner", system_prompt="Plan."),
+            *[
+                AgentDefinition(
+                    id=f"agent-{role.lower()}",
+                    pack_name="demo",
+                    role=role,
+                    system_prompt=f"Act as {role}.",
+                )
+                for _, role, _ in branch_specs
+            ],
+            AgentDefinition(id="agent-reviewer", pack_name="demo", role="Reviewer", system_prompt="Merge."),
+        ],
+        steps=[
+            WorkflowStep(
+                name="start",
+                agent_role="Planner",
+                produces_artifact_type="research_note",
+            ),
+            *[
+                WorkflowStep(
+                    name=name,
+                    agent_role=role,
+                    depends_on=["start"],
+                    required_artifacts=["research_note"],
+                    produces_artifact_type=artifact_type,
+                    ownership={"workspaces": [name]},
+                )
+                for name, role, artifact_type in branch_specs
+            ],
+            WorkflowStep(
+                name="merge",
+                agent_role="Reviewer",
+                depends_on=[name for name, _, _ in branch_specs],
+                required_artifacts=[artifact_type for _, _, artifact_type in branch_specs],
+                produces_artifact_type="final_report",
+            ),
+        ],
+        final_artifact_type="final_report",
+        max_parallel_steps=2,
     )
 
 

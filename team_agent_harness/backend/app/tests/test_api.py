@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 from datetime import UTC, datetime, timedelta
 import json
 import pytest
+from types import SimpleNamespace
 
 from app.core.models import (
     AgentDefinition,
@@ -56,6 +57,156 @@ def test_openapi_declares_typed_run_response_contracts(tmp_path) -> None:
         "application/json"
     ]["schema"] == {"$ref": "#/components/schemas/RunDetailResponse"}
     assert schemas["RunDetailResponse"]["properties"]["run"] == {"$ref": "#/components/schemas/Run"}
+
+
+def test_model_control_routes_are_safe_and_explain_unavailable_real_routes(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+    with TestClient(app) as client:
+        doctor = client.get("/providers/doctor")
+        capabilities = client.get("/models/deepseek/deepseek-chat/capabilities")
+        explained = client.post(
+            "/routes/explain",
+            json={
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "fallbacks": [{"provider": "mock", "model": "mock-model"}],
+                "require_vision": True,
+                "allow_mock_fallback": True,
+            },
+        )
+
+    assert doctor.status_code == 200
+    doctor_payload = doctor.json()
+    assert doctor_payload["network_calls_performed"] is False
+    assert "DEEPSEEK_API_KEY" not in doctor.text
+    assert "api.deepseek.com" not in doctor.text
+    assert any(item["name"] == "deepseek" for item in doctor_payload["providers"])
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()["known"] is True
+    assert capabilities.json()["capability"]["supports_vision"] is False
+
+    assert explained.status_code == 200
+    explained_payload = explained.json()
+    assert explained_payload["selected"] is None
+    assert [item["reason"] for item in explained_payload["rejected"]] == [
+        "provider_not_ready",
+        "capability_mismatch",
+    ]
+
+
+def test_provider_smoke_defaults_to_mock_and_never_calls_real_provider_without_confirmation(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+    with TestClient(app) as client:
+        mock_response = client.post("/providers/mock/smoke", json={})
+        real_response = client.post("/providers/deepseek/smoke", json={})
+
+    assert mock_response.status_code == 200
+    assert mock_response.json()["status"] == "ok"
+    assert mock_response.json()["mocked"] is True
+    assert mock_response.json()["network_call_performed"] is False
+    assert real_response.status_code == 400
+    assert "DEEPSEEK_API_KEY" not in real_response.text
+
+
+def test_pack_executor_persists_provider_attempt_before_hard_crash(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app):
+        state = app.state.harness
+        task = state.storage.create_task(
+            Task(id="task-provider-attempt", title="Trace", goal="Trace dispatch.", workflow_pack="code_rd")
+        )
+        run = state.storage.create_run(Run(id="run-provider-attempt", task_id=task.id))
+        executor = PackMappedExecutor(trace_logger=state.trace_logger)
+
+        def crash_after_dispatch(**kwargs: object) -> object:
+            raise SystemExit("simulated hard crash")
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=crash_after_dispatch)
+            )
+        )
+        adapter = OpenAICompatibleModelAdapter(
+            provider="openai",
+            api_key_env="OPENAI_API_KEY",
+            client=client,
+            endpoint="chat_completions",
+        )
+        request = executor._with_provider_attempt_recorder(
+            run,
+            ModelRequest(
+                provider="openai",
+                model="gpt-5",
+                system_prompt="System",
+                messages=[],
+                metadata={"step_name": "review", "agent_id": "reviewer"},
+            ),
+        )
+
+        with pytest.raises(SystemExit, match="simulated hard crash"):
+            adapter.complete(request)
+
+        events = state.storage.list_trace_events_for_run(run.id)
+        attempts = [
+            event
+            for event in events
+            if event.payload.get("action") == "model_provider_attempt_started"
+        ]
+        assert len(attempts) == 1
+        assert attempts[0].payload == {
+            "action": "model_provider_attempt_started",
+            "provider": "openai",
+            "model": "gpt-5",
+            "provider_attempt": 1,
+            "route_attempt": None,
+            "agent_loop_step": None,
+            "agent_id": "reviewer",
+            "step_name": "review",
+            "outcome": "dispatch_started",
+            "usage_known": False,
+        }
+
+
+def test_pack_executor_trace_failure_prevents_provider_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    calls: list[dict[str, object]] = []
+
+    class FailingTraceLogger:
+        def record(self, **kwargs: object) -> None:
+            raise StorageError("durable trace unavailable")
+
+    executor = PackMappedExecutor(trace_logger=FailingTraceLogger())  # type: ignore[arg-type]
+    request = executor._with_provider_attempt_recorder(
+        Run(id="run-provider-attempt", task_id="task-provider-attempt"),
+        ModelRequest(
+            provider="openai",
+            model="gpt-5",
+            system_prompt="System",
+            messages=[],
+        ),
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: calls.append(kwargs))
+        )
+    )
+
+    with pytest.raises(ModelRuntimeError, match="could not be persisted"):
+        OpenAICompatibleModelAdapter(
+            provider="openai",
+            api_key_env="OPENAI_API_KEY",
+            client=client,
+            endpoint="chat_completions",
+        ).complete(request)
+
+    assert calls == []
 
 
 def test_run_endpoints_preserve_the_same_serialized_run_contract(tmp_path) -> None:
@@ -223,6 +374,7 @@ def test_task_run_trace_artifact_api_round_trip(tmp_path) -> None:
         }
         assert all(event["payload"]["adapter"] == "mock" for event in model_responses)
         assert all(event["payload"]["mocked"] is True for event in model_responses)
+        assert all(event["payload"]["route_receipt"] for event in model_responses)
         assert all(event["payload"]["agent_id"] for event in model_responses)
         assert all(event["payload"]["step_name"] for event in model_responses)
         assert all(event["payload"]["usage"]["output_tokens"] > 0 for event in model_responses)
@@ -417,7 +569,10 @@ def test_auto_complex_task_run_uses_institutional_subagent_branches(tmp_path) ->
                 "constraints": ["不得泄漏 secret 或 token"],
             },
         ).json()
-        run = client.post("/runs", json={"task_id": task["id"]}).json()
+        run = client.post(
+            "/runs",
+            json={"task_id": task["id"], "confirm_real_models": True},
+        ).json()
 
         assert task["workflow_pack"] == "code_rd_institutional"
         assert run["status"] == "waiting"
@@ -601,7 +756,10 @@ def test_model_routing_config_is_reflected_in_agent_catalog_and_trace(
                 "workflow_pack": "code_rd",
             },
         ).json()
-        run = client.post("/runs", json={"task_id": task["id"]}).json()
+        run = client.post(
+            "/runs",
+            json={"task_id": task["id"], "confirm_real_models": True},
+        ).json()
         trace = client.get(f"/runs/{run['id']}/trace").json()
         requests = [
             event
@@ -981,6 +1139,8 @@ def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path)
         patch_payload = approve_patch.json()
         assert patch_payload["run"]["status"] == "waiting"
         assert patch_payload["run"]["current_step"] == "test_changes"
+        assert patch_payload["run"]["execution_plan_redacted"] is True
+        assert patch_payload["run"]["execution_plan"]["agent_snapshots"] == []
         assert patch_payload["runtime_job"]["status"] == "completed"
         assert patch_payload["runtime_job"]["approved_at"]
         assert patch_payload["runtime_job"]["metadata"]["external_runtime_started"] is False
@@ -1013,6 +1173,8 @@ def test_code_rd_institutional_run_via_api_records_dependency_handoffs(tmp_path)
         final_payload = approve_test.json()
         assert final_payload["run"]["status"] == "completed"
         assert final_payload["run"]["final_artifact_id"]
+        assert final_payload["run"]["execution_plan_redacted"] is True
+        assert final_payload["run"]["execution_plan"]["agent_snapshots"] == []
 
         run = final_payload["run"]
         agent_runs = client.get(f"/runs/{run['id']}/agent-runs").json()
@@ -1309,7 +1471,10 @@ def test_code_rd_institutional_session_step_falls_back_to_mock_on_provider_failu
             },
         ).json()
 
-        run = client.post("/runs", json={"task_id": task["id"]}).json()
+        run = client.post(
+            "/runs",
+            json={"task_id": task["id"], "confirm_real_models": True},
+        ).json()
 
         assert run["status"] == "waiting"
         assert run["current_step"] == "prepare_patch"
@@ -1394,7 +1559,10 @@ def test_code_rd_institutional_provider_failure_is_fail_closed_by_default(
             },
         ).json()
 
-        run = client.post("/runs", json={"task_id": task["id"]}).json()
+        run = client.post(
+            "/runs",
+            json={"task_id": task["id"], "confirm_real_models": True},
+        ).json()
 
         assert run["status"] == "failed"
         assert run["current_step"] == "dispatch_work"

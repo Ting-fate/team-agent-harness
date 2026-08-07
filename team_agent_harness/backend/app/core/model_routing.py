@@ -31,6 +31,11 @@ _ALLOWED_FIELD_NAMES = {
     "max_tokens",
     "reasoning_effort",
     "allow_real_calls",
+    "allow_mock_fallback",
+    "fallbacks",
+    "input_usd_per_million",
+    "output_usd_per_million",
+    "reason",
     "role_file",
 }
 
@@ -49,6 +54,22 @@ _FORBIDDEN_FIELD_MARKERS = (
 )
 
 
+class ModelFallbackRoute(HarnessModel):
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    reason: str = Field(default="fallback", min_length=1, max_length=128)
+    allow_real_calls: bool = False
+    input_usd_per_million: float | None = Field(default=None, ge=0)
+    output_usd_per_million: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_fallback(self) -> "ModelFallbackRoute":
+        if self.provider not in ROUTABLE_MODEL_PROVIDERS:
+            raise ValueError(f"Unsupported model provider in routing config: {self.provider}")
+        _validate_price_pair(self.input_usd_per_million, self.output_usd_per_million)
+        return self
+
+
 class ModelRoute(HarnessModel):
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
@@ -56,6 +77,10 @@ class ModelRoute(HarnessModel):
     max_tokens: int | None = Field(default=None, gt=0, le=200000)
     reasoning_effort: str | None = Field(default=None, min_length=1)
     allow_real_calls: bool = False
+    allow_mock_fallback: bool = False
+    input_usd_per_million: float | None = Field(default=None, ge=0)
+    output_usd_per_million: float | None = Field(default=None, ge=0)
+    fallbacks: list[ModelFallbackRoute] = Field(default_factory=list, max_length=4)
     role_file: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
@@ -66,6 +91,12 @@ class ModelRoute(HarnessModel):
             raise ValueError("temperature must be finite")
         if self.reasoning_effort is not None and self.reasoning_effort not in REASONING_EFFORT_VALUES:
             raise ValueError("reasoning_effort must be one of minimal, low, medium, high, xhigh")
+        _validate_price_pair(self.input_usd_per_million, self.output_usd_per_million)
+        targets = [(self.provider, self.model), *[(item.provider, item.model) for item in self.fallbacks]]
+        if len(set(targets)) != len(targets):
+            raise ValueError("Model route candidates must not contain duplicate provider/model targets")
+        if any(item.provider == "mock" for item in self.fallbacks) and not self.allow_mock_fallback:
+            raise ValueError("Mock fallback requires allow_mock_fallback=true")
         return self
 
 
@@ -75,6 +106,13 @@ class ModelRoutingConfig(HarnessModel):
 
 class ModelRoutingError(RuntimeError):
     pass
+
+
+def _validate_price_pair(input_price: float | None, output_price: float | None) -> None:
+    if (input_price is None) != (output_price is None):
+        raise ValueError("input/output model prices must be configured together")
+    if any(value is not None and not math.isfinite(value) for value in (input_price, output_price)):
+        raise ValueError("model prices must be finite")
 
 
 def load_model_routing_config(path: str | Path | None = None) -> ModelRoutingConfig:
@@ -129,6 +167,10 @@ def _apply_agent_route(agent: AgentDefinition, route: ModelRoute | None) -> Agen
     if route is None:
         return agent
     model_settings = route.model_dump(exclude={"allow_real_calls", "role_file"}, exclude_none=True)
+    if not route.allow_mock_fallback:
+        model_settings.pop("allow_mock_fallback", None)
+    if not route.fallbacks:
+        model_settings.pop("fallbacks", None)
     model_settings.setdefault(
         "reasoning_effort",
         default_reasoning_effort_for_model(route.provider, route.model),
@@ -145,25 +187,29 @@ def _apply_agent_route(agent: AgentDefinition, route: ModelRoute | None) -> Agen
 
 
 def _validate_real_provider_opt_in(routing: ModelRoutingConfig) -> None:
-    real_routes = {
-        agent_id: route
-        for agent_id, route in routing.agents.items()
-        if route.provider in REAL_MODEL_PROVIDER_API_KEY_ENVS
-    }
+    real_routes: list[tuple[str, str, bool]] = []
+    for agent_id, route in routing.agents.items():
+        if route.provider in REAL_MODEL_PROVIDER_API_KEY_ENVS:
+            real_routes.append((agent_id, route.provider, route.allow_real_calls))
+        real_routes.extend(
+            (f"{agent_id}.fallbacks[{index}]", fallback.provider, fallback.allow_real_calls)
+            for index, fallback in enumerate(route.fallbacks)
+            if fallback.provider in REAL_MODEL_PROVIDER_API_KEY_ENVS
+        )
     if not real_routes:
         return
 
     if os.environ.get("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS") != "1":
-        providers = sorted({route.provider for route in real_routes.values()})
+        providers = sorted({provider for _, provider, _ in real_routes})
         raise ModelRoutingError(
             "Model routing config enables real providers "
             f"({', '.join(providers)}) but TEAM_AGENT_ALLOW_REAL_MODEL_CALLS is not set to 1."
         )
 
     unapproved = sorted(
-        f"{agent_id}:{route.provider}"
-        for agent_id, route in real_routes.items()
-        if not route.allow_real_calls
+        f"{route_id}:{provider}"
+        for route_id, provider, allow_real_calls in real_routes
+        if not allow_real_calls
     )
     if unapproved:
         raise ModelRoutingError(
@@ -172,9 +218,9 @@ def _validate_real_provider_opt_in(routing: ModelRoutingConfig) -> None:
         )
 
     missing = sorted(
-        f"{agent_id}:{route.provider}:{REAL_MODEL_PROVIDER_API_KEY_ENVS[route.provider]}"
-        for agent_id, route in real_routes.items()
-        if not os.environ.get(REAL_MODEL_PROVIDER_API_KEY_ENVS[route.provider])
+        f"{route_id}:{provider}:{REAL_MODEL_PROVIDER_API_KEY_ENVS[provider]}"
+        for route_id, provider, _ in real_routes
+        if not os.environ.get(REAL_MODEL_PROVIDER_API_KEY_ENVS[provider])
     )
     if missing:
         raise ModelRoutingError(f"Model routing config enables providers without credentials: {', '.join(missing)}")

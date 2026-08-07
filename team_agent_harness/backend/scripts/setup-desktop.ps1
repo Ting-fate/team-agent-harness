@@ -13,11 +13,12 @@ $ErrorActionPreference = "Stop"
 $BackendRoot = Split-Path -Parent $PSScriptRoot
 $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $BackendRoot)
 $ProjectFile = Join-Path $BackendRoot "pyproject.toml"
+$DependencyLock = Join-Path $BackendRoot "requirements.lock"
 $HarnessVenv = Join-Path $BackendRoot ".venv"
 $LiteLlmVenv = Join-Path $BackendRoot ".venv-litellm"
 $Launcher = Join-Path $PSScriptRoot "harness-launcher.ps1"
 $ShortcutScript = Join-Path $PSScriptRoot "create-desktop-shortcut.ps1"
-$SetupSchemaVersion = 1
+$SetupSchemaVersion = 2
 $LiteLlmRequirement = "litellm[proxy]==1.89.2"
 $MainProbe = "import fastapi, openai, pydantic, uvicorn, websockets"
 $LiteLlmProbe = "import fastapi, litellm, uvicorn"
@@ -175,7 +176,8 @@ function Get-PythonVersion {
 function Get-DependencyHash {
     param([string]$DependencyLabel)
     $projectHash = (Get-FileHash -LiteralPath $ProjectFile -Algorithm SHA256).Hash
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes("$SetupSchemaVersion|$projectHash|$DependencyLabel")
+    $lockHash = (Get-FileHash -LiteralPath $DependencyLock -Algorithm SHA256).Hash
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("$SetupSchemaVersion|$projectHash|$lockHash|$DependencyLabel")
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-", "")
@@ -301,8 +303,11 @@ function Ensure-VirtualEnvironment {
     if ($Role -eq "main") {
         Write-Host "Installing Team Agent Harness runtime dependencies..."
         Invoke-CheckedCommand -Executable $venvPython -Arguments @(
-            "-m", "pip", "install", "--disable-pip-version-check", "-e", $BackendRoot
+            "-m", "pip", "install", "--disable-pip-version-check", "-r", $DependencyLock
         ) -FailureMessage "Could not install Team Agent Harness dependencies"
+        Invoke-CheckedCommand -Executable $venvPython -Arguments @(
+            "-m", "pip", "install", "--disable-pip-version-check", "--no-deps", "-e", $BackendRoot
+        ) -FailureMessage "Could not install Team Agent Harness"
     } else {
         Write-Host "Installing LiteLLM Proxy dependencies..."
         Invoke-CheckedCommand -Executable $venvPython -Arguments @(

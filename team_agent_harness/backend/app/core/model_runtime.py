@@ -1,19 +1,71 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import base64
+import binascii
 from ipaddress import ip_address
 import json
+from math import isfinite
 import os
+import re
 from time import perf_counter, sleep
+from threading import BoundedSemaphore
 from typing import Any, Protocol
 from urllib.parse import urlparse
+
+from app.core.model_capabilities import (
+    CapabilityError,
+    CapabilityRegistry,
+    load_capability_registry,
+)
+from app.core.provider_health import ProviderHealthRegistry
+from app.core.route_policy import (
+    RoutePolicyError,
+    RouteRequirements,
+    explain_route,
+    route_candidates_from_request,
+)
+from app.core.sensitive_text import contains_secret_like_text
+
+
+_MAX_MODEL_IMAGE_BYTES = 8 * 1024 * 1024
+_MAX_MODEL_DATA_URI_BYTES = 16 * 1024 * 1024
+_DATA_URI_RE = re.compile(
+    r"^data:(image/(?:jpeg|png|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$"
+)
+_LOCAL_ROUTE_REJECTION_REASONS = {
+    "capability_mismatch",
+    "invalid_request",
+    "provider_capacity_timeout",
+    "provider_not_configured",
+    "provider_not_ready",
+    "provider_attempt_record_failed",
+    "route_timeout_budget_exhausted",
+}
+_LOCAL_ROUTE_REJECTION_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class ModelToolDefinition:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ModelToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
 
 
 @dataclass(frozen=True)
 class ModelMessage:
     role: str
-    content: str
+    content: str | list[dict[str, Any]] = ""
+    tool_call_id: str | None = None
+    tool_calls: list[ModelToolCall] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -25,8 +77,18 @@ class ModelRequest:
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    timeout_seconds: float | None = None
     tools_allowed: list[str] = field(default_factory=list)
+    tools: list[ModelToolDefinition] = field(default_factory=list)
+    fallbacks: list[dict[str, Any]] = field(default_factory=list)
+    input_usd_per_million: float | None = None
+    output_usd_per_million: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    provider_attempt_recorder: Callable[[dict[str, Any]], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -48,6 +110,28 @@ class ModelResponse:
     raw_provider: str = "mock"
     adapter: str = "mock"
     mocked: bool = True
+    tool_calls: list[ModelToolCall] = field(default_factory=list)
+    route_receipt: list[dict[str, Any]] = field(default_factory=list)
+    provider_attempts: list[dict[str, Any]] = field(default_factory=list)
+    selected_provider: str | None = None
+    selected_model: str | None = None
+    selected_input_usd_per_million: float | None = None
+    selected_output_usd_per_million: float | None = None
+
+
+@dataclass(frozen=True)
+class ModelRoutePrice:
+    provider: str
+    model: str
+    input_usd_per_million: float
+    output_usd_per_million: float
+    source: str
+
+
+@dataclass(frozen=True)
+class ModelInteraction:
+    request: ModelRequest
+    response: ModelResponse
 
 
 @dataclass(frozen=True)
@@ -68,6 +152,14 @@ class ModelAdapter(Protocol):
 
 class MockModelAdapter:
     def complete(self, request: ModelRequest) -> ModelResponse:
+        if "vision" in _required_model_capabilities(request) or _request_contains_image_block(request):
+            raise ModelRuntimeError(
+                "The mock provider cannot inspect image input; use a confirmed vision-capable provider.",
+                provider=request.provider,
+                model=request.model,
+                error_class="MockVisionUnsupported",
+                error_summary="classification=capability_error;retryable=false",
+            )
         started = perf_counter()
         step_name = str(request.metadata.get("step_name", "step"))
         agent_role = str(request.metadata.get("agent_role", "Agent"))
@@ -89,6 +181,8 @@ class MockModelAdapter:
             latency_ms=elapsed_ms,
             finish_reason="stop",
             raw_provider=request.provider,
+            selected_provider=request.provider,
+            selected_model=request.model,
             adapter="mock",
             mocked=True,
         )
@@ -131,22 +225,66 @@ class OpenAICompatibleModelAdapter:
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         if not _real_model_calls_allowed(self.allow_real_calls_env):
-            raise ModelRuntimeError(
+            raise _LocalModelRouteRejection(
                 f"Real model calls are disabled for provider: {self.provider}. "
-                f"Set {self.allow_real_calls_env}=1 to enable explicit real calls."
+                f"Set {self.allow_real_calls_env}=1 to enable explicit real calls.",
+                reason="provider_not_ready",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=self.provider,
+                model=request.model,
+                error_class="ProviderNotReady",
+                error_summary="classification=provider_error;retryable=false",
             )
         started = perf_counter()
-        client = self._client or self._build_client()
-        response = self._complete_with_retries(client, request, started)
+        try:
+            client = self._client or self._build_client()
+            timeout_budget = self._request_timeout_seconds(request)
+        except _LocalModelRouteRejection:
+            raise
+        except ModelRuntimeError as exc:
+            raise _LocalModelRouteRejection(
+                str(exc),
+                reason="provider_not_ready",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=self.provider,
+                model=request.model,
+                error_class=exc.error_class or "ProviderNotReady",
+                error_summary=exc.error_summary or "classification=provider_error;retryable=false",
+            ) from exc
+        except Exception as exc:
+            raise _LocalModelRouteRejection(
+                "Model provider failed local transport setup.",
+                reason="provider_not_ready",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=self.provider,
+                model=request.model,
+                error_class="ProviderNotReady",
+                error_summary="classification=provider_error;retryable=false",
+            ) from exc
+        deadline = started + timeout_budget if timeout_budget is not None else None
+        response, provider_attempts = self._complete_with_retries(client, request, started, deadline)
 
         elapsed_ms = max(1, int((perf_counter() - started) * 1000))
         adapter = "openai_compatible_chat" if self.endpoint == "chat_completions" else "openai_compatible"
         try:
             _validate_openai_response_shape(response)
-            finish_reason = _response_finish_reason(response)
-            text = _response_text(response)
+            if not request.tools and _response_has_tool_calls(response):
+                _raise_unsupported_response_shape("tool_call")
+            tool_calls = _response_tool_calls(response)
+            _validate_requested_tool_calls(request, tool_calls)
+            finish_reason = _response_finish_reason(response, allow_tool_calls=bool(tool_calls))
+            text = _response_text(response, allow_empty=bool(tool_calls))
             usage = _response_usage(response)
         except ModelRuntimeError as exc:
+            failed_attempts = [
+                *provider_attempts,
+                _provider_attempt_evidence(
+                    len(provider_attempts) + 1,
+                    error_class=exc.error_class or "InvalidModelResponse",
+                    error_summary=exc.error_summary,
+                    retryable=False,
+                ),
+            ]
             raise ModelRuntimeError(
                 str(exc),
                 provider=self.provider,
@@ -155,6 +293,7 @@ class OpenAICompatibleModelAdapter:
                 error_class=exc.error_class or "InvalidModelResponse",
                 error_summary=exc.error_summary,
                 elapsed_ms=elapsed_ms,
+                provider_attempts=failed_attempts,
             ) from exc
         return ModelResponse(
             text=text,
@@ -162,8 +301,12 @@ class OpenAICompatibleModelAdapter:
             latency_ms=elapsed_ms,
             finish_reason=finish_reason,
             raw_provider=self.provider,
+            selected_provider=self.provider,
+            selected_model=request.model,
             adapter=adapter,
             mocked=False,
+            tool_calls=tool_calls,
+            provider_attempts=provider_attempts,
         )
 
     def _build_client(self) -> Any:
@@ -193,17 +336,61 @@ class OpenAICompatibleModelAdapter:
             return self.base_url()
         return self.base_url
 
-    def _complete_with_retries(self, client: Any, request: ModelRequest, started: float) -> Any:
+    def _complete_with_retries(
+        self,
+        client: Any,
+        request: ModelRequest,
+        started: float,
+        deadline: float | None,
+    ) -> tuple[Any, list[dict[str, Any]]]:
         last_exc: Exception | None = None
+        provider_attempts: list[dict[str, Any]] = []
         for attempt in range(1, self.max_attempts + 1):
+            attempt_request = request
+            if deadline is not None:
+                remaining_seconds = deadline - perf_counter()
+                if remaining_seconds <= 0:
+                    if not provider_attempts:
+                        raise _LocalModelRouteRejection(
+                            "Model request timeout was exhausted before provider dispatch.",
+                            reason="route_timeout_budget_exhausted",
+                            token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                            provider=self.provider,
+                            model=request.model,
+                            error_class="ModelRequestTimeout",
+                            error_summary="classification=timeout_error;retryable=true",
+                        )
+                    break
+                attempt_request = replace(request, timeout_seconds=remaining_seconds)
             try:
-                return self._complete_once(client, request)
+                return self._complete_once(
+                    client,
+                    attempt_request,
+                    provider_attempt=attempt,
+                ), provider_attempts
             except Exception as exc:
+                if isinstance(exc, _LocalModelRouteRejection):
+                    raise
                 last_exc = exc
-                if attempt >= self.max_attempts or not _is_transient_model_error(exc):
+                retryable = _is_transient_model_error(exc)
+                provider_attempts.append(
+                    _provider_attempt_evidence(
+                        attempt,
+                        error_class=exc.__class__.__name__,
+                        error_summary=_safe_provider_error_summary(exc),
+                        retryable=retryable,
+                    )
+                )
+                if attempt >= self.max_attempts or not retryable:
                     break
                 if self.retry_delay_seconds:
-                    sleep(self.retry_delay_seconds)
+                    delay = self.retry_delay_seconds
+                    if deadline is not None:
+                        remaining_seconds = deadline - perf_counter()
+                        if remaining_seconds <= 0:
+                            break
+                        delay = min(delay, remaining_seconds)
+                    sleep(delay)
         elapsed_ms = max(1, int((perf_counter() - started) * 1000))
         raise ModelRuntimeError(
             f"{self.provider} model call failed. See server logs for provider details.",
@@ -213,37 +400,64 @@ class OpenAICompatibleModelAdapter:
             error_class=last_exc.__class__.__name__ if last_exc is not None else None,
             error_summary=_safe_provider_error_summary(last_exc),
             elapsed_ms=elapsed_ms,
+            provider_attempts=provider_attempts,
         ) from last_exc
 
-    def _complete_once(self, client: Any, request: ModelRequest) -> Any:
-        request_options = self._request_options(request)
+    def _complete_once(
+        self,
+        client: Any,
+        request: ModelRequest,
+        *,
+        provider_attempt: int,
+    ) -> Any:
+        try:
+            request_options = self._request_options(request)
+            if self.endpoint == "chat_completions":
+                messages = [
+                    {"role": "system", "content": request.system_prompt},
+                    *[_chat_message(message) for message in request.messages],
+                ]
+            else:
+                input_items = [
+                    {"role": "system", "content": request.system_prompt},
+                    *_responses_input_items(request.messages),
+                ]
+        except ModelRuntimeError as exc:
+            raise _LocalModelRouteRejection(
+                "Model request failed local transport validation.",
+                reason="invalid_request",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=self.provider,
+                model=request.model,
+                error_class="InvalidModelRequest",
+                error_summary="classification=provider_error;retryable=false",
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise _LocalModelRouteRejection(
+                "Model request failed local transport validation.",
+                reason="invalid_request",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=self.provider,
+                model=request.model,
+                error_class="InvalidModelRequest",
+                error_summary="classification=provider_error;retryable=false",
+            ) from exc
+        _record_provider_attempt_started(request, provider_attempt)
         if self.endpoint == "chat_completions":
             return client.chat.completions.create(
                 model=request.model,
-                messages=[
-                    {"role": "system", "content": request.system_prompt},
-                    *[
-                        {"role": message.role, "content": message.content}
-                        for message in request.messages
-                    ],
-                ],
+                messages=messages,
                 **request_options,
             )
         return client.responses.create(
             model=request.model,
-            input=[
-                {"role": "system", "content": request.system_prompt},
-                *[
-                    {"role": message.role, "content": message.content}
-                        for message in request.messages
-                    ],
-                ],
+            input=input_items,
             **request_options,
         )
 
     def _request_options(self, request: ModelRequest) -> dict[str, Any]:
         options = _chat_request_options(request) if self.endpoint == "chat_completions" else _request_options(request)
-        timeout_seconds = self._resolved_timeout_seconds()
+        timeout_seconds = self._request_timeout_seconds(request)
         if timeout_seconds is not None:
             options["timeout"] = timeout_seconds
             if request.provider == "litellm_proxy":
@@ -252,11 +466,26 @@ class OpenAICompatibleModelAdapter:
                 options["extra_headers"] = headers
         return options
 
+    def _request_timeout_seconds(self, request: ModelRequest) -> float | None:
+        timeout_seconds = self._resolved_timeout_seconds()
+        if request.timeout_seconds is not None:
+            request_timeout = _validated_positive_timeout(
+                request.timeout_seconds,
+                "Model request timeout_seconds must be a positive finite number.",
+            )
+            timeout_seconds = (
+                min(timeout_seconds, request_timeout)
+                if timeout_seconds is not None
+                else request_timeout
+            )
+        return timeout_seconds
+
     def _resolved_timeout_seconds(self) -> float | None:
         if self.timeout_seconds is not None:
-            if self.timeout_seconds <= 0:
-                raise ModelRuntimeError("TEAM_AGENT_MODEL_TIMEOUT_SECONDS must be a positive number.")
-            return self.timeout_seconds
+            return _validated_positive_timeout(
+                self.timeout_seconds,
+                "Model adapter timeout_seconds must be a positive finite number.",
+            )
         raw = os.environ.get("TEAM_AGENT_MODEL_TIMEOUT_SECONDS")
         if raw is None or not raw.strip():
             return 180.0
@@ -264,21 +493,498 @@ class OpenAICompatibleModelAdapter:
             timeout = float(raw)
         except ValueError as exc:
             raise ModelRuntimeError("TEAM_AGENT_MODEL_TIMEOUT_SECONDS must be a positive number.") from exc
-        if timeout <= 0:
-            raise ModelRuntimeError("TEAM_AGENT_MODEL_TIMEOUT_SECONDS must be a positive number.")
+        if not isfinite(timeout) or timeout <= 0:
+            raise ModelRuntimeError(
+                "TEAM_AGENT_MODEL_TIMEOUT_SECONDS must be a positive finite number."
+            )
         return timeout
 
 
 class ModelGateway:
-    def __init__(self, adapters: dict[str, ModelAdapter] | None = None) -> None:
+    def __init__(
+        self,
+        adapters: dict[str, ModelAdapter] | None = None,
+        *,
+        provider_concurrency_limits: dict[str, int] | None = None,
+        capability_registry: CapabilityRegistry | None = None,
+        health_registry: ProviderHealthRegistry | None = None,
+    ) -> None:
         self.adapters = adapters or default_model_adapters()
+        self.capability_registry = capability_registry or load_capability_registry()
+        self.health_registry = health_registry or ProviderHealthRegistry()
+        default_limit = _positive_int_env("TEAM_AGENT_PROVIDER_MAX_CONCURRENCY", 4)
+        configured_limits = provider_concurrency_limits or {}
+        unknown_providers = sorted(set(configured_limits) - set(self.adapters))
+        if unknown_providers:
+            raise ModelRuntimeError(
+                f"Concurrency limits reference unconfigured providers: {', '.join(unknown_providers)}"
+            )
+        invalid_providers = sorted(
+            provider for provider, limit in configured_limits.items() if type(limit) is not int or limit <= 0
+        )
+        if invalid_providers:
+            raise ModelRuntimeError(
+                f"Provider concurrency limits must be positive integers: {', '.join(invalid_providers)}"
+            )
+        self._provider_gates = {
+            provider: BoundedSemaphore(configured_limits.get(provider, default_limit))
+            for provider in self.adapters
+        }
 
     def complete(self, request: ModelRequest) -> ModelResponse:
+        try:
+            candidates = route_candidates_from_request(
+                request.provider,
+                request.model,
+                request.fallbacks,
+                input_usd_per_million=request.input_usd_per_million,
+                output_usd_per_million=request.output_usd_per_million,
+            )
+        except (RoutePolicyError, ValueError) as exc:
+            raise ModelRuntimeError(
+                "Model request contains an invalid route candidate.",
+                provider=request.provider,
+                model=request.model,
+                error_class="RoutePolicyError",
+                error_summary="classification=provider_error;retryable=false",
+            ) from exc
+        requirements = RouteRequirements(
+            tools=bool(request.tools),
+            vision="vision" in _required_model_capabilities(request),
+            reasoning="reasoning" in _required_model_capabilities(request),
+            web_sidecar="web_sidecar" in _required_model_capabilities(request),
+        )
+        route_deadline: float | None = None
+        if len(candidates) > 1:
+            total_timeout = (
+                _validated_positive_timeout(
+                    request.timeout_seconds,
+                    "Model request timeout_seconds must be a positive finite number.",
+                )
+                if request.timeout_seconds is not None
+                else _positive_float_env("TEAM_AGENT_MODEL_TIMEOUT_SECONDS", 180.0)
+            )
+            route_deadline = perf_counter() + total_timeout
+        receipt: list[dict[str, Any]] = []
+        last_error: ModelRuntimeError | None = None
+        for attempt, candidate in enumerate(candidates, start=1):
+            if (
+                candidate.provider in REAL_MODEL_PROVIDERS
+                and request.metadata.get("run_bound") is True
+                and request.metadata.get("real_model_access_confirmed") is not True
+            ):
+                receipt.append(
+                    _route_receipt_entry(
+                        attempt=attempt,
+                        provider=candidate.provider,
+                        model=candidate.model,
+                        outcome="rejected",
+                        reason="real_model_access_not_confirmed",
+                    )
+                )
+                continue
+            if (
+                candidate.provider == "mock"
+                and attempt > 1
+                and request.metadata.get("allow_mock_fallback") is not True
+            ):
+                receipt.append(
+                    _route_receipt_entry(
+                        attempt=attempt,
+                        provider=candidate.provider,
+                        model=candidate.model,
+                        outcome="rejected",
+                        reason="mock_fallback_disabled",
+                    )
+                )
+                continue
+            if (
+                attempt > 1
+                and candidate.provider in REAL_MODEL_PROVIDERS
+                and not candidate.allow_real_calls
+            ):
+                receipt.append(
+                    _route_receipt_entry(
+                        attempt=attempt,
+                        provider=candidate.provider,
+                        model=candidate.model,
+                        outcome="rejected",
+                        reason="real_fallback_not_approved",
+                    )
+                )
+                continue
+            decision = explain_route(
+                [candidate],
+                requirements=requirements,
+                capabilities=self.capability_registry,
+                configured_providers=set(self.adapters),
+                health=self.health_registry,
+                allow_mock_fallback=request.metadata.get("allow_mock_fallback") is True,
+                provider_ready=lambda route_candidate: self.provider_ready(route_candidate.provider),
+            )
+            if not decision.usable:
+                rejection = decision.rejected[0].reason if decision.rejected else "route_rejected"
+                receipt.append(
+                    _route_receipt_entry(
+                        attempt=attempt,
+                        provider=candidate.provider,
+                        model=candidate.model,
+                        outcome="rejected",
+                        reason=rejection,
+                    )
+                )
+                continue
+            candidate_price = self._route_price(candidate)
+            candidate_request = replace(
+                request,
+                provider=candidate.provider,
+                model=candidate.model,
+                fallbacks=[],
+                input_usd_per_million=(
+                    candidate_price.input_usd_per_million if candidate_price is not None else None
+                ),
+                output_usd_per_million=(
+                    candidate_price.output_usd_per_million if candidate_price is not None else None
+                ),
+                metadata={
+                    **request.metadata,
+                    "route_attempt": attempt,
+                    "route_reason": candidate.reason,
+                },
+            )
+            if route_deadline is not None:
+                remaining_seconds = route_deadline - perf_counter()
+                if remaining_seconds <= 0:
+                    receipt.append(
+                        _route_receipt_entry(
+                            attempt=attempt,
+                            provider=candidate.provider,
+                            model=candidate.model,
+                            outcome="rejected",
+                            reason="route_timeout_budget_exhausted",
+                        )
+                    )
+                    break
+                candidate_request = replace(candidate_request, timeout_seconds=remaining_seconds)
+            try:
+                response = self._complete_single(candidate_request)
+                trusted_transport = _is_trusted_attempt_adapter(
+                    self.adapters.get(candidate.provider)
+                )
+                validated = _validate_model_response(
+                    response,
+                    provider=candidate.provider,
+                    model=candidate.model,
+                    allowed_tools={tool.name for tool in request.tools},
+                    allow_provider_attempts=trusted_transport,
+                )
+            except ModelRuntimeError as exc:
+                retryable = model_error_is_retryable(exc)
+                local_rejection_reason = (
+                    exc.reason if isinstance(exc, _LocalModelRouteRejection) else None
+                )
+                if local_rejection_reason is None:
+                    self.health_registry.record_failure(
+                        candidate.provider,
+                        exc.error_class,
+                        retryable=retryable,
+                    )
+                trusted_transport = _is_trusted_attempt_adapter(
+                    self.adapters.get(candidate.provider)
+                )
+                provider_attempts = (
+                    getattr(exc, "provider_attempts", []) if trusted_transport else []
+                )
+                if local_rejection_reason is not None:
+                    receipt.append(
+                        _route_receipt_entry(
+                            attempt=attempt,
+                            provider=candidate.provider,
+                            model=candidate.model,
+                            outcome="rejected",
+                            reason=local_rejection_reason,
+                            error_class=exc.error_class,
+                            error_summary=exc.error_summary,
+                            latency_ms=exc.elapsed_ms,
+                        )
+                    )
+                elif provider_attempts:
+                    receipt.extend(
+                        _route_receipt_entry(
+                            attempt=attempt,
+                            provider=candidate.provider,
+                            model=candidate.model,
+                            outcome="failed",
+                            reason=str(provider_attempt["reason"]),
+                            error_class=str(provider_attempt["error_class"]),
+                            error_summary=str(provider_attempt["error_summary"]),
+                            provider_attempt=int(provider_attempt["provider_attempt"]),
+                            usage_known=False,
+                        )
+                        for provider_attempt in provider_attempts
+                    )
+                else:
+                    receipt.append(
+                        _route_receipt_entry(
+                            attempt=attempt,
+                            provider=candidate.provider,
+                            model=candidate.model,
+                            outcome="failed",
+                            reason="retryable_error" if retryable else "non_retryable_error",
+                            error_class=exc.error_class,
+                            error_summary=exc.error_summary,
+                            latency_ms=exc.elapsed_ms,
+                        )
+                    )
+                exc.route_receipt = receipt
+                last_error = exc
+                if not retryable:
+                    raise
+                continue
+            self.health_registry.record_success(candidate.provider, validated.latency_ms)
+            selected_price = candidate_price
+            receipt.extend(
+                _route_receipt_entry(
+                    attempt=attempt,
+                    provider=candidate.provider,
+                    model=candidate.model,
+                    outcome="failed",
+                    reason=str(provider_attempt["reason"]),
+                    error_class=str(provider_attempt["error_class"]),
+                    error_summary=str(provider_attempt["error_summary"]),
+                    provider_attempt=int(provider_attempt["provider_attempt"]),
+                    usage_known=False,
+                )
+                for provider_attempt in validated.provider_attempts
+            )
+            selected_provider_attempt = (
+                len(validated.provider_attempts) + 1
+                if trusted_transport
+                else None
+            )
+            receipt.append(
+                _route_receipt_entry(
+                    attempt=attempt,
+                    provider=candidate.provider,
+                    model=candidate.model,
+                    outcome="succeeded",
+                    reason="selected",
+                    mocked=validated.mocked,
+                    latency_ms=validated.latency_ms,
+                    usage=validated.usage,
+                    cost_usd=self._estimate_route_cost(selected_price, validated.usage),
+                    provider_attempt=selected_provider_attempt,
+                    usage_known=(
+                        (
+                            type(validated.usage.get("input_tokens")) is int
+                            and type(validated.usage.get("output_tokens")) is int
+                        )
+                        if selected_provider_attempt is not None
+                        else None
+                    ),
+                )
+            )
+            return replace(
+                validated,
+                route_receipt=receipt,
+                selected_provider=candidate.provider,
+                selected_model=candidate.model,
+                selected_input_usd_per_million=(
+                    selected_price.input_usd_per_million if selected_price is not None else None
+                ),
+                selected_output_usd_per_million=(
+                    selected_price.output_usd_per_million if selected_price is not None else None
+                ),
+            )
+        if last_error is not None:
+            last_error.route_receipt = receipt
+            raise last_error
+        if len(candidates) == 1 and receipt:
+            reason = receipt[0].get("reason")
+            if reason == "provider_not_configured":
+                raise ModelRuntimeError(
+                    f"Model provider not configured: {request.provider}",
+                    provider=request.provider,
+                    model=request.model,
+                    error_class="ProviderNotConfigured",
+                    error_summary="classification=provider_error;retryable=false",
+                    route_receipt=receipt,
+                )
+            if reason == "capability_mismatch":
+                raise ModelRuntimeError(
+                    "Model route does not satisfy the request capability contract.",
+                    provider=request.provider,
+                    model=request.model,
+                    error_class="ModelCapabilityError",
+                    error_summary="classification=capability_error;retryable=false",
+                    route_receipt=receipt,
+                )
+        raise ModelRuntimeError(
+            "No usable model route remained after capability and health checks.",
+            provider=request.provider,
+            model=request.model,
+            error_class="RoutePolicyError",
+            error_summary="classification=provider_error;retryable=false",
+            route_receipt=receipt,
+        )
+
+    def provider_ready(self, provider: str) -> bool:
+        adapter = self.adapters.get(provider)
+        if adapter is None or isinstance(adapter, ProviderStubAdapter):
+            return False
+        if not isinstance(adapter, OpenAICompatibleModelAdapter):
+            return True
+        catalog_entry = next((item for item in model_provider_catalog() if item.name == provider), None)
+        if catalog_entry is None:
+            return True
+        return catalog_entry.enabled and (
+            catalog_entry.real_calls_configured or not catalog_entry.requires_credentials
+        )
+
+    def _complete_single(self, request: ModelRequest) -> ModelResponse:
         adapter = self.adapters.get(request.provider)
         if adapter is None:
-            raise ModelRuntimeError(f"Model provider not configured: {request.provider}")
-        response = adapter.complete(request)
-        return _validate_model_response(response, provider=request.provider, model=request.model)
+            raise _LocalModelRouteRejection(
+                f"Model provider not configured: {request.provider}",
+                reason="provider_not_configured",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=request.provider,
+                model=request.model,
+                error_class="ProviderNotConfigured",
+            )
+        self._validate_request_capabilities(request)
+        if request.timeout_seconds is not None:
+            _validated_positive_timeout(
+                request.timeout_seconds,
+                "Model request timeout_seconds must be a positive finite number.",
+            )
+        capacity_timeout = (
+            float(request.timeout_seconds)
+            if request.timeout_seconds is not None
+            else _positive_float_env("TEAM_AGENT_MODEL_TIMEOUT_SECONDS", 180.0)
+        )
+        deadline = perf_counter() + capacity_timeout
+        gate = self._provider_gates[request.provider]
+        if not gate.acquire(timeout=capacity_timeout):
+            raise _LocalModelRouteRejection(
+                f"Provider concurrency wait exceeded the request timeout: {request.provider}",
+                reason="provider_capacity_timeout",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=request.provider,
+                model=request.model,
+                error_class="ProviderConcurrencyLimit",
+                error_summary="classification=timeout_error;retryable=true",
+            )
+        try:
+            remaining_seconds = deadline - perf_counter()
+            if remaining_seconds <= 0:
+                raise _LocalModelRouteRejection(
+                    f"Provider concurrency wait exhausted the request timeout: {request.provider}",
+                    reason="provider_capacity_timeout",
+                    token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                    provider=request.provider,
+                    model=request.model,
+                    error_class="ProviderConcurrencyLimit",
+                    error_summary="classification=timeout_error;retryable=true",
+                )
+            return adapter.complete(replace(request, timeout_seconds=remaining_seconds))
+        finally:
+            gate.release()
+
+    def _validate_request_capabilities(self, request: ModelRequest) -> None:
+        required = request.metadata.get("required_model_capabilities", [])
+        if not isinstance(required, list) or any(
+            type(item) is not str or item not in {"tools", "vision", "reasoning", "web_sidecar"}
+            for item in required
+        ):
+            raise _LocalModelRouteRejection(
+                "Model request contains invalid capability requirements.",
+                reason="capability_mismatch",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=request.provider,
+                model=request.model,
+                error_class="ModelCapabilityError",
+                error_summary="classification=capability_error;retryable=false",
+            )
+        required_set = set(required)
+        try:
+            match = self.capability_registry.require(
+                request.provider,
+                request.model,
+                tools=bool(request.tools) or "tools" in required_set,
+                vision="vision" in required_set,
+                reasoning="reasoning" in required_set,
+                web_sidecar="web_sidecar" in required_set,
+            )
+            capability = match.capability
+            if (
+                capability is not None
+                and capability.max_output_tokens is not None
+                and request.max_tokens is not None
+                and request.max_tokens > capability.max_output_tokens
+            ):
+                raise CapabilityError(
+                    f"Requested max_tokens exceeds the known limit for {request.provider}/{request.model}"
+                )
+        except CapabilityError as exc:
+            raise _LocalModelRouteRejection(
+                "Model route does not satisfy the request capability contract.",
+                reason="capability_mismatch",
+                token=_LOCAL_ROUTE_REJECTION_TOKEN,
+                provider=request.provider,
+                model=request.model,
+                error_class="ModelCapabilityError",
+                error_summary="classification=capability_error;retryable=false",
+            ) from exc
+
+    def route_prices(self, request: ModelRequest) -> list[ModelRoutePrice | None]:
+        try:
+            candidates = route_candidates_from_request(
+                request.provider,
+                request.model,
+                request.fallbacks,
+                input_usd_per_million=request.input_usd_per_million,
+                output_usd_per_million=request.output_usd_per_million,
+            )
+        except (RoutePolicyError, ValueError) as exc:
+            raise ModelRuntimeError("Model request contains an invalid route candidate.") from exc
+        return [self._route_price(candidate) for candidate in candidates]
+
+    def _route_price(self, candidate: Any) -> ModelRoutePrice | None:
+        if candidate.input_usd_per_million is not None:
+            return ModelRoutePrice(
+                provider=candidate.provider,
+                model=candidate.model,
+                input_usd_per_million=float(candidate.input_usd_per_million),
+                output_usd_per_million=float(candidate.output_usd_per_million),
+                source="route_override",
+            )
+        capability = self.capability_registry.resolve(candidate.provider, candidate.model).capability
+        if capability is None or capability.input_price is None or capability.output_price is None:
+            return None
+        return ModelRoutePrice(
+            provider=candidate.provider,
+            model=candidate.model,
+            input_usd_per_million=float(capability.input_price),
+            output_usd_per_million=float(capability.output_price),
+            source="capability_registry",
+        )
+
+    def _estimate_route_cost(
+        self,
+        price: ModelRoutePrice | None,
+        usage: dict[str, int],
+    ) -> float | None:
+        if price is None:
+            return None
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if type(input_tokens) is not int or type(output_tokens) is not int:
+            return None
+        return (
+            input_tokens * price.input_usd_per_million
+            + output_tokens * price.output_usd_per_million
+        ) / 1_000_000
 
 
 class ModelRuntimeError(RuntimeError):
@@ -292,27 +998,111 @@ class ModelRuntimeError(RuntimeError):
         error_class: str | None = None,
         error_summary: str | None = None,
         elapsed_ms: int | None = None,
+        route_receipt: list[dict[str, Any]] | None = None,
+        provider_attempts: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(message)
-        self.provider = provider
-        self.model = model
-        self.adapter = adapter
-        self.error_class = error_class
+        self.provider = (
+            _safe_model_identifier(provider, "unknown_provider") if provider is not None else None
+        )
+        self.model = _safe_model_identifier(model, "unknown_model") if model is not None else None
+        self.adapter = (
+            _safe_model_identifier(adapter, "unknown_adapter") if adapter is not None else None
+        )
+        self.error_class = _safe_model_error_class(error_class) if error_class is not None else None
         self.error_summary = _normalize_model_error_summary(error_summary)
         self.elapsed_ms = elapsed_ms
+        self.route_receipt = _safe_route_receipt(route_receipt)
+        self.provider_attempts = _validated_provider_attempts(provider_attempts or [])
+
+
+class _LocalModelRouteRejection(ModelRuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        token: object,
+        **kwargs: Any,
+    ) -> None:
+        if token is not _LOCAL_ROUTE_REJECTION_TOKEN or reason not in _LOCAL_ROUTE_REJECTION_REASONS:
+            raise ValueError("Unsupported local route rejection")
+        super().__init__(message, **kwargs)
+        self.reason = reason
+
+
+def _is_trusted_attempt_adapter(adapter: Any) -> bool:
+    # This is an in-process trust boundary, not a plugin sandbox. Only the exact
+    # built-in transport may attest to its own physical HTTP attempts.
+    return type(adapter) is OpenAICompatibleModelAdapter
+
+
+def _record_provider_attempt_started(request: ModelRequest, provider_attempt: int) -> None:
+    recorder = request.provider_attempt_recorder
+    if recorder is None:
+        return
+    evidence = {
+        "provider_attempt": provider_attempt,
+        "provider": _safe_model_identifier(request.provider, "unknown_provider"),
+        "model": _safe_model_identifier(request.model, "unknown_model"),
+        "outcome": "dispatch_started",
+        "usage_known": False,
+    }
+    for key in ("agent_run_id", "agent_id", "step_name"):
+        value = request.metadata.get(key)
+        if type(value) is str:
+            evidence[key] = _safe_model_identifier(value, f"unknown_{key}")
+    for key in ("route_attempt", "agent_loop_step"):
+        value = request.metadata.get(key)
+        if type(value) is int and value > 0:
+            evidence[key] = value
+    try:
+        recorder(evidence)
+    except Exception as exc:
+        raise _LocalModelRouteRejection(
+            "Provider attempt evidence could not be persisted before dispatch.",
+            reason="provider_attempt_record_failed",
+            token=_LOCAL_ROUTE_REJECTION_TOKEN,
+            provider=request.provider,
+            model=request.model,
+            error_class="ProviderAttemptRecordError",
+            error_summary="classification=provider_error;retryable=false",
+        ) from exc
 
 
 def model_runtime_error_payload(exc: Exception) -> dict[str, Any]:
+    raw_provider = getattr(exc, "provider", None)
+    raw_model = getattr(exc, "model", None)
+    raw_adapter = getattr(exc, "adapter", None)
+    raw_error_class = getattr(exc, "error_class", None)
+    raw_elapsed_ms = getattr(exc, "elapsed_ms", None)
     payload = {
-        "provider": getattr(exc, "provider", None),
-        "model": getattr(exc, "model", None),
-        "adapter": getattr(exc, "adapter", None),
-        "error_class": getattr(exc, "error_class", None),
+        "provider": (
+            _safe_model_identifier(raw_provider, "unknown_provider")
+            if raw_provider is not None
+            else None
+        ),
+        "model": (
+            _safe_model_identifier(raw_model, "unknown_model") if raw_model is not None else None
+        ),
+        "adapter": (
+            _safe_model_identifier(raw_adapter, "unknown_adapter")
+            if raw_adapter is not None
+            else None
+        ),
+        "error_class": (
+            _safe_model_error_class(raw_error_class) if raw_error_class is not None else None
+        ),
         "error_summary": getattr(exc, "error_summary", None),
-        "elapsed_ms": getattr(exc, "elapsed_ms", None),
+        "elapsed_ms": (
+            raw_elapsed_ms if type(raw_elapsed_ms) is int and raw_elapsed_ms >= 0 else None
+        ),
+        "route_receipt": _safe_route_receipt(getattr(exc, "route_receipt", None)),
     }
     if payload["error_summary"] is not None:
         payload["error_summary"] = _normalize_model_error_summary(str(payload["error_summary"]))
+    if not payload["route_receipt"]:
+        payload.pop("route_receipt", None)
     return {key: value for key, value in payload.items() if value is not None}
 
 
@@ -425,6 +1215,190 @@ def model_provider_catalog() -> list[ModelProviderInfo]:
     ]
 
 
+def _required_model_capabilities(request: ModelRequest) -> list[str]:
+    value = request.metadata.get("required_model_capabilities", [])
+    required = list(value) if isinstance(value, list) else []
+    if _request_contains_image_block(request) and "vision" not in required:
+        required.append("vision")
+    return required
+
+
+def _request_contains_image_block(request: ModelRequest) -> bool:
+    return any(
+        isinstance(block, dict) and block.get("type") == "image_ref"
+        for message in request.messages
+        if isinstance(message.content, list)
+        for block in message.content
+    )
+
+
+def _route_receipt_entry(
+    *,
+    attempt: int,
+    provider: str,
+    model: str,
+    outcome: str,
+    reason: str,
+    error_class: str | None = None,
+    error_summary: str | None = None,
+    mocked: bool | None = None,
+    latency_ms: int | None = None,
+    usage: dict[str, int] | None = None,
+    cost_usd: float | None = None,
+    provider_attempt: int | None = None,
+    usage_known: bool | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "attempt": attempt if type(attempt) is int and attempt > 0 else 1,
+        "provider": _safe_model_identifier(provider, "unknown_provider"),
+        "model": _safe_model_identifier(model, "unknown_model"),
+        "outcome": outcome if outcome in {"rejected", "failed", "succeeded"} else "failed",
+        "reason": _safe_model_identifier(reason, "invalid_evidence"),
+    }
+    if error_class is not None:
+        payload["error_class"] = _safe_model_error_class(error_class)
+    if error_summary is not None:
+        payload["error_summary"] = _normalize_model_error_summary(error_summary)
+    if mocked is not None:
+        payload["mocked"] = mocked
+    if latency_ms is not None:
+        payload["latency_ms"] = max(0, int(latency_ms))
+    if usage:
+        payload["usage"] = dict(usage)
+    if cost_usd is not None and isfinite(float(cost_usd)):
+        payload["cost_usd"] = round(max(0.0, float(cost_usd)), 8)
+    if type(provider_attempt) is int and provider_attempt > 0:
+        payload["provider_attempt"] = provider_attempt
+    if usage_known is not None:
+        payload["usage_known"] = usage_known
+    return payload
+
+
+def _provider_attempt_evidence(
+    provider_attempt: int,
+    *,
+    error_class: str,
+    error_summary: str | None,
+    retryable: bool,
+) -> dict[str, Any]:
+    safe_error_summary = (
+        _normalize_model_error_summary(error_summary)
+        or "classification=unclassified_model_runtime_error"
+    )
+    return {
+        "provider_attempt": provider_attempt,
+        "outcome": "failed",
+        "reason": "retryable_error" if retryable else "non_retryable_error",
+        "error_class": _safe_model_error_class(error_class),
+        "error_summary": safe_error_summary,
+        "usage_known": False,
+    }
+
+
+def _safe_model_identifier(value: Any, fallback: str) -> str:
+    normalized = value.strip() if type(value) is str else ""
+    return (
+        normalized
+        if normalized
+        and len(normalized) <= _MAX_MODEL_RESPONSE_IDENTIFIER_LENGTH
+        and all(character in _MODEL_RESPONSE_IDENTIFIER_CHARS for character in normalized)
+        and not contains_secret_like_text(normalized)
+        else fallback
+    )
+
+
+def _safe_model_error_class(value: Any) -> str:
+    return _safe_model_identifier(value, "ProviderError")
+
+
+def _safe_route_receipt(value: Any) -> list[dict[str, Any]]:
+    if type(value) is not list:
+        return []
+    safe: list[dict[str, Any]] = []
+    for raw in value:
+        if type(raw) is not dict:
+            continue
+        usage = raw.get("usage")
+        safe_usage = (
+            {
+                key: item
+                for key, item in usage.items()
+                if key in _MODEL_RESPONSE_USAGE_KEYS and type(item) is int and item >= 0
+            }
+            if type(usage) is dict
+            else None
+        )
+        safe.append(
+            _route_receipt_entry(
+                attempt=raw.get("attempt"),
+                provider=raw.get("provider"),
+                model=raw.get("model"),
+                outcome=raw.get("outcome"),
+                reason=raw.get("reason"),
+                error_class=raw.get("error_class") if raw.get("error_class") is not None else None,
+                error_summary=(
+                    raw.get("error_summary") if raw.get("error_summary") is not None else None
+                ),
+                mocked=raw.get("mocked") if type(raw.get("mocked")) is bool else None,
+                latency_ms=(
+                    raw.get("latency_ms")
+                    if type(raw.get("latency_ms")) is int and raw.get("latency_ms") >= 0
+                    else None
+                ),
+                usage=safe_usage,
+                cost_usd=(
+                    raw.get("cost_usd")
+                    if type(raw.get("cost_usd")) in {int, float}
+                    and not isinstance(raw.get("cost_usd"), bool)
+                    and isfinite(float(raw.get("cost_usd")))
+                    else None
+                ),
+                provider_attempt=raw.get("provider_attempt"),
+                usage_known=(
+                    raw.get("usage_known") if type(raw.get("usage_known")) is bool else None
+                ),
+            )
+        )
+    return safe
+
+
+def _validated_provider_attempts(value: Any) -> list[dict[str, Any]]:
+    if type(value) is not list:
+        _raise_invalid_model_response_metadata()
+    required_keys = {
+        "provider_attempt",
+        "outcome",
+        "reason",
+        "error_class",
+        "error_summary",
+        "usage_known",
+    }
+    validated: list[dict[str, Any]] = []
+    for index, raw_attempt in enumerate(value, start=1):
+        if type(raw_attempt) is not dict or set(raw_attempt) != required_keys:
+            _raise_invalid_model_response_metadata()
+        if (
+            raw_attempt.get("provider_attempt") != index
+            or raw_attempt.get("outcome") != "failed"
+            or raw_attempt.get("reason") not in {"retryable_error", "non_retryable_error"}
+            or raw_attempt.get("usage_known") is not False
+        ):
+            _raise_invalid_model_response_metadata()
+        error_class = _validated_model_response_identifier(raw_attempt.get("error_class"))
+        error_summary = _normalize_model_error_summary(raw_attempt.get("error_summary"))
+        validated.append(
+            {
+                "provider_attempt": index,
+                "outcome": "failed",
+                "reason": raw_attempt["reason"],
+                "error_class": error_class,
+                "error_summary": error_summary or "classification=unclassified_model_runtime_error",
+                "usage_known": False,
+            }
+        )
+    return validated
+
+
 def model_request_from_agent(
     *,
     task_title: str,
@@ -443,19 +1417,35 @@ def model_request_from_agent(
         provider,
         model,
     )
+    model_content_blocks = context.get("_model_content_blocks")
+    required_capabilities = [
+        item
+        for item in context.get("required_model_capabilities", [])
+        if isinstance(item, str)
+    ]
+    if isinstance(model_content_blocks, list) and any(
+        isinstance(item, dict) and item.get("type") == "image_ref" for item in model_content_blocks
+    ) and "vision" not in required_capabilities:
+        required_capabilities.append("vision")
+    messages = [
+        ModelMessage(role="user", content=f"Task: {task_title}\nGoal: {task_goal}"),
+        ModelMessage(role="user", content=f"Step: {step_name}\nAgent: {agent_role}"),
+        ModelMessage(role="user", content=context_message_from_envelope(context)),
+    ]
+    if isinstance(model_content_blocks, list) and model_content_blocks:
+        messages.append(ModelMessage(role="user", content=model_content_blocks))
     return ModelRequest(
         provider=provider,
         model=model,
         system_prompt=system_prompt,
-        messages=[
-            ModelMessage(role="user", content=f"Task: {task_title}\nGoal: {task_goal}"),
-            ModelMessage(role="user", content=f"Step: {step_name}\nAgent: {agent_role}"),
-            ModelMessage(role="user", content=context_message_from_envelope(context)),
-        ],
+        messages=messages,
         temperature=_optional_float(model_config.get("temperature")),
         max_tokens=_optional_int(model_config.get("max_tokens")),
         reasoning_effort=reasoning_effort,
         tools_allowed=allowed_tools,
+        fallbacks=model_fallbacks_from_config(model_config),
+        input_usd_per_million=_optional_float(model_config.get("input_usd_per_million")),
+        output_usd_per_million=_optional_float(model_config.get("output_usd_per_million")),
         metadata={
             "task_title": task_title,
             "step_name": step_name,
@@ -463,8 +1453,43 @@ def model_request_from_agent(
             "agent_run_id": context.get("agent_run_id"),
             "agent_role": agent_role,
             "context_keys": sorted(context.keys()),
+            "allow_mock_fallback": model_allow_mock_fallback_from_config(model_config),
+            "required_model_capabilities": required_capabilities,
+            "run_bound": isinstance(context.get("run_id"), str) and bool(context.get("run_id")),
+            "real_model_access_confirmed": context.get("real_model_access_confirmed") is True,
+            "content_block_hashes": [
+                str(item.get("sha256"))
+                for item in context.get("content_blocks", [])
+                if isinstance(item, dict) and item.get("sha256")
+            ],
         },
     )
+
+
+def model_fallbacks_from_config(model_config: dict[str, Any]) -> list[dict[str, Any]]:
+    values = model_config.get("fallbacks", [])
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        raise ModelRuntimeError("Model fallback configuration must be a list.")
+    try:
+        return [
+            candidate.public_dict()
+            for candidate in route_candidates_from_request("mock", "mock-model", values)[1:]
+        ]
+    except (RoutePolicyError, ValueError) as exc:
+        raise ModelRuntimeError("Model fallback configuration is invalid.") from exc
+
+
+def model_allow_mock_fallback_from_config(model_config: dict[str, Any]) -> bool:
+    return _model_config_bool(model_config, "allow_mock_fallback", False)
+
+
+def _model_config_bool(model_config: dict[str, Any], name: str, default: bool) -> bool:
+    value = model_config.get(name, default)
+    if type(value) is not bool:
+        raise ModelRuntimeError(f"Model configuration {name} must be boolean.")
+    return value
 
 
 def context_message_from_envelope(context: dict[str, Any]) -> str:
@@ -492,6 +1517,8 @@ def _model_context_payload(context: dict[str, Any]) -> dict[str, Any]:
         "gate_context",
         "artifact_refs",
         "artifact_excerpts",
+        "content_blocks",
+        "vision_preprocess",
         "research_tool_evidence",
         "context_manifest",
     ]
@@ -529,13 +1556,213 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
-def _estimate_tokens(value: str) -> int:
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ModelRuntimeError(f"{name} must be a positive number.") from exc
+    if not isfinite(value) or value <= 0:
+        raise ModelRuntimeError(f"{name} must be a positive finite number.")
+    return value
+
+
+def _validated_positive_timeout(value: Any, message: str) -> float:
+    if (
+        type(value) not in {int, float}
+        or isinstance(value, bool)
+        or not isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise _LocalModelRouteRejection(
+            message,
+            reason="invalid_request",
+            token=_LOCAL_ROUTE_REJECTION_TOKEN,
+            error_class="InvalidModelRequest",
+            error_summary="classification=provider_error;retryable=false",
+        )
+    return float(value)
+
+
+def _estimate_tokens(value: object) -> int:
+    if isinstance(value, list):
+        return max(1, sum(_estimate_tokens(item) for item in value))
+    if isinstance(value, dict):
+        return max(1, sum(_estimate_tokens(key) + _estimate_tokens(item) for key, item in value.items()))
+    if isinstance(value, str) and value.startswith("data:"):
+        return max(1, (len(value.encode("utf-8")) + 3) // 4)
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return max(1, len(value.split()))
 
 
 def _format_timeout_header(value: float) -> str:
     numeric = float(value)
     return str(int(numeric)) if numeric.is_integer() else str(numeric)
+
+
+def _message_text_content(content: str | list[dict[str, Any]]) -> str:
+    if not isinstance(content, str):
+        raise ModelRuntimeError("Tool result messages must contain text content.")
+    return content
+
+
+def _chat_content(content: str | list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise ModelRuntimeError("Model message content must be text or content blocks.")
+    if len(content) > 16:
+        raise ModelRuntimeError("Model message contains too many content blocks.")
+    converted: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+            raise ModelRuntimeError("Model message contains an invalid content block.")
+        block_type = block["type"]
+        if block_type == "text":
+            text = block.get("text")
+            if not isinstance(text, str) or not text:
+                raise ModelRuntimeError("Text content blocks must contain non-empty text.")
+            converted.append({"type": "text", "text": text})
+        elif block_type == "image_ref":
+            data_uri = _validated_image_data_uri(block.get("data_uri"))
+            converted.append({"type": "image_url", "image_url": {"url": data_uri}})
+        elif block_type == "file_ref":
+            raise ModelRuntimeError("file_ref must be converted to untrusted text by the multimodal preprocessor.")
+        else:
+            raise ModelRuntimeError("Model message contains an unsupported content block type.")
+    return converted
+
+
+def _responses_content(content: str | list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise ModelRuntimeError("Model message content must be text or content blocks.")
+    if len(content) > 16:
+        raise ModelRuntimeError("Model message contains too many content blocks.")
+    converted: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+            raise ModelRuntimeError("Model message contains an invalid content block.")
+        block_type = block["type"]
+        if block_type == "text":
+            text = block.get("text")
+            if not isinstance(text, str) or not text:
+                raise ModelRuntimeError("Text content blocks must contain non-empty text.")
+            converted.append({"type": "input_text", "text": text})
+        elif block_type == "image_ref":
+            data_uri = _validated_image_data_uri(block.get("data_uri"))
+            converted.append({"type": "input_image", "image_url": data_uri})
+        elif block_type == "file_ref":
+            raise ModelRuntimeError("file_ref must be converted to untrusted text by the multimodal preprocessor.")
+        else:
+            raise ModelRuntimeError("Model message contains an unsupported content block type.")
+    return converted
+
+
+def _validated_image_data_uri(value: Any) -> str:
+    if not isinstance(value, str) or len(value.encode("ascii", errors="ignore")) > _MAX_MODEL_DATA_URI_BYTES:
+        raise ModelRuntimeError("Image content blocks require a bounded validated data URI.")
+    match = _DATA_URI_RE.fullmatch(value)
+    if match is None:
+        raise ModelRuntimeError("Image content blocks require a valid base64 data URI.")
+    mime_type, encoded = match.groups()
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ModelRuntimeError("Image content blocks contain invalid base64 data.") from exc
+    if not decoded or len(decoded) > _MAX_MODEL_IMAGE_BYTES:
+        raise ModelRuntimeError("Image content blocks exceed the decoded size limit.")
+    magic = {
+        "image/jpeg": decoded.startswith(b"\xff\xd8\xff"),
+        "image/png": decoded.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/gif": decoded.startswith((b"GIF87a", b"GIF89a")),
+        "image/webp": decoded.startswith(b"RIFF") and decoded[8:12] == b"WEBP",
+    }
+    if not magic.get(mime_type, False):
+        raise ModelRuntimeError("Image content blocks do not match their declared MIME type.")
+    return value
+
+
+def _chat_message(message: ModelMessage) -> dict[str, Any]:
+    if message.role == "tool":
+        if not message.tool_call_id:
+            raise ModelRuntimeError("Tool result messages require tool_call_id.")
+        return {
+            "role": "tool",
+            "tool_call_id": message.tool_call_id,
+            "content": _message_text_content(message.content),
+        }
+    if message.role not in {"system", "developer", "user", "assistant"}:
+        raise ModelRuntimeError("Model message contains an unsupported role.")
+    payload: dict[str, Any] = {"role": message.role, "content": _chat_content(message.content)}
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": tool_call.id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.name,
+                    "arguments": json.dumps(tool_call.arguments, ensure_ascii=False, separators=(",", ":")),
+                },
+            }
+            for tool_call in message.tool_calls
+        ]
+    return payload
+
+
+def _responses_input_items(messages: list[ModelMessage]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        if message.role == "tool":
+            if not message.tool_call_id:
+                raise ModelRuntimeError("Tool result messages require tool_call_id.")
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id,
+                    "output": _message_text_content(message.content),
+                }
+            )
+            continue
+        if message.role not in {"system", "developer", "user", "assistant"}:
+            raise ModelRuntimeError("Model message contains an unsupported role.")
+        items.append({"role": message.role, "content": _responses_content(message.content)})
+        items.extend(
+            {
+                "type": "function_call",
+                "call_id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": json.dumps(tool_call.arguments, ensure_ascii=False, separators=(",", ":")),
+            }
+            for tool_call in message.tool_calls
+        )
+    return items
+
+
+def _validated_tool_definitions(tools: list[ModelToolDefinition]) -> list[ModelToolDefinition]:
+    names: set[str] = set()
+    validated: list[ModelToolDefinition] = []
+    for tool in tools:
+        name = _validated_model_response_identifier(tool.name)
+        if name in names:
+            raise ModelRuntimeError("Model request declares duplicate tool names.")
+        names.add(name)
+        if not isinstance(tool.description, str) or not tool.description.strip() or len(tool.description) > 2000:
+            raise ModelRuntimeError("Model request contains an invalid tool description.")
+        if not isinstance(tool.input_schema, dict) or tool.input_schema.get("type") != "object":
+            raise ModelRuntimeError("Model request contains an invalid tool input schema.")
+        try:
+            encoded_schema = json.dumps(tool.input_schema, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ModelRuntimeError("Model request contains a non-serializable tool input schema.") from exc
+        if len(encoded_schema) > 100_000:
+            raise ModelRuntimeError("Model request tool input schema is too large.")
+        validated.append(ModelToolDefinition(name=name, description=tool.description.strip(), input_schema=tool.input_schema))
+    return validated
 
 
 def _request_options(request: ModelRequest) -> dict[str, Any]:
@@ -547,6 +1774,16 @@ def _request_options(request: ModelRequest) -> dict[str, Any]:
     transport = reasoning_effort_transport(request)
     if transport.reasoning_effort_sent and transport.sent_reasoning_effort is not None:
         options["reasoning"] = {"effort": transport.sent_reasoning_effort}
+    if request.tools:
+        options["tools"] = [
+            {
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            }
+            for tool in _validated_tool_definitions(request.tools)
+        ]
     return options
 
 
@@ -559,6 +1796,18 @@ def _chat_request_options(request: ModelRequest) -> dict[str, Any]:
     transport = reasoning_effort_transport(request)
     if transport.reasoning_effort_sent and transport.sent_reasoning_effort is not None:
         options["reasoning_effort"] = transport.sent_reasoning_effort
+    if request.tools:
+        options["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                },
+            }
+            for tool in _validated_tool_definitions(request.tools)
+        ]
     return options
 
 
@@ -649,9 +1898,22 @@ _MODEL_RESPONSE_IDENTIFIER_CHARS = frozenset(
 )
 _MAX_MODEL_RESPONSE_IDENTIFIER_LENGTH = 128
 _MAX_MODEL_RESPONSE_COUNTER = (1 << 63) - 1
+_MAX_TOOL_CALLS_PER_RESPONSE = 16
+_MAX_TOOL_ARGUMENT_CHARS = 100_000
 
 
-def _validate_model_response(response: Any, *, provider: str, model: str) -> ModelResponse:
+def model_response_is_complete(response: ModelResponse) -> bool:
+    return response.finish_reason in _COMPLETE_RESPONSE_STATES
+
+
+def _validate_model_response(
+    response: Any,
+    *,
+    provider: str,
+    model: str,
+    allowed_tools: set[str],
+    allow_provider_attempts: bool = False,
+) -> ModelResponse:
     if not isinstance(response, ModelResponse):
         raise ModelRuntimeError(
             "Model adapter returned an invalid response.",
@@ -665,6 +1927,17 @@ def _validate_model_response(response: Any, *, provider: str, model: str) -> Mod
         latency_ms = _validated_model_response_counter(response.latency_ms)
         raw_provider = _validated_model_response_identifier(response.raw_provider)
         adapter = _validated_model_response_identifier(response.adapter)
+        provider_attempts = _validated_provider_attempts(response.provider_attempts)
+        if provider_attempts and not allow_provider_attempts:
+            _raise_invalid_model_response_metadata()
+        if response.selected_provider is not None:
+            selected_provider = _validated_model_response_identifier(response.selected_provider)
+            if selected_provider != provider:
+                _raise_invalid_model_response_metadata()
+        if response.selected_model is not None:
+            selected_model = _validated_model_response_identifier(response.selected_model)
+            if selected_model != model:
+                _raise_invalid_model_response_metadata()
         if raw_provider != provider or type(response.mocked) is not bool:
             _raise_invalid_model_response_metadata()
     except Exception:
@@ -676,8 +1949,10 @@ def _validate_model_response(response: Any, *, provider: str, model: str) -> Mod
             error_summary="response_type=invalid",
         ) from None
     try:
-        finish_reason = _validated_finish_reason(response.finish_reason)
-        text = _validated_response_text(response.text)
+        tool_calls = _validated_model_tool_calls(response.tool_calls)
+        _ensure_tool_calls_allowed(tool_calls, allowed_tools)
+        finish_reason = _validated_finish_reason(response.finish_reason, allow_tool_calls=bool(tool_calls))
+        text = _validated_response_text(response.text, allow_empty=bool(tool_calls))
     except ModelRuntimeError as exc:
         raise ModelRuntimeError(
             str(exc),
@@ -693,8 +1968,12 @@ def _validate_model_response(response: Any, *, provider: str, model: str) -> Mod
         latency_ms=latency_ms,
         finish_reason=finish_reason,
         raw_provider=raw_provider,
+        selected_provider=provider,
+        selected_model=model,
         adapter=adapter,
         mocked=response.mocked,
+        tool_calls=tool_calls,
+        provider_attempts=provider_attempts,
     )
 
 
@@ -729,6 +2008,35 @@ def _validated_model_response_identifier(value: Any) -> str:
     return normalized
 
 
+def _validated_model_tool_calls(value: Any) -> list[ModelToolCall]:
+    if not isinstance(value, list) or len(value) > _MAX_TOOL_CALLS_PER_RESPONSE:
+        _raise_invalid_model_response_metadata()
+    calls: list[ModelToolCall] = []
+    ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, ModelToolCall) or not isinstance(item.arguments, dict):
+            _raise_invalid_model_response_metadata()
+        call_id = _validated_model_response_identifier(item.id)
+        name = _validated_model_response_identifier(item.name)
+        if call_id in ids:
+            _raise_invalid_model_response_metadata()
+        ids.add(call_id)
+        try:
+            encoded = json.dumps(item.arguments, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            _raise_invalid_model_response_metadata()
+        if len(encoded) > _MAX_TOOL_ARGUMENT_CHARS:
+            _raise_invalid_model_response_metadata()
+        calls.append(ModelToolCall(id=call_id, name=name, arguments=item.arguments))
+    return calls
+
+
+def _ensure_tool_calls_allowed(tool_calls: list[ModelToolCall], allowed_tools: set[str]) -> None:
+    unknown = sorted({tool_call.name for tool_call in tool_calls} - allowed_tools)
+    if unknown:
+        _raise_unsupported_response_shape("tool_call")
+
+
 def _raise_invalid_model_response_metadata() -> None:
     raise ModelRuntimeError(
         "Model adapter returned invalid response metadata.",
@@ -741,7 +2049,7 @@ def _validate_openai_response_shape(response: Any) -> None:
     choices = getattr(response, "choices", None) or []
     for choice in choices:
         message = getattr(choice, "message", None)
-        if getattr(message, "tool_calls", None) or getattr(message, "function_call", None):
+        if getattr(message, "function_call", None):
             _raise_unsupported_response_shape("tool_call")
         if getattr(message, "refusal", None) is not None:
             _raise_unsupported_response_shape("refusal")
@@ -749,14 +2057,10 @@ def _validate_openai_response_shape(response: Any) -> None:
     output = getattr(response, "output", None) or []
     for item in output:
         item_type = _normalized_response_item_type(item)
-        if _is_tool_call_item_type(item_type):
-            _raise_unsupported_response_shape("tool_call")
         if item_type == "refusal" or getattr(item, "refusal", None) is not None:
             _raise_unsupported_response_shape("refusal")
         for content in getattr(item, "content", None) or []:
             content_type = _normalized_response_item_type(content)
-            if _is_tool_call_item_type(content_type):
-                _raise_unsupported_response_shape("tool_call")
             if content_type == "refusal" or getattr(content, "refusal", None) is not None:
                 _raise_unsupported_response_shape("refusal")
 
@@ -772,6 +2076,66 @@ def _is_tool_call_item_type(item_type: str | None) -> bool:
     return item_type is not None and (item_type == "function_call" or item_type.endswith("_call"))
 
 
+def _response_tool_calls(response: Any) -> list[ModelToolCall]:
+    calls: list[ModelToolCall] = []
+    choices = getattr(response, "choices", None) or []
+    for choice in choices:
+        message = getattr(choice, "message", None)
+        for raw_call in getattr(message, "tool_calls", None) or []:
+            function = getattr(raw_call, "function", None)
+            calls.append(
+                _parsed_tool_call(
+                    getattr(raw_call, "id", None),
+                    getattr(function, "name", None),
+                    getattr(function, "arguments", None),
+                )
+            )
+    for item in getattr(response, "output", None) or []:
+        if not _is_tool_call_item_type(_normalized_response_item_type(item)):
+            continue
+        calls.append(
+            _parsed_tool_call(
+                getattr(item, "call_id", None) or getattr(item, "id", None),
+                getattr(item, "name", None),
+                getattr(item, "arguments", None),
+            )
+        )
+    return _validated_model_tool_calls(calls)
+
+
+def _response_has_tool_calls(response: Any) -> bool:
+    for choice in getattr(response, "choices", None) or []:
+        if getattr(getattr(choice, "message", None), "tool_calls", None):
+            return True
+    return any(
+        _is_tool_call_item_type(_normalized_response_item_type(item))
+        for item in getattr(response, "output", None) or []
+    )
+
+
+def _parsed_tool_call(call_id: Any, name: Any, raw_arguments: Any) -> ModelToolCall:
+    try:
+        validated_id = _validated_model_response_identifier(call_id)
+        validated_name = _validated_model_response_identifier(name)
+        if not isinstance(raw_arguments, str) or len(raw_arguments) > _MAX_TOOL_ARGUMENT_CHARS:
+            raise ValueError("invalid arguments")
+        arguments = json.loads(raw_arguments)
+        if not isinstance(arguments, dict):
+            raise ValueError("arguments must be an object")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise ModelRuntimeError(
+            "Model response included an invalid tool call.",
+            error_class="InvalidModelResponse",
+            error_summary="response_shape=tool_call",
+        ) from None
+    return ModelToolCall(id=validated_id, name=validated_name, arguments=arguments)
+
+
+def _validate_requested_tool_calls(request: ModelRequest, tool_calls: list[ModelToolCall]) -> None:
+    declared_tools = {tool.name for tool in _validated_tool_definitions(request.tools)}
+    _ensure_tool_calls_allowed(tool_calls, declared_tools)
+
+
 def _raise_unsupported_response_shape(shape: str) -> None:
     raise ModelRuntimeError(
         "Model response included unsupported tool or refusal content.",
@@ -780,15 +2144,15 @@ def _raise_unsupported_response_shape(shape: str) -> None:
     )
 
 
-def _response_text(response: Any) -> str:
+def _response_text(response: Any, *, allow_empty: bool = False) -> str:
     choices = getattr(response, "choices", None) or []
     for choice in choices:
         message = getattr(choice, "message", None)
         content = getattr(message, "content", None)
-        return _validated_response_text(content)
+        return _validated_response_text(content, allow_empty=allow_empty)
     output_text = getattr(response, "output_text", _MISSING_RESPONSE_FIELD)
     if output_text is not _MISSING_RESPONSE_FIELD:
-        return _validated_response_text(output_text)
+        return _validated_response_text(output_text, allow_empty=allow_empty)
     output = getattr(response, "output", None) or []
     parts: list[str] = []
     for item in output:
@@ -804,7 +2168,9 @@ def _response_text(response: Any) -> str:
                 )
             parts.append(text)
     if parts:
-        return _validated_response_text("\n".join(parts))
+        return _validated_response_text("\n".join(parts), allow_empty=allow_empty)
+    if allow_empty:
+        return ""
     raise ModelRuntimeError(
         "Model response did not contain non-empty text.",
         error_class="InvalidModelResponse",
@@ -812,14 +2178,16 @@ def _response_text(response: Any) -> str:
     )
 
 
-def _validated_response_text(value: Any) -> str:
+def _validated_response_text(value: Any, *, allow_empty: bool = False) -> str:
+    if allow_empty and value is None:
+        return ""
     if not isinstance(value, str):
         raise ModelRuntimeError(
             "Model response did not contain non-empty text.",
             error_class="InvalidModelResponse",
             error_summary="response_text_type=non_string",
         )
-    if not value.strip():
+    if not value.strip() and not allow_empty:
         raise ModelRuntimeError(
             "Model response did not contain non-empty text.",
             error_class="InvalidModelResponse",
@@ -837,11 +2205,11 @@ def _response_usage(response: Any) -> dict[str, int]:
         completion_tokens = _response_usage_field(usage, "completion_tokens")
         total_tokens = _response_usage_field(usage, "total_tokens")
         if prompt_tokens is not _MISSING_RESPONSE_FIELD or completion_tokens is not _MISSING_RESPONSE_FIELD:
-            raw_usage = {
-                "input_tokens": _response_usage_counter(prompt_tokens),
-                "output_tokens": _response_usage_counter(completion_tokens),
-                "total_tokens": _response_usage_counter(total_tokens),
-            }
+            raw_usage = _present_response_usage(
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
         else:
             input_tokens = _response_usage_field(usage, "input_tokens")
             output_tokens = _response_usage_field(usage, "output_tokens")
@@ -851,11 +2219,11 @@ def _response_usage(response: Any) -> dict[str, int]:
                 and total_tokens is _MISSING_RESPONSE_FIELD
             ):
                 _raise_invalid_model_response_metadata()
-            raw_usage = {
-                "input_tokens": _response_usage_counter(input_tokens),
-                "output_tokens": _response_usage_counter(output_tokens),
-                "total_tokens": _response_usage_counter(total_tokens),
-            }
+            raw_usage = _present_response_usage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
         return _validated_model_response_usage(raw_usage)
     except Exception:
         _raise_invalid_model_response_metadata()
@@ -867,20 +2235,25 @@ def _response_usage_field(usage: Any, name: str) -> Any:
     return getattr(usage, name, _MISSING_RESPONSE_FIELD)
 
 
-def _response_usage_counter(value: Any) -> int:
-    if value is _MISSING_RESPONSE_FIELD or value is None:
-        return 0
-    return _validated_model_response_counter(value)
+def _present_response_usage(**values: Any) -> dict[str, int]:
+    return {
+        key: _validated_model_response_counter(value)
+        for key, value in values.items()
+        if value is not _MISSING_RESPONSE_FIELD and value is not None
+    }
 
 
-def _response_finish_reason(response: Any) -> str:
+def _response_finish_reason(response: Any, *, allow_tool_calls: bool = False) -> str:
     choices = getattr(response, "choices", None) or []
     for choice in choices:
-        return _validated_finish_reason(getattr(choice, "finish_reason", None))
-    return _validated_finish_reason(getattr(response, "status", None))
+        return _validated_finish_reason(
+            getattr(choice, "finish_reason", None),
+            allow_tool_calls=allow_tool_calls,
+        )
+    return _validated_finish_reason(getattr(response, "status", None), allow_tool_calls=allow_tool_calls)
 
 
-def _validated_finish_reason(value: Any) -> str:
+def _validated_finish_reason(value: Any, *, allow_tool_calls: bool = False) -> str:
     if not isinstance(value, str) or not value.strip():
         summary = (
             "finish_reason=missing"
@@ -893,6 +2266,8 @@ def _validated_finish_reason(value: Any) -> str:
             error_summary=summary,
         )
     finish_reason = value.strip().lower()
+    if finish_reason == "tool_calls" and allow_tool_calls:
+        return finish_reason
     if finish_reason not in _COMPLETE_RESPONSE_STATES:
         summary = (
             f"finish_reason={finish_reason}"
@@ -908,6 +2283,11 @@ def _validated_finish_reason(value: Any) -> str:
 
 
 def _is_transient_model_error(exc: Exception) -> bool:
+    status_code = _provider_error_status_code(exc)
+    if status_code in {401, 403}:
+        return False
+    if status_code == 429 or status_code in {408, 500, 502, 503, 504}:
+        return True
     text = str(exc).lower()
     transient_markers = (
         "connection error",
@@ -945,6 +2325,15 @@ def _is_transient_model_error(exc: Exception) -> bool:
     return any(marker in text for marker in transient_markers) and not any(
         marker in text for marker in non_transient_markers
     )
+
+
+def model_error_is_retryable(exc: Exception) -> bool:
+    summary = getattr(exc, "error_summary", None)
+    if isinstance(summary, str) and "retryable=true" in summary:
+        return True
+    if isinstance(summary, str) and "retryable=false" in summary:
+        return False
+    return _is_transient_model_error(exc)
 
 
 def _safe_provider_error_summary(exc: Exception | None) -> str | None:
@@ -994,6 +2383,7 @@ _MODEL_ERROR_SUMMARY_ALLOWED_VALUES = {
             "connection_error",
             "transient_provider_error",
             "provider_error",
+            "capability_error",
             "unclassified_model_runtime_error",
         }
     ),

@@ -398,3 +398,139 @@ def test_model_routing_rejects_unknown_agent_provider_sensitive_fields_and_numer
     )
     with pytest.raises(ModelRoutingError, match="invalid"):
         load_model_routing_config(bad_temperature_path)
+
+
+def test_model_routing_applies_typed_fallback_chain(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", raising=False)
+    path = tmp_path / "model-routing.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "code_rd-reviewer": {
+                        "provider": "mock",
+                        "model": "mock-reviewer",
+                        "allow_mock_fallback": True,
+                        "fallbacks": [
+                            {
+                                "provider": "mock",
+                                "model": "mock-fallback",
+                                "reason": "local_degradation",
+                            }
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pack = get_code_rd_pack()
+    routed = apply_model_routing_config({pack.name: pack}, load_model_routing_config(path))[pack.name]
+    reviewer = next(agent for agent in routed.agents if agent.id == "code_rd-reviewer")
+
+    assert reviewer.model_settings["allow_mock_fallback"] is True
+    assert reviewer.model_settings["fallbacks"] == [
+        {
+            "provider": "mock",
+            "model": "mock-fallback",
+            "reason": "local_degradation",
+            "allow_real_calls": False,
+        }
+    ]
+
+
+def test_model_routing_requires_explicit_real_fallback_approval(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    path = tmp_path / "model-routing.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "code_rd-reviewer": {
+                        "provider": "mock",
+                        "model": "mock-reviewer",
+                        "fallbacks": [{"provider": "deepseek", "model": "deepseek-chat"}],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pack = get_code_rd_pack()
+    with pytest.raises(ModelRoutingError, match="allow_real_calls"):
+        apply_model_routing_config({pack.name: pack}, load_model_routing_config(path))
+
+
+def test_model_routing_preserves_primary_and_fallback_prices(tmp_path) -> None:
+    path = tmp_path / "model-routing.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "code_rd-reviewer": {
+                        "provider": "mock",
+                        "model": "mock-reviewer",
+                        "input_usd_per_million": 0.0,
+                        "output_usd_per_million": 0.0,
+                        "allow_mock_fallback": True,
+                        "fallbacks": [
+                            {
+                                "provider": "mock",
+                                "model": "mock-fallback",
+                                "input_usd_per_million": 1.25,
+                                "output_usd_per_million": 2.5,
+                            }
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pack = get_code_rd_pack()
+    routed = apply_model_routing_config({pack.name: pack}, load_model_routing_config(path))[pack.name]
+    reviewer = next(agent for agent in routed.agents if agent.id == "code_rd-reviewer")
+
+    assert reviewer.model_settings["input_usd_per_million"] == 0.0
+    assert reviewer.model_settings["output_usd_per_million"] == 0.0
+    assert reviewer.model_settings["fallbacks"][0]["input_usd_per_million"] == 1.25
+    assert reviewer.model_settings["fallbacks"][0]["output_usd_per_million"] == 2.5
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        {
+            "provider": "mock",
+            "model": "mock-reviewer",
+            "input_usd_per_million": 1.0,
+        },
+        {
+            "provider": "mock",
+            "model": "mock-reviewer",
+            "fallbacks": [
+                {
+                    "provider": "mock",
+                    "model": "mock-fallback",
+                    "output_usd_per_million": 2.0,
+                }
+            ],
+        },
+    ],
+)
+def test_model_routing_rejects_incomplete_price_pairs(tmp_path, route: dict[str, object]) -> None:
+    path = tmp_path / "model-routing.json"
+    path.write_text(
+        json.dumps({"agents": {"code_rd-reviewer": route}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ModelRoutingError, match="invalid"):
+        load_model_routing_config(path)

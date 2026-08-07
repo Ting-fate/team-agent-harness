@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from app.core.artifacts import ArtifactStore, ArtifactStoreError
 from app.core.context_injection import ContextInjector
+from app.core.execution_plan import ExecutionPlan, execution_plan_hash, workflow_pack_from_execution_plan
 from app.core.model_runtime import (
     ModelGateway,
     ModelRequest,
@@ -40,7 +41,7 @@ from app.core.sensitive_text import redact_secret_like_text
 from app.core.storage import SQLiteStorage
 from app.core.task_intake import analyze_task_intake
 from app.core.trace import TraceLogger
-from app.packs.base import EvalCheck, WorkflowPack, WorkflowStep
+from app.packs.base import EvalCheck, StepAcceptanceCriterion, WorkflowPack, WorkflowStep
 
 
 class WorkflowRunnerError(RuntimeError):
@@ -443,6 +444,8 @@ class WorkflowRunner:
                     f"Run task expects workflow pack {task.workflow_pack}, got {pack.name}"
                 )
 
+            pack = self._resolved_execution_plan_pack(active_run, pack)
+
             final_artifact_type = self._artifact_type(pack.final_artifact_type)
             self._register_pack_agents(pack)
             self._invalidate_incomplete_checkpoints(active_run.id, pack)
@@ -528,6 +531,7 @@ class WorkflowRunner:
                         parallel_candidate
                         and self._can_execute_batch_in_parallel(task, prepared_steps)
                     ),
+                    max_parallel_steps=pack.max_parallel_steps,
                 )
                 for executed_step in executed_steps:
                     prepared = executed_step.prepared
@@ -611,6 +615,40 @@ class WorkflowRunner:
             if isinstance(exc, WorkflowRunnerError):
                 raise
             raise WorkflowRunnerError(_safe_error_message(exc)) from exc
+
+    def _resolved_execution_plan_pack(self, run: Run, pack: WorkflowPack) -> WorkflowPack:
+        if run.execution_plan is None:
+            return pack
+        try:
+            execution_plan = ExecutionPlan.model_validate(run.execution_plan)
+        except Exception as exc:
+            raise WorkflowRunnerError("Persisted execution plan is invalid.") from exc
+        if not execution_plan.agent_snapshots:
+            raise WorkflowRunnerError("Persisted execution plan is missing agent snapshots.")
+        expected_hash = execution_plan_hash(execution_plan)
+        if run.execution_plan_hash != expected_hash:
+            raise WorkflowRunnerError("Persisted execution plan hash does not match its content.")
+        try:
+            resolved_pack = workflow_pack_from_execution_plan(
+                execution_plan,
+                pack,
+                allow_frozen_workflow_pack_snapshot=True,
+            )
+        except ValueError as exc:
+            raise WorkflowRunnerError(str(exc)) from exc
+        self.trace_logger.record(
+            run_id=run.id,
+            event_type=TraceEventType.WORKFLOW_EVENT,
+            payload={
+                "action": "execution_plan_loaded",
+                "schema_version": execution_plan.schema_version,
+                "source": execution_plan.source,
+                "plan_hash": expected_hash,
+                "step_count": len(execution_plan.steps),
+                "max_parallel_steps": execution_plan.max_parallel_steps,
+            },
+        )
+        return resolved_pack
 
     def _start_run(self, run: Run, *, resume_waiting: bool = False) -> Run:
         existing = self.storage.get_run(run.id)
@@ -935,6 +973,7 @@ class WorkflowRunner:
         prepared_steps: list[_PreparedStepExecution],
         *,
         allow_parallel: bool,
+        max_parallel_steps: int,
     ) -> list[_ExecutedStepOutput]:
         if allow_parallel and len(prepared_steps) > 1:
             self.trace_logger.record(
@@ -951,22 +990,63 @@ class WorkflowRunner:
                 },
             )
             outputs_by_step: dict[str, AgentStepOutput | Exception] = {}
-            with ThreadPoolExecutor(max_workers=len(prepared_steps)) as executor:
-                futures = {
-                    executor.submit(
+            cancelled_before_start: list[str] = []
+            worker_count = min(len(prepared_steps), max_parallel_steps)
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures: dict[Any, tuple[int, _PreparedStepExecution]] = {}
+                next_index = 0
+                while next_index < worker_count:
+                    prepared = prepared_steps[next_index]
+                    future = executor.submit(
                         self._execute_prepared_step,
                         active_run,
                         task,
                         prepared,
-                    ): prepared
-                    for prepared in prepared_steps
-                }
-                for future in as_completed(futures):
-                    prepared = futures[future]
+                    )
+                    futures[future] = (next_index, prepared)
+                    next_index += 1
+
+                failed_index: int | None = None
+                while futures:
+                    future = next(as_completed(tuple(futures)))
+                    index, prepared = futures.pop(future)
                     try:
                         outputs_by_step[prepared.step.name] = future.result()
                     except Exception as exc:  # preserve stable commit/error ordering below
                         outputs_by_step[prepared.step.name] = exc
+                        failed_index = index if failed_index is None else min(failed_index, index)
+                        for sibling_future, (sibling_index, sibling) in list(futures.items()):
+                            if sibling_index > failed_index and sibling_future.cancel():
+                                futures.pop(sibling_future)
+                                outputs_by_step[sibling.step.name] = CancelledError(
+                                    f"Parallel step cancelled before execution: {sibling.step.name}"
+                                )
+                                cancelled_before_start.append(sibling.step.name)
+                    if failed_index is None and next_index < len(prepared_steps):
+                        next_prepared = prepared_steps[next_index]
+                        next_future = executor.submit(
+                            self._execute_prepared_step,
+                            active_run,
+                            task,
+                            next_prepared,
+                        )
+                        futures[next_future] = (next_index, next_prepared)
+                        next_index += 1
+
+            for prepared in prepared_steps[next_index:]:
+                outputs_by_step[prepared.step.name] = CancelledError(
+                    f"Parallel step cancelled before execution: {prepared.step.name}"
+                )
+                cancelled_before_start.append(prepared.step.name)
+            if cancelled_before_start:
+                self.trace_logger.record(
+                    run_id=active_run.id,
+                    event_type=TraceEventType.WORKFLOW_EVENT,
+                    payload={
+                        "action": "parallel_step_pending_cancelled",
+                        "steps": cancelled_before_start,
+                    },
+                )
             return [
                 _ExecutedStepOutput(prepared=prepared, output=outputs_by_step[prepared.step.name])
                 for prepared in prepared_steps
@@ -1144,6 +1224,7 @@ class WorkflowRunner:
                 )
                 if eval_result.status == EvalStatus.FAIL:
                     raise WorkflowRunnerError(f"Executor evaluation failed: {eval_result.check_name}")
+            self._validate_step_acceptance_criteria(active_run, agent_run, step, artifacts, output.eval_results)
             self._validate_step_eval_gate(step, output.eval_results)
 
             next_steps = self._next_steps(pack, ordered_steps, step)
@@ -1430,7 +1511,11 @@ class WorkflowRunner:
             event_type=TraceEventType.WORKFLOW_EVENT,
             payload=result.trace_summary,
         )
-        return result.context
+        return {
+            **result.context,
+            "run_id": run.id,
+            "real_model_access_confirmed": run.real_model_access_confirmed,
+        }
 
     def _record_task_intake_trace(self, task: Task, run: Run, pack: WorkflowPack) -> None:
         result = analyze_task_intake(task)
@@ -1851,6 +1936,69 @@ class WorkflowRunner:
                 f"Step {step.name} is missing upstream gate artifacts: {', '.join(missing_gate_artifacts)}"
             )
 
+    def _validate_step_acceptance_criteria(
+        self,
+        run: Run,
+        agent_run: AgentRun,
+        step: WorkflowStep,
+        artifacts: list[Artifact],
+        eval_results: list[EvalResult],
+    ) -> None:
+        for criterion in step.acceptance_criteria:
+            passed, message, artifact_id = self._evaluate_step_acceptance_criterion(
+                criterion,
+                artifacts,
+                eval_results,
+            )
+            self._record_eval_result(
+                run,
+                agent_run,
+                f"{step.name}:acceptance:{criterion.name}",
+                EvalStatus.PASS if passed else EvalStatus.FAIL,
+                message,
+                artifact_id,
+                scope="step_acceptance",
+            )
+            if not passed:
+                raise WorkflowRunnerError(
+                    f"Step {step.name} failed acceptance criterion: {criterion.name}"
+                )
+
+    def _evaluate_step_acceptance_criterion(
+        self,
+        criterion: StepAcceptanceCriterion,
+        artifacts: list[Artifact],
+        eval_results: list[EvalResult],
+    ) -> tuple[bool, str, str | None]:
+        if criterion.kind == "executor_eval_pass":
+            matches = [result for result in eval_results if result.check_name == criterion.check_name]
+            passed = len(matches) == 1 and matches[0].status == EvalStatus.PASS
+            return passed, "Required executor eval passed." if passed else "Required executor eval did not pass.", None
+
+        matching_artifacts = [
+            artifact for artifact in artifacts if artifact.type == criterion.artifact_type
+        ]
+        if not matching_artifacts:
+            return False, "Required artifact was not produced by this step.", None
+        artifact = matching_artifacts[-1]
+        if criterion.kind == "source_refs_present":
+            passed = bool(artifact.source_refs)
+            return passed, "Artifact source references are present." if passed else "Artifact source references are missing.", artifact.id
+        try:
+            content = self.artifact_store.read_text_verified(artifact)
+        except ArtifactStoreError:
+            return False, "Artifact content verification failed.", artifact.id
+        if criterion.kind == "artifact_nonempty":
+            passed = bool(content.strip())
+            return passed, "Artifact content is non-empty." if passed else "Artifact content is empty.", artifact.id
+        if criterion.kind == "artifact_min_chars":
+            passed = criterion.min_chars is not None and len(content) >= criterion.min_chars
+            return passed, f"Artifact contains {len(content)} characters.", artifact.id
+        if criterion.kind == "artifact_contains":
+            passed = criterion.marker is not None and criterion.marker in content
+            return passed, "Required artifact marker is present." if passed else "Required artifact marker is missing.", artifact.id
+        raise WorkflowRunnerError(f"Unsupported acceptance criterion kind: {criterion.kind}")
+
     def _validate_step_eval_gate(self, step: WorkflowStep, eval_results: list[EvalResult]) -> None:
         if not step.requires_eval_pass:
             return
@@ -2022,8 +2170,11 @@ class WorkflowRunner:
                 event_type=TraceEventType.MODEL_ACTION,
                 payload={
                     "action": "model_response",
-                    "provider": output.model_response.raw_provider,
-                    "model": output.model_request.model if output.model_request is not None else None,
+                    "provider": output.model_response.selected_provider or output.model_response.raw_provider,
+                    "model": (
+                        output.model_response.selected_model
+                        or (output.model_request.model if output.model_request is not None else None)
+                    ),
                     "agent_id": response_metadata.get("agent_id"),
                     "step_name": response_metadata.get("step_name"),
                     **(
@@ -2037,6 +2188,7 @@ class WorkflowRunner:
                     "latency_ms": output.model_response.latency_ms,
                     "finish_reason": output.model_response.finish_reason,
                     "output_length": len(output.model_response.text),
+                    "route_receipt": output.model_response.route_receipt,
                 },
                 duration_ms=output.model_response.latency_ms,
             )

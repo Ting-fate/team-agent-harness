@@ -1,5 +1,8 @@
 import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +13,8 @@ from app.core.model_runtime import (
     ModelRequest,
     ModelResponse,
     ModelRuntimeError,
+    ModelToolCall,
+    ModelToolDefinition,
     MockModelAdapter,
     OpenAICompatibleModelAdapter,
     ProviderStubAdapter,
@@ -20,6 +25,8 @@ from app.core.model_runtime import (
     reasoning_effort_trace_payload,
     reasoning_effort_transport,
 )
+from app.core.model_capabilities import CapabilityRegistry, ModelCapability
+from app.core.provider_health import ProviderHealthRegistry
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -68,6 +75,440 @@ def test_model_gateway_rejects_unconfigured_provider() -> None:
 
     with pytest.raises(ModelRuntimeError, match="Model provider not configured"):
         ModelGateway().complete(request)
+
+
+def test_model_gateway_fails_closed_before_adapter_call_for_unsupported_tools() -> None:
+    calls: list[ModelRequest] = []
+    adapter = SimpleNamespace(complete=lambda request: calls.append(request))
+    request = ModelRequest(
+        provider="deepseek",
+        model="deepseek-chat",
+        system_prompt="System",
+        messages=[],
+        tools=[ModelToolDefinition(name="read_file", description="Read.", input_schema={"type": "object"})],
+    )
+    registry = CapabilityRegistry(
+        [
+            ModelCapability(
+                provider="deepseek",
+                model_pattern="deepseek-*",
+                protocol="chat_completions",
+                supports_tools=False,
+            )
+        ]
+    )
+
+    with pytest.raises(ModelRuntimeError, match="capability contract") as exc_info:
+        ModelGateway({"deepseek": adapter}, capability_registry=registry).complete(request)
+
+    assert calls == []
+    assert model_runtime_error_payload(exc_info.value)["error_summary"] == (
+        "classification=capability_error;retryable=false"
+    )
+
+
+def test_model_gateway_rejects_known_output_limit_before_adapter_call() -> None:
+    adapter = SimpleNamespace(complete=lambda request: pytest.fail("adapter must not be called"))
+    health = ProviderHealthRegistry(failure_threshold=1)
+    request = ModelRequest(
+        provider="deepseek",
+        model="deepseek-chat",
+        system_prompt="System",
+        messages=[],
+        max_tokens=8_001,
+    )
+
+    with pytest.raises(ModelRuntimeError, match="capability contract") as exc_info:
+        ModelGateway({"deepseek": adapter}, health_registry=health).complete(request)
+
+    assert exc_info.value.route_receipt[0]["outcome"] == "rejected"
+    assert exc_info.value.route_receipt[0]["reason"] == "capability_mismatch"
+    assert "provider_attempt" not in exc_info.value.route_receipt[0]
+    assert health.snapshot("deepseek").consecutive_failures == 0
+
+
+def test_model_gateway_falls_back_only_after_retryable_failure_and_records_receipt() -> None:
+    class RetryableFailureAdapter:
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            raise ModelRuntimeError(
+                "Primary provider failed.",
+                provider="primary",
+                model=request.model,
+                error_class="RateLimitError",
+                error_summary="classification=rate_limit_error;status_code=429;retryable=true",
+                elapsed_ms=12,
+            )
+
+    request = ModelRequest(
+        provider="primary",
+        model="primary-model",
+        system_prompt="System",
+        messages=[],
+        fallbacks=[{"provider": "mock", "model": "mock-model"}],
+        metadata={"allow_mock_fallback": True},
+    )
+
+    response = ModelGateway(
+        {"primary": RetryableFailureAdapter(), "mock": MockModelAdapter()}
+    ).complete(request)
+
+    assert response.raw_provider == "mock"
+    assert response.selected_provider == "mock"
+    assert response.selected_model == "mock-model"
+    assert [attempt["outcome"] for attempt in response.route_receipt] == ["failed", "succeeded"]
+    assert response.route_receipt[0]["error_summary"] == (
+        "classification=rate_limit_error;status_code=429;retryable=true"
+    )
+
+
+def test_model_gateway_uses_selected_fallback_identity_and_prices() -> None:
+    class RetryableFailureAdapter:
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            raise ModelRuntimeError(
+                "Timed out.",
+                provider=request.provider,
+                model=request.model,
+                error_class="TimeoutError",
+                error_summary="classification=timeout_error;retryable=true",
+            )
+
+    fallback_requests: list[ModelRequest] = []
+    fallback = SimpleNamespace(
+        complete=lambda request: fallback_requests.append(request) or ModelResponse(
+            text="fallback result",
+            usage={"input_tokens": 10, "output_tokens": 5},
+            raw_provider=request.provider,
+            adapter="test",
+            mocked=False,
+        )
+    )
+    request = ModelRequest(
+        provider="primary",
+        model="primary-model",
+        system_prompt="System",
+        messages=[],
+        input_usd_per_million=1.0,
+        output_usd_per_million=2.0,
+        fallbacks=[
+            {
+                "provider": "fallback",
+                "model": "fallback-model",
+                "input_usd_per_million": 10.0,
+                "output_usd_per_million": 20.0,
+            }
+        ],
+    )
+
+    response = ModelGateway(
+        {"primary": RetryableFailureAdapter(), "fallback": fallback}
+    ).complete(request)
+
+    assert response.selected_provider == "fallback"
+    assert response.selected_model == "fallback-model"
+    assert response.selected_input_usd_per_million == 10.0
+    assert response.selected_output_usd_per_million == 20.0
+    assert response.route_receipt[-1]["cost_usd"] == pytest.approx(0.0002)
+    assert fallback_requests[0].input_usd_per_million == 10.0
+    assert fallback_requests[0].output_usd_per_million == 20.0
+
+
+def test_model_gateway_skips_known_unready_provider_before_adapter_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    request = ModelRequest(
+        provider="openai",
+        model="gpt-5",
+        system_prompt="System",
+        messages=[],
+        fallbacks=[{"provider": "mock", "model": "mock-model"}],
+        metadata={"allow_mock_fallback": True},
+    )
+
+    response = ModelGateway(
+        {
+            "openai": OpenAICompatibleModelAdapter(provider="openai", api_key_env="OPENAI_API_KEY"),
+            "mock": MockModelAdapter(),
+        }
+    ).complete(request)
+
+    assert response.raw_provider == "mock"
+    assert [entry["reason"] for entry in response.route_receipt] == [
+        "provider_not_ready",
+        "selected",
+    ]
+
+
+def test_model_gateway_does_not_fallback_after_non_retryable_failure() -> None:
+    fallback_calls: list[ModelRequest] = []
+
+    class AuthenticationFailureAdapter:
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            raise ModelRuntimeError(
+                "Authentication failed.",
+                provider="primary",
+                model=request.model,
+                error_class="AuthenticationError",
+                error_summary=(
+                    "classification=authentication_or_permission_error;status_code=401;retryable=false"
+                ),
+            )
+
+    request = ModelRequest(
+        provider="primary",
+        model="primary-model",
+        system_prompt="System",
+        messages=[],
+        fallbacks=[{"provider": "fallback", "model": "fallback-model", "allow_real_calls": True}],
+    )
+    fallback = SimpleNamespace(
+        complete=lambda candidate_request: fallback_calls.append(candidate_request)
+        or ModelResponse(text="unexpected", raw_provider="fallback", adapter="test", mocked=False)
+    )
+
+    with pytest.raises(ModelRuntimeError, match="Authentication failed") as exc_info:
+        ModelGateway({"primary": AuthenticationFailureAdapter(), "fallback": fallback}).complete(request)
+
+    assert fallback_calls == []
+    assert exc_info.value.route_receipt[0]["reason"] == "non_retryable_error"
+
+
+def test_model_gateway_rejects_mock_fallback_without_explicit_opt_in() -> None:
+    class RetryableFailureAdapter:
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            raise ModelRuntimeError(
+                "Timed out.",
+                provider="primary",
+                model=request.model,
+                error_class="TimeoutError",
+                error_summary="classification=timeout_error;status_code=504;retryable=true",
+            )
+
+    request = ModelRequest(
+        provider="primary",
+        model="primary-model",
+        system_prompt="System",
+        messages=[],
+        fallbacks=[{"provider": "mock", "model": "mock-model"}],
+    )
+
+    with pytest.raises(ModelRuntimeError) as exc_info:
+        ModelGateway({"primary": RetryableFailureAdapter(), "mock": MockModelAdapter()}).complete(request)
+
+    assert exc_info.value.route_receipt[-1]["reason"] == "mock_fallback_disabled"
+
+
+def test_model_gateway_enforces_per_provider_concurrency_limit() -> None:
+    class ConcurrencyTrackingAdapter:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.lock = Lock()
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.05)
+                return ModelResponse(text="ok", raw_provider="limited", adapter="test")
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    adapter = ConcurrencyTrackingAdapter()
+    gateway = ModelGateway(
+        {"limited": adapter},
+        provider_concurrency_limits={"limited": 1},
+    )
+    request = ModelRequest(
+        provider="limited",
+        model="limited-model",
+        system_prompt="System",
+        messages=[ModelMessage(role="user", content="Hello")],
+        timeout_seconds=1,
+    )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        responses = list(executor.map(gateway.complete, [request, request, request]))
+
+    assert [response.text for response in responses] == ["ok", "ok", "ok"]
+    assert adapter.max_active == 1
+
+
+def test_model_gateway_deducts_provider_capacity_wait_from_request_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CapturingAdapter:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            return ModelResponse(text="ok", raw_provider="limited", adapter="test")
+
+    class DelayedGate:
+        def __init__(self) -> None:
+            self.acquire_timeout: float | None = None
+            self.released = False
+
+        def acquire(self, *, timeout: float) -> bool:
+            self.acquire_timeout = timeout
+            return True
+
+        def release(self) -> None:
+            self.released = True
+
+    times = iter([100.0, 102.0])
+    monkeypatch.setattr("app.core.model_runtime.perf_counter", lambda: next(times))
+    adapter = CapturingAdapter()
+    gate = DelayedGate()
+    gateway = ModelGateway({"limited": adapter})
+    gateway._provider_gates["limited"] = gate
+    request = ModelRequest(
+        provider="limited",
+        model="limited-model",
+        system_prompt="System",
+        messages=[],
+        timeout_seconds=10,
+    )
+
+    response = gateway.complete(request)
+
+    assert response.text == "ok"
+    assert gate.acquire_timeout == 10
+    assert gate.released is True
+    assert adapter.requests[0].timeout_seconds == 8
+
+
+@pytest.mark.parametrize("capacity_acquired", [False, True])
+def test_model_gateway_records_capacity_timeout_as_local_rejection_without_provider_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    capacity_acquired: bool,
+) -> None:
+    class CapturingAdapter:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            return ModelResponse(text="unexpected", raw_provider="openai", adapter="test")
+
+    class CapacityGate:
+        def __init__(self) -> None:
+            self.released = False
+
+        def acquire(self, *, timeout: float) -> bool:
+            return capacity_acquired
+
+        def release(self) -> None:
+            self.released = True
+
+    if capacity_acquired:
+        times = iter([0.0, 0.0, 0.0, 10.0, 10.0])
+        monkeypatch.setattr("app.core.model_runtime.perf_counter", lambda: next(times))
+    adapter = CapturingAdapter()
+    health = ProviderHealthRegistry(failure_threshold=1)
+    gateway = ModelGateway(
+        {"openai": adapter, "mock": MockModelAdapter()},
+        health_registry=health,
+    )
+    gate = CapacityGate()
+    gateway._provider_gates["openai"] = gate
+
+    request = ModelRequest(
+        provider="openai",
+        model="gpt-5",
+        system_prompt="System",
+        messages=[],
+        timeout_seconds=10,
+        fallbacks=[{"provider": "mock", "model": "mock-model"}],
+        metadata={"allow_mock_fallback": True},
+    )
+    if capacity_acquired:
+        with pytest.raises(ModelRuntimeError) as exc_info:
+            gateway.complete(request)
+        receipt = exc_info.value.route_receipt
+    else:
+        response = gateway.complete(request)
+        assert response.selected_provider == "mock"
+        receipt = response.route_receipt
+
+    assert adapter.requests == []
+    assert receipt[0]["outcome"] == "rejected"
+    assert receipt[0]["reason"] == "provider_capacity_timeout"
+    assert "provider_attempt" not in receipt[0]
+    assert receipt[1]["outcome"] == ("rejected" if capacity_acquired else "succeeded")
+    if capacity_acquired:
+        assert receipt[1]["reason"] == "route_timeout_budget_exhausted"
+    assert health.snapshot("openai").consecutive_failures == 0
+    assert gate.released is capacity_acquired
+
+
+@pytest.mark.parametrize("timeout_seconds", [0.0, float("nan"), float("inf")])
+def test_model_gateway_rejects_non_finite_or_non_positive_route_deadline_before_dispatch(
+    timeout_seconds: float,
+) -> None:
+    calls: list[ModelRequest] = []
+    adapter = SimpleNamespace(complete=lambda request: calls.append(request))
+
+    with pytest.raises(ModelRuntimeError, match="positive finite number"):
+        ModelGateway({"primary": adapter, "mock": MockModelAdapter()}).complete(
+            ModelRequest(
+                provider="primary",
+                model="primary-model",
+                system_prompt="System",
+                messages=[],
+                timeout_seconds=timeout_seconds,
+                fallbacks=[{"provider": "mock", "model": "mock-model"}],
+                metadata={"allow_mock_fallback": True},
+            )
+        )
+
+    assert calls == []
+
+
+def test_model_gateway_records_transport_serialization_failure_as_local_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    calls: list[dict[str, object]] = []
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: calls.append(kwargs))
+        )
+    )
+    health = ProviderHealthRegistry(failure_threshold=1)
+    gateway = ModelGateway(
+        {
+            "openai": OpenAICompatibleModelAdapter(
+                provider="openai",
+                api_key_env="OPENAI_API_KEY",
+                client=client,
+                endpoint="chat_completions",
+            )
+        },
+        health_registry=health,
+    )
+
+    with pytest.raises(ModelRuntimeError, match="local transport validation") as exc_info:
+        gateway.complete(
+            ModelRequest(
+                provider="openai",
+                model="gpt-5",
+                system_prompt="System",
+                messages=[ModelMessage(role="invalid-role", content="secret body")],
+            )
+        )
+
+    assert calls == []
+    assert exc_info.value.provider_attempts == []
+    assert exc_info.value.route_receipt[0]["outcome"] == "rejected"
+    assert exc_info.value.route_receipt[0]["reason"] == "invalid_request"
+    assert "provider_attempt" not in exc_info.value.route_receipt[0]
+    assert health.snapshot("openai").consecutive_failures == 0
 
 
 @pytest.mark.parametrize(
@@ -146,8 +587,28 @@ def test_model_gateway_validates_injected_adapter_responses(
         {"raw_provider": "EXTERNAL_EVIDENCE_BODY"},
         {"adapter": "EXTERNAL EVIDENCE BODY"},
         {"mocked": "EXTERNAL_EVIDENCE_BODY"},
+        {
+            "provider_attempts": [
+                {
+                    "provider_attempt": 1,
+                    "outcome": "failed",
+                    "reason": "retryable_error",
+                    "error_class": "TimeoutError",
+                    "error_summary": "classification=timeout_error;retryable=true",
+                    "usage_known": False,
+                }
+            ]
+        },
     ],
-    ids=["usage-value", "usage-key", "latency", "provider", "adapter", "mocked"],
+    ids=[
+        "usage-value",
+        "usage-key",
+        "latency",
+        "provider",
+        "adapter",
+        "mocked",
+        "provider-attempts",
+    ],
 )
 def test_model_gateway_rejects_untrusted_adapter_response_metadata_without_leaking(
     metadata: dict[str, object],
@@ -175,12 +636,23 @@ def test_model_gateway_rejects_untrusted_adapter_response_metadata_without_leaki
         ModelGateway(adapters={"injected": adapter}).complete(request)
 
     payload = model_runtime_error_payload(exc_info.value)
-    assert payload == {
+    assert {key: value for key, value in payload.items() if key != "route_receipt"} == {
         "provider": "injected",
         "model": "injected-model",
         "error_class": "InvalidModelResponse",
         "error_summary": "response_type=invalid",
     }
+    assert payload["route_receipt"] == [
+        {
+            "attempt": 1,
+            "provider": "injected",
+            "model": "injected-model",
+            "outcome": "failed",
+            "reason": "non_retryable_error",
+            "error_class": "InvalidModelResponse",
+            "error_summary": "response_type=invalid",
+        }
+    ]
     assert "EXTERNAL_EVIDENCE_BODY" not in str(exc_info.value)
     assert "EXTERNAL_EVIDENCE_BODY" not in str(payload)
 
@@ -205,15 +677,153 @@ def test_model_gateway_normalizes_valid_injected_adapter_response_metadata() -> 
 
     normalized = ModelGateway(adapters={"injected": adapter}).complete(request)
 
-    assert normalized == ModelResponse(
-        text="safe response",
-        usage={"input_tokens": 1, "output_tokens": 2},
-        latency_ms=3,
-        finish_reason="stop",
-        raw_provider="injected",
-        adapter="injected-adapter",
-        mocked=False,
+    assert normalized.text == "safe response"
+    assert normalized.usage == {"input_tokens": 1, "output_tokens": 2}
+    assert normalized.latency_ms == 3
+    assert normalized.finish_reason == "stop"
+    assert normalized.raw_provider == "injected"
+    assert normalized.adapter == "injected-adapter"
+    assert normalized.mocked is False
+    assert normalized.route_receipt == [
+        {
+            "attempt": 1,
+            "provider": "injected",
+            "model": "injected-model",
+            "outcome": "succeeded",
+            "reason": "selected",
+            "mocked": False,
+            "latency_ms": 3,
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }
+    ]
+
+
+def test_injected_real_provider_name_does_not_create_transport_attempt_evidence() -> None:
+    response = ModelGateway(
+        {
+            "openai": SimpleNamespace(
+                complete=lambda request: ModelResponse(
+                    text="safe response",
+                    usage={"input_tokens": 1, "output_tokens": 2},
+                    raw_provider="openai",
+                    adapter="injected-adapter",
+                    mocked=False,
+                )
+            )
+        }
+    ).complete(
+        ModelRequest(
+            provider="openai",
+            model="gpt-5",
+            system_prompt="System",
+            messages=[],
+        )
     )
+
+    assert "provider_attempt" not in response.route_receipt[0]
+    assert "usage_known" not in response.route_receipt[0]
+
+
+def test_model_runtime_error_payload_sanitizes_untrusted_error_and_receipt_metadata() -> None:
+    payload = model_runtime_error_payload(
+        ModelRuntimeError(
+            "Provider failed.",
+            provider="Bearer sk-secret",
+            model="secret model",
+            adapter="secret adapter",
+            error_class="Bearer sk-secret raw body",
+            route_receipt=[
+                {
+                    "attempt": 1,
+                    "provider": "Bearer sk-secret",
+                    "model": "secret model",
+                    "outcome": "failed",
+                    "reason": "raw secret reason",
+                    "error_class": "Bearer sk-secret raw body",
+                    "error_summary": "raw secret body",
+                    "unexpected": "raw secret body",
+                }
+            ],
+        )
+    )
+
+    assert "sk-secret" not in str(payload)
+    assert "raw secret" not in str(payload)
+    assert payload["error_class"] == "ProviderError"
+    assert payload["route_receipt"][0]["error_summary"] == (
+        "classification=unclassified_model_runtime_error"
+    )
+
+
+def test_model_runtime_error_payload_removes_secret_shaped_identifiers() -> None:
+    secret = "sk-1234567890abcdef"
+    payload = model_runtime_error_payload(
+        ModelRuntimeError(
+            "Provider failed.",
+            provider=secret,
+            model=secret,
+            adapter=secret,
+            error_class=secret,
+            route_receipt=[
+                {
+                    "attempt": 1,
+                    "provider": secret,
+                    "model": secret,
+                    "outcome": "failed",
+                    "reason": secret,
+                    "error_class": secret,
+                }
+            ],
+        )
+    )
+
+    assert secret not in str(payload)
+    assert payload["provider"] == "unknown_provider"
+    assert payload["error_class"] == "ProviderError"
+
+
+def test_only_exact_builtin_adapter_can_supply_provider_attempt_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    class DerivedOpenAIAdapter(OpenAICompatibleModelAdapter):
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            return ModelResponse(
+                text="untrusted",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                raw_provider="openai",
+                adapter="derived",
+                mocked=False,
+                provider_attempts=[
+                    {
+                        "provider_attempt": 1,
+                        "outcome": "failed",
+                        "reason": "retryable_error",
+                        "error_class": "TimeoutError",
+                        "error_summary": "classification=timeout_error;retryable=true",
+                        "usage_known": False,
+                    }
+                ],
+            )
+
+    adapter = DerivedOpenAIAdapter(
+        provider="openai",
+        api_key_env="OPENAI_API_KEY",
+        client=SimpleNamespace(),
+    )
+
+    with pytest.raises(ModelRuntimeError, match="invalid response metadata") as exc_info:
+        ModelGateway({"openai": adapter}).complete(
+            ModelRequest(
+                provider="openai",
+                model="gpt-5",
+                system_prompt="System",
+                messages=[],
+            )
+        )
+
+    assert all("provider_attempt" not in item for item in exc_info.value.route_receipt)
 
 
 def test_model_request_from_agent_includes_curated_context_envelope() -> None:
@@ -280,8 +890,10 @@ def test_default_model_gateway_knows_real_provider_skeletons_but_keeps_them_disa
         messages=[ModelMessage(role="user", content="Hello")],
     )
 
-    with pytest.raises(ModelRuntimeError, match="Real provider calls are not implemented"):
+    with pytest.raises(ModelRuntimeError, match="No usable model route") as exc_info:
         ModelGateway(adapters={"openai": ProviderStubAdapter("openai")}).complete(request)
+
+    assert exc_info.value.route_receipt[0]["reason"] == "provider_not_ready"
 
 
 def test_openai_compatible_adapter_maps_request_and_response_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -303,18 +915,18 @@ def test_openai_compatible_adapter_maps_request_and_response_without_network(mon
         client=fake_client,
     ).complete(request)
 
-    assert fake_client.responses.calls == [
-        {
-            "model": "deepseek-v4-pro",
-            "input": [
-                {"role": "system", "content": "System"},
-                {"role": "user", "content": "Hello"},
-            ],
-            "temperature": 0.1,
-            "max_output_tokens": 128,
-            "timeout": 180.0,
-        }
-    ]
+    assert len(fake_client.responses.calls) == 1
+    call = fake_client.responses.calls[0]
+    assert {key: value for key, value in call.items() if key != "timeout"} == {
+        "model": "deepseek-v4-pro",
+        "input": [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "Hello"},
+        ],
+        "temperature": 0.1,
+        "max_output_tokens": 128,
+    }
+    assert call["timeout"] == pytest.approx(180.0, abs=0.01)
     assert response.text == "adapter response"
     assert response.raw_provider == "deepseek"
     assert response.adapter == "openai_compatible"
@@ -527,7 +1139,7 @@ def test_openai_compatible_adapter_rejects_invalid_timeout(
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("TEAM_AGENT_MODEL_TIMEOUT_SECONDS", "0")
 
-    with pytest.raises(ModelRuntimeError, match="positive number"):
+    with pytest.raises(ModelRuntimeError, match="positive finite number"):
         OpenAICompatibleModelAdapter(
             provider="openai",
             api_key_env="OPENAI_API_KEY",
@@ -556,18 +1168,18 @@ def test_openai_compatible_adapter_can_use_chat_completions_without_network(
         endpoint="chat_completions",
     ).complete(request)
 
-    assert fake_client.chat.completions.calls == [
-        {
-            "model": "deepseek-v4-pro",
-            "messages": [
-                {"role": "system", "content": "System"},
-                {"role": "user", "content": "Hello"},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 128,
-            "timeout": 180.0,
-        }
-    ]
+    assert len(fake_client.chat.completions.calls) == 1
+    call = fake_client.chat.completions.calls[0]
+    assert {key: value for key, value in call.items() if key != "timeout"} == {
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "Hello"},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 128,
+    }
+    assert call["timeout"] == pytest.approx(180.0, abs=0.01)
     assert response.text == "chat adapter response"
     assert response.raw_provider == "deepseek"
     assert response.adapter == "openai_compatible_chat"
@@ -667,8 +1279,10 @@ def test_litellm_gpt55_chat_request_maps_xhigh_reasoning_effort_to_high(
     ).complete(request)
 
     assert fake_client.chat.completions.calls[0]["reasoning_effort"] == "high"
-    assert fake_client.chat.completions.calls[0]["timeout"] == 180.0
-    assert fake_client.chat.completions.calls[0]["extra_headers"] == {"x-litellm-timeout": "180"}
+    assert fake_client.chat.completions.calls[0]["timeout"] == pytest.approx(180.0, abs=0.01)
+    assert float(fake_client.chat.completions.calls[0]["extra_headers"]["x-litellm-timeout"]) == (
+        pytest.approx(180.0, abs=0.01)
+    )
     assert reasoning_effort_trace_payload(request) == {
         "reasoning_effort": "xhigh",
         "configured_reasoning_effort": "xhigh",
@@ -727,7 +1341,9 @@ def test_litellm_gpt55_chat_request_can_passthrough_xhigh_reasoning_effort(
     ).complete(request)
 
     assert fake_client.chat.completions.calls[0]["reasoning_effort"] == "xhigh"
-    assert fake_client.chat.completions.calls[0]["extra_headers"] == {"x-litellm-timeout": "12.5"}
+    assert float(fake_client.chat.completions.calls[0]["extra_headers"]["x-litellm-timeout"]) == (
+        pytest.approx(12.5, abs=0.01)
+    )
 
 
 def test_litellm_non_gpt55_chat_request_does_not_send_reasoning_effort(
@@ -751,7 +1367,9 @@ def test_litellm_non_gpt55_chat_request_does_not_send_reasoning_effort(
     ).complete(request)
 
     assert "reasoning_effort" not in fake_client.chat.completions.calls[0]
-    assert fake_client.chat.completions.calls[0]["extra_headers"] == {"x-litellm-timeout": "180"}
+    assert float(fake_client.chat.completions.calls[0]["extra_headers"]["x-litellm-timeout"]) == (
+        pytest.approx(180.0, abs=0.01)
+    )
     assert reasoning_effort_trace_payload(request) == {
         "reasoning_effort": "xhigh",
         "configured_reasoning_effort": "xhigh",
@@ -883,6 +1501,402 @@ def test_openai_compatible_adapter_retries_transient_connection_errors(
 
     assert response.text == "chat adapter response"
     assert len(fake_client.chat.completions.calls) == 3
+    assert response.provider_attempts == [
+        {
+            "provider_attempt": 1,
+            "outcome": "failed",
+            "reason": "retryable_error",
+            "error_class": "RuntimeError",
+            "error_summary": "classification=transient_provider_error;retryable=true",
+            "usage_known": False,
+        },
+        {
+            "provider_attempt": 2,
+            "outcome": "failed",
+            "reason": "retryable_error",
+            "error_class": "RuntimeError",
+            "error_summary": "classification=transient_provider_error;retryable=true",
+            "usage_known": False,
+        },
+    ]
+    assert "sk-secret" not in str(response.provider_attempts)
+
+
+def test_openai_compatible_adapter_retries_status_code_429_without_error_text_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RateLimitResponseError(RuntimeError):
+        status_code = 429
+
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    fake_client = FlakyChatCompatibleClient(failures=[RateLimitResponseError("request rejected")])
+
+    response = OpenAICompatibleModelAdapter(
+        provider="litellm_proxy",
+        api_key_env="LITELLM_API_KEY",
+        client=fake_client,
+        endpoint="chat_completions",
+        max_attempts=2,
+        retry_delay_seconds=0,
+    ).complete(
+        ModelRequest(
+            provider="litellm_proxy",
+            model="gpt-planner",
+            system_prompt="System",
+            messages=[],
+        )
+    )
+
+    assert response.text == "chat adapter response"
+    assert response.provider_attempts[0]["reason"] == "retryable_error"
+    assert response.provider_attempts[0]["error_summary"] == (
+        "classification=rate_limit_error;status_code=429;retryable=true"
+    )
+
+
+def test_provider_attempt_recorder_runs_before_every_physical_http_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    persisted: list[dict[str, object]] = []
+    fake_client = FlakyChatCompatibleClient(
+        failures=[RuntimeError("Connection error"), RuntimeError("HTTP 500 InternalServerError")]
+    )
+    request = ModelRequest(
+        provider="openai",
+        model="gpt-5",
+        system_prompt="System",
+        messages=[],
+        provider_attempt_recorder=lambda evidence: persisted.append(dict(evidence)),
+    )
+
+    response = OpenAICompatibleModelAdapter(
+        provider="openai",
+        api_key_env="OPENAI_API_KEY",
+        client=fake_client,
+        endpoint="chat_completions",
+        max_attempts=3,
+        retry_delay_seconds=0,
+    ).complete(request)
+
+    assert response.text == "chat adapter response"
+    assert [item["provider_attempt"] for item in persisted] == [1, 2, 3]
+    assert all(item["outcome"] == "dispatch_started" for item in persisted)
+    assert all(item["usage_known"] is False for item in persisted)
+    assert len(fake_client.chat.completions.calls) == len(persisted)
+
+
+def test_provider_attempt_recorder_failure_prevents_http_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    calls: list[dict[str, object]] = []
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: calls.append(kwargs))
+        )
+    )
+
+    with pytest.raises(ModelRuntimeError, match="could not be persisted") as exc_info:
+        OpenAICompatibleModelAdapter(
+            provider="openai",
+            api_key_env="OPENAI_API_KEY",
+            client=client,
+            endpoint="chat_completions",
+            retry_delay_seconds=0,
+        ).complete(
+            ModelRequest(
+                provider="openai",
+                model="gpt-5",
+                system_prompt="System",
+                messages=[],
+                provider_attempt_recorder=lambda evidence: (_ for _ in ()).throw(
+                    RuntimeError("durable trace unavailable")
+                ),
+            )
+        )
+
+    assert calls == []
+    assert exc_info.value.provider_attempts == []
+
+
+def test_provider_attempt_record_survives_hard_crash_window_before_http_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    persisted: list[dict[str, object]] = []
+
+    def crash_after_dispatch(**kwargs: object) -> object:
+        assert persisted[0]["provider_attempt"] == 1
+        raise SystemExit("simulated hard crash")
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=crash_after_dispatch))
+    )
+
+    with pytest.raises(SystemExit, match="simulated hard crash"):
+        OpenAICompatibleModelAdapter(
+            provider="openai",
+            api_key_env="OPENAI_API_KEY",
+            client=client,
+            endpoint="chat_completions",
+        ).complete(
+            ModelRequest(
+                provider="openai",
+                model="gpt-5",
+                system_prompt="System",
+                messages=[],
+                provider_attempt_recorder=lambda evidence: persisted.append(dict(evidence)),
+            )
+        )
+
+    assert persisted == [
+        {
+            "provider_attempt": 1,
+            "provider": "openai",
+            "model": "gpt-5",
+            "outcome": "dispatch_started",
+            "usage_known": False,
+        }
+    ]
+
+
+def test_partial_provider_usage_does_not_synthesize_missing_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    provider_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="done", refusal=None, function_call=None, tool_calls=[]),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=4),
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: provider_response)
+        )
+    )
+    response = ModelGateway(
+        {
+            "openai": OpenAICompatibleModelAdapter(
+                provider="openai",
+                api_key_env="OPENAI_API_KEY",
+                client=client,
+                endpoint="chat_completions",
+            )
+        }
+    ).complete(
+        ModelRequest(
+            provider="openai",
+            model="gpt-5",
+            system_prompt="System",
+            messages=[],
+        )
+    )
+
+    assert response.usage == {"input_tokens": 4}
+    assert response.route_receipt[-1]["usage_known"] is False
+
+
+def test_non_serializable_tool_call_arguments_are_local_rejection_not_provider_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    calls: list[dict[str, object]] = []
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: calls.append(kwargs))
+        )
+    )
+    gateway = ModelGateway(
+        {
+            "openai": OpenAICompatibleModelAdapter(
+                provider="openai",
+                api_key_env="OPENAI_API_KEY",
+                client=client,
+                endpoint="chat_completions",
+            )
+        }
+    )
+
+    with pytest.raises(ModelRuntimeError, match="local transport validation") as exc_info:
+        gateway.complete(
+            ModelRequest(
+                provider="openai",
+                model="gpt-5",
+                system_prompt="System",
+                messages=[
+                    ModelMessage(
+                        role="assistant",
+                        tool_calls=[
+                            ModelToolCall(
+                                id="call-1",
+                                name="read_file",
+                                arguments={"path": object()},
+                            )
+                        ],
+                    )
+                ],
+            )
+        )
+
+    assert calls == []
+    assert exc_info.value.provider_attempts == []
+    assert exc_info.value.route_receipt[0]["outcome"] == "rejected"
+    assert "provider_attempt" not in exc_info.value.route_receipt[0]
+
+
+def test_model_gateway_expands_internal_provider_retries_before_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_client = FlakyChatCompatibleClient(
+        failures=[RuntimeError("Connection error Authorization: Bearer sk-secret")]
+    )
+    gateway = ModelGateway(
+        adapters={
+            "openai": OpenAICompatibleModelAdapter(
+                provider="openai",
+                api_key_env="OPENAI_API_KEY",
+                client=fake_client,
+                endpoint="chat_completions",
+                max_attempts=2,
+                retry_delay_seconds=0,
+            )
+        }
+    )
+
+    response = gateway.complete(
+        ModelRequest(
+            provider="openai",
+            model="gpt-5",
+            system_prompt="System",
+            messages=[ModelMessage(role="user", content="Hello")],
+        )
+    )
+
+    assert [entry["outcome"] for entry in response.route_receipt] == ["failed", "succeeded"]
+    assert [entry["provider_attempt"] for entry in response.route_receipt] == [1, 2]
+    assert response.route_receipt[0]["usage_known"] is False
+    assert response.route_receipt[1]["usage"] == {
+        "input_tokens": 4,
+        "output_tokens": 3,
+        "total_tokens": 7,
+    }
+    assert "sk-secret" not in str(response.route_receipt)
+
+
+def test_model_gateway_counts_each_internal_failure_before_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    fake_client = FlakyChatCompatibleClient(
+        failures=[RuntimeError("Connection error"), RuntimeError("HTTP 500 InternalServerError")]
+    )
+    gateway = ModelGateway(
+        adapters={
+            "openai": OpenAICompatibleModelAdapter(
+                provider="openai",
+                api_key_env="OPENAI_API_KEY",
+                client=fake_client,
+                endpoint="chat_completions",
+                max_attempts=2,
+                retry_delay_seconds=0,
+            ),
+            "mock": MockModelAdapter(),
+        }
+    )
+
+    response = gateway.complete(
+        ModelRequest(
+            provider="openai",
+            model="gpt-5",
+            system_prompt="System",
+            messages=[],
+            fallbacks=[{"provider": "mock", "model": "mock-model"}],
+            metadata={"allow_mock_fallback": True},
+        )
+    )
+
+    assert response.selected_provider == "mock"
+    assert [entry["outcome"] for entry in response.route_receipt] == [
+        "failed",
+        "failed",
+        "succeeded",
+    ]
+    assert [entry.get("provider_attempt") for entry in response.route_receipt] == [1, 2, None]
+    assert all(entry.get("usage_known") is False for entry in response.route_receipt[:2])
+
+
+def test_openai_compatible_retries_use_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    times = iter([0.0, 3.0, 6.0, 7.0, 8.0])
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.core.model_runtime.perf_counter", lambda: next(times))
+    monkeypatch.setattr("app.core.model_runtime.sleep", sleeps.append)
+    fake_client = FlakyChatCompatibleClient(failures=[RuntimeError("Connection error")])
+    request = ModelRequest(
+        provider="litellm_proxy",
+        model="gpt-planner",
+        system_prompt="System",
+        messages=[],
+        timeout_seconds=10,
+    )
+
+    response = OpenAICompatibleModelAdapter(
+        provider="litellm_proxy",
+        api_key_env="LITELLM_API_KEY",
+        client=fake_client,
+        endpoint="chat_completions",
+        max_attempts=2,
+        retry_delay_seconds=5,
+    ).complete(request)
+
+    assert response.text == "chat adapter response"
+    assert sleeps == [4]
+    calls = fake_client.chat.completions.calls
+    assert [call["timeout"] for call in calls] == [7, 3]
+    assert [call["extra_headers"]["x-litellm-timeout"] for call in calls] == ["7", "3"]
+
+
+def test_openai_compatible_backoff_does_not_start_retry_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    times = iter([0.0, 9.8, 10.0, 10.1])
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.core.model_runtime.perf_counter", lambda: next(times))
+    monkeypatch.setattr("app.core.model_runtime.sleep", sleeps.append)
+    fake_client = FlakyChatCompatibleClient(failures=[RuntimeError("Connection error")])
+    request = ModelRequest(
+        provider="litellm_proxy",
+        model="gpt-planner",
+        system_prompt="System",
+        messages=[],
+        timeout_seconds=10,
+    )
+
+    with pytest.raises(ModelRuntimeError):
+        OpenAICompatibleModelAdapter(
+            provider="litellm_proxy",
+            api_key_env="LITELLM_API_KEY",
+            client=fake_client,
+            endpoint="chat_completions",
+            max_attempts=2,
+            retry_delay_seconds=5,
+        ).complete(request)
+
+    assert len(fake_client.chat.completions.calls) == 1
+    assert sleeps == []
 
 
 def test_openai_compatible_adapter_does_not_retry_non_transient_errors(
@@ -1147,6 +2161,124 @@ def test_model_request_from_agent_defaults_real_provider_reasoning_effort_to_xhi
     assert transport.configured_reasoning_effort == "xhigh"
     assert transport.reasoning_effort_sent is False
     assert transport.reasoning_effort_ignored is True
+
+
+def test_chat_adapter_sends_typed_tools_and_parses_declared_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    calls: list[dict[str, object]] = []
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    refusal=None,
+                    function_call=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call-1",
+                            function=SimpleNamespace(name="read_file", arguments='{"path":"README.md"}'),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=FakeChatUsage(),
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: calls.append(kwargs) or response,
+            )
+        )
+    )
+    request = ModelRequest(
+        provider="litellm_proxy",
+        model="gpt5.5",
+        system_prompt="System",
+        messages=[ModelMessage(role="user", content="Inspect the repository.")],
+        tools=[
+            ModelToolDefinition(
+                name="read_file",
+                description="Read one file.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": False,
+                },
+            )
+        ],
+    )
+
+    result = OpenAICompatibleModelAdapter(
+        provider="litellm_proxy",
+        api_key_env="LITELLM_API_KEY",
+        client=client,
+        endpoint="chat_completions",
+    ).complete(request)
+
+    assert result.text == ""
+    assert result.finish_reason == "tool_calls"
+    assert result.tool_calls == [ModelToolCall(id="call-1", name="read_file", arguments={"path": "README.md"})]
+    assert calls[0]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read one file.",
+                "parameters": request.tools[0].input_schema,
+            },
+        }
+    ]
+
+
+def test_responses_adapter_serializes_tool_observation_for_next_reasoning_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    calls: list[dict[str, object]] = []
+    response = SimpleNamespace(output_text="done", output=[], status="completed", usage=FakeUsage())
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: calls.append(kwargs) or response)
+    )
+    tool_call = ModelToolCall(id="call-1", name="read_file", arguments={"path": "README.md"})
+    request = ModelRequest(
+        provider="openai",
+        model="gpt-5",
+        system_prompt="System",
+        messages=[
+            ModelMessage(role="assistant", tool_calls=[tool_call]),
+            ModelMessage(role="tool", tool_call_id="call-1", content='{"content":"hello"}'),
+        ],
+        tools=[
+            ModelToolDefinition(
+                name="read_file",
+                description="Read one file.",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            )
+        ],
+    )
+
+    result = OpenAICompatibleModelAdapter(
+        provider="openai",
+        api_key_env="OPENAI_API_KEY",
+        client=client,
+    ).complete(request)
+
+    assert result.text == "done"
+    assert calls[0]["input"][1:] == [
+        {"role": "assistant", "content": ""},
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "read_file",
+            "arguments": '{"path":"README.md"}',
+        },
+        {"type": "function_call_output", "call_id": "call-1", "output": '{"content":"hello"}'},
+    ]
 
 
 class FakeOpenAICompatibleClient:

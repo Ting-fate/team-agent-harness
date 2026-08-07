@@ -7,6 +7,27 @@ routing through an explicitly configured LiteLLM proxy.
 The runnable project lives in [`team_agent_harness/backend`](team_agent_harness/backend/README.md).
 Shared design records live in [`docs/superpowers/specs`](docs/superpowers/specs/).
 
+## Current Capabilities
+
+- Persists tasks, immutable execution plans, run checkpoints, handoffs,
+  artifacts, eval results, trace events, queue state, and locks in a local
+  FastAPI + SQLite service.
+- Supports opt-in bounded Agent Loops with typed tool calls, explicit
+  side-effect approval, provider/model route receipts, fallback control, and
+  time, token, tool-call, repetition, and conservative estimated-cost budgets.
+- Validates dynamic plans against the selected Workflow Pack, executes only
+  ownership-safe DAG branches in parallel, and evaluates real artifact hashes,
+  acceptance criteria, blocker checks, and final-artifact lineage.
+- Provides reproducible Single-Agent versus Multi-Agent benchmark reporting
+  without treating missing usage or possibly billed interrupted calls as free.
+- Keeps mock execution as the default. Real model, web, browser, host-test, and
+  source-write actions remain separate explicit opt-ins.
+
+The supported runtime is intentionally local and single-process. It does not
+start external Codex/ACP child processes, provide distributed workers, or
+guarantee exactly-once execution for a model request interrupted by a hard
+process crash.
+
 ## Windows Download And Start
 
 No server deployment is required. After you have access to this repository:

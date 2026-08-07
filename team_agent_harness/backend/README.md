@@ -4,7 +4,7 @@ Local single-process backend for the team-oriented multi-agent harness.
 
 ## Current Scope
 
-This directory includes the original MVP phases plus the durable local worker and bounded-context increment completed on 2026-07-10:
+This directory includes the original MVP phases, the durable local worker and bounded-context increment completed on 2026-07-10, and the frozen-plan/agent-loop increment completed on 2026-08-04:
 
 - FastAPI application skeleton with worker-aware `GET /health`; it returns HTTP 503 when the background worker thread is not running.
 - Core Pydantic domain models and enums, including local runtime session, runtime job, run queue item, and run lock records.
@@ -15,11 +15,14 @@ This directory includes the original MVP phases plus the durable local worker an
 - Trace logging and local file-backed artifact storage.
 - Tool gateway with permission checks, mocked tools, optional Tavily-backed web search/fetch tools, and optional local browser bridge search/fetch tools for Research.
 - Model runtime contract with a deterministic mocked adapter and `model_request` / `model_response` trace observability.
+- Typed model tool definitions and tool-call observations for both Chat Completions and Responses-compatible providers. Unknown tools, malformed arguments, duplicate call ids, undeclared tool calls, and oversized arguments fail closed.
 - Real-model responses fail closed: only `stop`/`completed` responses with non-empty string text are accepted; truncated, filtered, tool-call-only, failed, incomplete, missing, or non-text responses raise a sanitized runtime error without persisting the raw provider response.
 - Mocked multi-model profile assignment inside each workflow pack, so one run can show two or more model profiles cooperating through agent-level `model_config`.
 - Provider catalog and explicit opt-in OpenAI-compatible adapters for OpenAI, DeepSeek, and an optional LiteLLM Proxy gateway; mock remains the default, while Anthropic and local providers are still skeleton-only.
 - Server-side model routing config that can assign selected agents to `mock`, `openai`, `deepseek`, or `litellm_proxy` without storing API keys in the app.
 - Single-process workflow runner with deterministic mocked agent execution, dependency-aware ready-set step scheduling, dependency-edge handoffs for DAG packs, explicit dependency lineage on completed DAG attempts, bounded context envelope construction, workflow-level intake/context/skill-route trace events, scoped structural/executor/pack evaluation, named step eval and artifact gate enforcement, ready-batch/ownership conflict checks, conservative opt-in parallel executor dispatch for safe DAG batches, failure trace recording, run/agent-run status updates, local runtime session/job metadata recording for `session` and `acp` steps, and local approval gates.
+- Versioned immutable execution plans that freeze the effective Agent prompt, model route, tools, runtime limits, and Skill ids for an existing Pack or accept a validated Planner/operator DAG. Planner/operator plans may reuse existing roles and permission subsets only, may create `runtime=model` steps only, and require deterministic acceptance criteria for every step.
+- Opt-in bounded Agent Loops with model/tool iteration, step/tool/token/time/conservative-estimated-cost/repetition budgets, untrusted-observation labeling, side-effect approval, and action/observation trace. Existing Pack steps retain one-call behavior unless `agent_loop.enabled=true`.
 - Durable local `RunWorker` plus run coordinator. UI and operator CLI submissions return after persistence, execute outside the initiating HTTP request, maintain a per-run lock heartbeat, and recover interrupted runs from completed step checkpoints on service restart.
 - Mocked Code R&D workflow pack with Clarifier, Architect, Coder, Tester, Reviewer, and Finalizer steps.
 - Mocked Institutional Code R&D workflow pack with GPT as the trusted main thread, DeepSeek V4 Pro long-context reading/review roles, GPT implementation/test executor branches that require local approval before their mocked/model step execution proceeds, DeepSeek final risk review, and GPT final approval.
@@ -27,6 +30,8 @@ This directory includes the original MVP phases plus the durable local worker an
 - FastAPI endpoints for creating/listing tasks, starting workflows synchronously or in the local background worker, reading run metadata, trace events, artifacts, workflow pack catalogs, single workflow pack details, model provider skeletons, tool provider status, local Skill Library metadata, skill bindings, and pack agent catalogs; default routes remain mock unless server-side routing explicitly enables real providers for selected agents. `GET /tasks` and `GET /runs` are bounded to 500 newest records by default and accept validated `limit`/`offset` query parameters up to 1000 records.
 - Conservative Skill Auto-Router that can automatically select relevant read-only local skills for agents from explicit workflow, role, tool-permission, document-file task signals, and high-confidence domain task signals such as security, performance, database, testing, architecture, UI/web, and AI/model work while preserving manual bindings as an override/extension path.
 - FastAPI endpoints for reading full run observability data: aggregated run detail, agent runs, handoffs, eval results, trace events, artifacts, runtime sessions, runtime jobs, and safe queue/lock summaries.
+- FastAPI execution-plan validation/generation and run-quality endpoints. Quality reports verify frozen-plan artifacts, every declared step acceptance result, blocker evals, final content, and artifact hashes instead of treating artifact presence alone as success.
+- Reproducible paired-replicate benchmark evaluation for Single-Agent, current Multi-Agent, role ablations, and model combinations, including quality, token usage, latency, estimated cost, manual rework, contradictions, and indispensable contributions.
 - FastAPI endpoints for local runtime job approval actions: approve, reject, and cancel. These mutate local job/session/run state only; they do not launch external ACP processes.
 - Safe Codex/operator CLI for creating tasks, starting runs, polling run state, reading run details, listing approval-required runtime jobs, and inspecting provider/pack catalogs without exposing approval, writeback, or arbitrary shell commands.
 - Same-origin Chinese thin UI for creating tasks, filling Code R&D / Institutional Code R&D / Research examples, running workflows, confirming enabled real-provider and real web-search routes before execution, inspecting selected pack details including step phase, dependencies, Main/Subagent coordination role, runtime, session policy, return contract, agent model assignment, provider/tool status, local Skill Library bindings, and reading execution chains, local session/job/approval/queue/lock status, eval results, trace events, failure summaries, artifacts, and artifact content through the aggregated run detail contract.
@@ -34,7 +39,7 @@ This directory includes the original MVP phases plus the durable local worker an
 
 The default multi-model assignment is still mocked: current workflow packs use `provider="mock"` unless an agent is explicitly reconfigured through server-side routing. OpenAI, DeepSeek, and LiteLLM Proxy adapters can make real calls only when their provider key is set, `TEAM_AGENT_ALLOW_REAL_MODEL_CALLS=1` is set, and an agent explicitly opts into that provider. Tavily web search/fetch can make real network calls only when `TEAM_AGENT_ALLOW_REAL_WEB_SEARCH=1`, `TEAM_AGENT_WEB_SEARCH_PROVIDER=tavily`, and `TAVILY_API_KEY` are set. Browser search/fetch can make real browser calls only when `TEAM_AGENT_ALLOW_BROWSER_ACCESS=1`, `TEAM_AGENT_BROWSER_PROVIDER=edge|chrome|browser_cdp`, and a compatible local CDP proxy is available. API keys are read from server-side environment variables only; they are not entered in the browser task UI, obvious secret-like task content is rejected before SQLite storage, and keys are not written to trace/artifacts. The separate local desktop launcher can save keys to `.env.local`, which is ignored by Git. Anthropic and local model providers are still skeleton entries.
 
-The runner can dispatch safe explicit-DAG batches in parallel only when the executor explicitly opts in and every ready step has non-conflicting ownership. The in-process `RunWorker` is a durable local execution mechanism, not a distributed queue or external engineering executor. Built-in runtime jobs still do not launch external ACP processes or maintain live background child sessions. Code R&D does not receive general web search by default; only Research uses the web tools.
+The runner can dispatch safe explicit-DAG batches in parallel only when the executor explicitly opts in and every ready step has non-conflicting ownership. Parallel work is submitted up to the frozen plan's `max_parallel_steps`; after a branch failure, queued branches are not started, running calls are allowed to settle, and commit/error handling stays in deterministic plan order. `ModelGateway` separately limits concurrent calls per provider through `TEAM_AGENT_PROVIDER_MAX_CONCURRENCY` (default `4`). The in-process `RunWorker` is a durable local execution mechanism, not a distributed queue or external engineering executor. Built-in runtime jobs still do not launch external ACP processes or maintain live background child sessions. Code R&D does not receive general web search by default; only Research uses the web tools.
 
 ## Durable Background Runs And Context Budgets
 
@@ -67,6 +72,37 @@ Each `WorkflowStep` has a typed `context_policy`:
 - `max_upstream_handoffs`: maximum structured upstream handoffs retained; schema validation requires it to be at least the number of declared dependencies.
 
 Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step at 100K excerpt characters, 300K encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are streamed through a full hash verification while retaining only the bounded excerpt; tampered artifacts and artifacts or handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. The active local `research-planner` route uses `max_tokens=1000`; every `deepseek-v4-pro` route uses at least `max_tokens=4096` because a real Research reader still reached `finish_reason=length` at 2048 tokens. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
+
+## Multimodal Input Contract
+
+Tasks may opt into bounded external content with `inputs.allow_external_model_inputs=true` and a `content_blocks` list. A block is either `{ "type": "text", "text": "..." }` or a validated `{ "type": "image_ref" | "file_ref", "path": "inputs/...", "mime_type": "...", "sha256": "...", "size_bytes": n }` reference. Paths are relative to the configured `inputs/` directory; observed links, junctions, reparse points, alternate data streams, device syntax, hard links, and sensitive names/content are rejected. `file_ref` is intentionally converted to bounded, marked-untrusted UTF-8 text; serializers never emit a bare `input_file` payload. These host-path checks are defense in depth, not a race-free Windows filesystem sandbox: do not let an untrusted process mutate the input tree concurrently.
+
+Run creation verifies every reference and stages the exact bytes under the run's artifact root. The persisted `Run.content_block_snapshot_files` map is used for retries and restart recovery, so a later source-file edit, deletion, or configuration drift cannot silently change bytes sent to a model. If the frozen snapshot contains any image/file reference, every execution requires the corresponding staged blob; an empty or partial staged-file map fails closed and never reopens the mutable source path. Staged blobs are hash-checked on every read and are not ordinary `Artifact` records or a replacement for artifact retention policy.
+
+Image blocks require a vision-capable route. The Gateway derives the `vision` requirement from actual message blocks, not only caller metadata; non-vision, unconfigured, unhealthy, unready, unconfirmed, or unapproved routes are skipped before adapter execution. A capability override cannot make the mock provider vision-capable. Direct image delivery includes an explicit untrusted-external-data instruction, and `test_changes` receives the same validated multimodal context as other model-backed steps. An optional `vision_preprocess` sidecar must pass the same readiness and approval checks before egress, use a 2,048-token output cap, fit the final envelope plus text-block budgets, and have durable artifact storage plus an AgentRun attempt before any call. The artifact filename includes the aggregate image digest, full attempt digest, and full content hash. Identical retries reuse one artifact; a matching file orphaned between filesystem and SQLite persistence is safely adopted, while a repeated external call returning different valid text creates a separate artifact. Mixed image/file input preserves file context; sidecar provenance names only images actually sent, and downstream artifacts retain original image/file refs plus the sidecar artifact id.
+
+The runtime validator, not generated OpenAPI, is currently authoritative for the discriminated `content_blocks` shapes and the separate 4 MiB `file_ref` limit. Image validation bounds encoded/raw bytes and verifies allowlisted magic, but does not decode pixel dimensions or animation frames and does not predict every provider-specific context-window rule; a provider may still reject a valid bounded payload. Strong containment for concurrently hostile local files or decompression/resource attacks requires a separate trusted staging or sandbox boundary.
+
+Every run-bound real-model request carries the persisted `real_model_access_confirmed` value. Primary and fallback real routes are rejected by the Gateway when that value is absent; route receipts record the rejection. This remains true if credentials or provider availability change after the run was created. Real route confirmation is also required when generating a dynamic execution plan with a real fallback.
+
+## Frozen Plans, Agent Loops, And Quality
+
+`POST /runs` always stores an `execution-plan-v1` snapshot and its canonical SHA-256 hash. Before the snapshot is frozen, task-time Skill routing is applied to every participating Agent. The stored Agent snapshots include the effective system prompt, model settings, tool permissions, runtime limits, and Skill ids; restart recovery rebuilds Agents from those snapshots rather than the current Pack definitions. A persisted plan without Agent snapshots fails recovery instead of falling back to current Pack agents. Recovery validates permissions, runtime limits, and dataflow against the frozen plan and Agent snapshots; later changes to the current Pack's dynamic-plan switch, blocker evals, role counts, or parallelism do not reinterpret an in-flight run. Run-facing APIs remove `agent_snapshots` and set `execution_plan_redacted=true`, so injected Skill bodies and role prompts are not exposed through run responses.
+
+With no supplied plan, the server freezes the selected Pack. An operator can first call `POST /execution-plans/validate`, or request a Planner result through `POST /execution-plans/generate`. These endpoints return the redacted plan, `public_plan_hash`, `run_execution_plan_hash=null`, and `immutable_after_run_creation=true`; only `POST /runs` freezes task-specific Skill snapshots and returns the actual `execution_plan_hash`. Real-model generation requires `confirm_real_models=true`; model output must be one plain JSON object without Markdown fences and is still validated against the Pack's roles and tool permissions. Planner schemas omit trusted Agent snapshots; the Harness adds them only after validation. Dynamic plans cannot exceed Pack parallelism, Agent Loop limits, or the static Pack's use count for any role. Blocker Pack evals whose required artifacts are produced by the dynamic plan are restored by the Harness, and a same-name weakened gate is rejected. If restoring those gates would exceed the 32-check plan schema limit, validation fails before persistence. `code_rd_institutional` rejects Planner/operator plans entirely because its patch/test/writeback sequence depends on reserved static step identities. Restart recovery recalculates the persisted hash and rebuilds execution from the immutable snapshot, so later Pack edits cannot silently change an in-flight run.
+
+An Agent Loop is enabled per step. It follows `reason -> tool call -> observation -> revise -> finish` and stops at the first configured step, tool-call, token, wall-clock, estimated-cost, or repeated-call limit. Every model request caps `max_tokens` to the remaining token budget. When `max_cost_usd` is set, every primary/fallback candidate must have an input/output price from the capability registry or an explicit frozen route override. Before each request, the Loop serializes the current system prompt, messages, tool calls/observations, and tool schemas, uses its UTF-8 byte size plus framing allowance as a conservative input-token estimate, and applies the highest candidate input/output rates to reduce `max_tokens` or stop before dispatch. The response records the actual selected provider/model and is charged at that selected route's price. Missing or incomplete provider usage never counts as zero: when total consumption cannot be proven, the response consumes the entire remaining token allowance; when only aggregate tokens are available, cost is estimated at the higher selected input/output rate. This is a conservative estimated-call control, not a provider billing hard cap: provider chat templates, special vision/input pricing, price drift, and an already-completed single request can still make the final bill exceed the estimate. Once any budget is exhausted, that outcome is irreversible: later text cannot relabel the loop as `finished`, a batch stops executing additional tool calls, and exhaustion without a non-empty usable result fails the step instead of inventing placeholder success. If usable text exists, the loop returns that best result with `budget_exhausted=true` and the exact stop reason. Tool permissions are the intersection of the frozen step and agent definition. `local_write`, `local_execute`, and external-write tools require explicit persisted approval in loop mode. Tool output is treated as untrusted data, redacted, and bounded before it returns to the model; artifact-write observations omit local filesystem paths. Agent Loops with `read_file`, `list_files`, or `search_files` require an explicit existing `repository_path` and never fall back to the Harness process directory. File tools use descriptor-level identity/size checks and exclude symlinks, junctions/reparse points, hard-linked files, `.env`, credentials/secrets/token/password names, private-key formats, VCS/dependency/cache directories, non-UTF-8 files, and files over 1 MiB; list/search result counts are bounded. These checks reduce accidental disclosure but do not make the host workspace a race-free sandbox against a concurrently hostile local process.
+
+`GET /runs/{run_id}/quality` derives its checks from the frozen plan. It requires artifacts produced by the latest completed attempt for each step, each step's named acceptance eval, blocker Pack evals, valid content hashes, and a verified non-empty final artifact that belongs to the Run, comes from a latest completed attempt, and matches the plan's final artifact type. `scripts/benchmark_control.py` applies explicit benchmark case criteria to existing runs and compares variants without rerunning paid models:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\benchmark_control.py `
+  --suite config\benchmarks\code-repair-v1.json `
+  --trials path\to\trials.json `
+  --output output\benchmark-report.json
+```
+
+The benchmark does not claim Multi-Agent value by construction. Every case must explicitly declare its expected `final_artifact_type`; benchmark loading fails if that contract is absent. Every trial declares a positive `replicate`; each `(case_id, variant)` must use the same continuous replicate grid, and a `run_id` cannot be reused elsewhere in the suite. Variant comparisons are paired by `(case_id, replicate)` before quality, cost, duration, and rework deltas are aggregated. Normal model responses and `vision_preprocess` sidecar responses are both counted under the actual selected provider/model. Quality metrics expose `usage_complete` and `unmetered_model_calls`. A persisted confirmed real-model request with no terminal response is conservatively treated as potentially dispatched after a hard crash, and a failed real-provider route attempt before a successful fallback is also unmetered; confirmed local preflight rejection and mock failure do not create external-cost debt. If any call lacks input/output usage or any potentially billed attempt is unmetered, estimated cost and the variant's average token count are `null`, so the value gate fails rather than treating unknown consumption as free. A variant passes its value gate only when measured quality or rework improves within the configured cost and duration ratios.
 
 ## Main/Subagent Mental Model
 
@@ -110,6 +146,46 @@ Provider route example:
   }
 }
 ```
+
+## Model Control Plane
+
+The Harness keeps workflow orchestration separate from provider selection. A
+model request is evaluated against configured primary/fallback routes, required
+capabilities, provider readiness, the process-local health circuit, and the
+run's durable real-model confirmation before any adapter is called.
+
+The built-in capability registry is the default source for protocol, tool,
+vision, reasoning, context, output, and price metadata. To replace it with a
+reviewed local registry, set `TEAM_AGENT_MODEL_CAPABILITIES_CONFIG` to a JSON
+file following `config/model-capabilities.example.json`. `input_price` and
+`output_price` are USD per million tokens. Explicit per-route
+`input_usd_per_million` / `output_usd_per_million` values take precedence. A
+cost-bounded Agent Loop fails before dispatch when any candidate lacks a
+complete price pair; unknown price or usage is never treated as zero.
+
+The local diagnostic surface is:
+
+- `GET /providers/doctor`: reports configuration, readiness, health, and
+  capability-registry source without making a network call.
+- `POST /routes/explain`: evaluates a proposed primary/fallback chain without
+  calling a model.
+- `GET /models/{provider}/{model}/capabilities`: resolves the effective
+  capability entry for one provider/model pair.
+- `POST /providers/{provider}/smoke`: performs a fixed health prompt. A real
+  provider requires both server-side real-call enablement and
+  `confirm_real_models=true`, so this endpoint can incur provider cost.
+
+Retryable failures feed a process-local circuit breaker. Three consecutive
+retryable failures open the provider circuit for 30 seconds; restarting the
+service resets that health state. Fallback candidates remain ordered and must
+individually pass capability, readiness, health, mock-fallback, and real-call
+approval checks. Trace and benchmark accounting use the actual selected
+provider/model and preserve route receipts for rejected or failed candidates.
+For persisted runs, every physical HTTP attempt made by the exact built-in
+OpenAI-compatible adapter first writes a durable `model_provider_attempt_started`
+trace. If that write fails, dispatch is aborted; custom adapters cannot attest
+trusted provider attempts. A crash after dispatch can still repeat the request
+on recovery, so this does not provide exactly-once external execution.
 
 LiteLLM Proxy route example:
 
@@ -451,6 +527,7 @@ The backend validates accepted values (`minimal`, `low`, `medium`, `high`, and `
 LiteLLM itself defaults to very long upstream waits and provider retries. The harness keeps the failure boundary local and observable:
 
 - `TEAM_AGENT_MODEL_TIMEOUT_SECONDS` controls the harness OpenAI-compatible client timeout and defaults to 180 seconds in the launcher.
+- Provider semaphore waiting, provider retries, and retry backoff consume one monotonic request deadline. Each retry receives only the remaining time instead of restarting the timeout budget.
 - LiteLLM proxy calls receive `x-litellm-timeout` with that same value.
 - `TEAM_AGENT_LITELLM_PROXY_MAX_ATTEMPTS` defaults to `1` so harness retries do not stack on top of LiteLLM retries.
 - `REQUEST_TIMEOUT` and `DEFAULT_MAX_RETRIES` are set by `scripts/start-litellm-harness.ps1` for the local LiteLLM process.
@@ -546,14 +623,11 @@ Writeback safety limits:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -U pip
-.\.venv\Scripts\python -m pip install -e .[test]
+.\.venv\Scripts\python -m pip install -r requirements.lock
+.\.venv\Scripts\python -m pip install --no-deps -e .
 ```
 
-If editable install dependency resolution is slow, install the minimal current test/runtime dependencies:
-
-```powershell
-.\.venv\Scripts\python -m pip install fastapi httpx pytest uvicorn
-```
+`requirements.lock` pins the complete tested runtime/test dependency graph by version. It intentionally does not include distribution hashes, so installation still trusts the configured package index. The Windows desktop bootstrap uses the same lock, and `.github/workflows/ci.yml` is configured to verify it on Windows with Python 3.12, 3.13, and 3.14. Local verification does not prove that the remote GitHub Actions matrix has executed.
 
 ## Run Tests
 
@@ -563,6 +637,9 @@ If editable install dependency resolution is slow, install the minimal current t
 
 ### Current Verification Record
 
+- On 2026-08-07 the final release review passed the full backend suite with `823 passed, 5 skipped, 1 warning`. Fourteen focused adversarial regressions proved pre-dispatch durable provider-attempt evidence, fail-closed trace persistence, partial-usage accounting, local serialization rejection, sensitive-identifier sanitization, the exact built-in adapter trust boundary, and recorder coverage for normal Pack, Agent Loop, vision-sidecar, and Institutional local-code paths. `python -m compileall -q app scripts`, `pip check`, all four tracked PowerShell parse checks, CI/config YAML parsing, and `git diff --check` passed. The warning remains the existing Starlette `TestClient` deprecation. A fresh temporary-data Uvicorn smoke completed all six mock steps with `quality_passed=true`, six AgentRun checkpoints, five handoffs, six artifacts, 18 eval results, and no error trace; the service stopped cleanly and the temporary data was removed. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
+- On 2026-08-06 the current worktree passed the full backend suite with `751 passed, 5 skipped, 1 warning`; the final focused cross-module regression set passed `203 passed, 1 skipped`, and the multimodal-only regression set passed `22 passed`. `python -m compileall -q app scripts`, `pip check`, `git diff --check`, and a high-confidence source/config secret scan also passed. The warning remains the existing Starlette `TestClient` deprecation. A fresh temporary-data Uvicorn smoke on port `8015` completed all six mock steps with `quality_passed=true`, six metered model calls, complete usage, six AgentRun checkpoints, five handoffs, six artifacts, 17 eval results, and no error trace; the service was then stopped and its temporary data removed. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
+- On 2026-08-04 the immutable-plan, Agent-Loop, shared-deadline, quality/benchmark, dynamic-plan gate, frozen-recovery, final-artifact-lineage, and static-executor-boundary increment passed the full backend suite with `705 passed, 5 skipped, 1 warning`. `python -m compileall -q app scripts`, `pip check`, all project PowerShell parse checks, CI YAML parsing, `git diff --check`, and a source/config secret scan also passed. The warning remains the existing Starlette `TestClient` deprecation. A forced-restart Uvicorn smoke submitted 20 temporary-data mock runs, killed the service while all 20 were non-terminal, then recovered all 20 to `completed`; all 20 quality reports passed, no error trace remained, and every queue item and lock was terminal.
 - On 2026-08-03 the patched-test, dependency-provenance, credential-redaction, and worker-recovery hardening passed the full backend suite with `643 passed, 5 skipped, 1 warning`. The warning is the existing Starlette `TestClient` compatibility deprecation for the installed `httpx`; it does not affect the live Uvicorn path. Live and recovery paths reject mixed-attempt/duplicate/extra handoffs, multiple canonical PATCH artifacts, inexact lineage, and missing/tampered checkpoint files. Pytest requires independent test-case evidence instead of trusting exit code alone; writeback rejects stale attempts; storage retry and missing-pack paths preserve atomic runtime/run/queue terminal state. EOF diff semantics and the 20 consecutive real-loop terminalization retry repetitions remain covered.
 - A fresh temporary-database live smoke queued and completed all six mock steps, persisted six artifacts and a final artifact, completed its queue item, released its lock, recorded no error trace, and released the service port after shutdown.
 - A fresh two-process forced-restart smoke killed the first service with the run, first agent attempt, queue item, and lock all persisted as active. The second service cancelled only the interrupted attempt, completed its retry plus the remaining steps, preserved `cancelled/completed` queue history, released both locks, produced six completed checkpoints and six artifacts, recorded `interrupted_run_requeued` with no error trace, and released both service ports. A separate terminal-window interruption was also recovered on the next startup from `completed + running queue + acquired lock` to a completed queue and released locks.
@@ -667,6 +744,7 @@ Safety boundary:
 - `GET /runs`
 - `GET /runs/{run_id}`
 - `GET /runs/{run_id}/detail`
+- `GET /runs/{run_id}/quality`
 - `GET /runs/{run_id}/trace`
 - `GET /runs/{run_id}/artifacts`
 - `GET /runs/{run_id}/agent-runs`
@@ -676,13 +754,21 @@ Safety boundary:
 - `GET /runs/{run_id}/runtime-jobs`
 - `GET /runs/{run_id}/queue-state`
 - `GET /runs/{run_id}/lock-state`
+- `POST /execution-plans/validate`
+- `POST /execution-plans/generate`
 - `POST /runs/{run_id}/runtime-jobs/{job_id}/approve`
 - `POST /runs/{run_id}/runtime-jobs/{job_id}/reject`
 - `POST /runs/{run_id}/runtime-jobs/{job_id}/cancel`
+- `POST /runs/{run_id}/writeback/preview`
+- `POST /runs/{run_id}/writeback/approve`
 - `GET /artifacts/{artifact_id}`
 - `GET /workflow-packs`
 - `GET /workflow-packs/{pack_name}`
 - `GET /model-providers`
+- `GET /providers/doctor`
+- `POST /routes/explain`
+- `POST /providers/{provider}/smoke`
+- `GET /models/{provider}/{model:path}/capabilities`
 - `GET /tool-providers`
 - `GET /skill-auto-routes`
 - `GET /agents`

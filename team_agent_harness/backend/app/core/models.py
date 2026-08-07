@@ -77,6 +77,7 @@ class ArtifactType(StrEnum):
     TEST_REPORT = "test_report"
     SOURCE_SUMMARY = "source_summary"
     RESEARCH_NOTE = "research_note"
+    IMAGE_DESCRIPTION = "image_description"
     FINAL_REPORT = "final_report"
 
 
@@ -120,7 +121,17 @@ class Task(HarnessModel):
 class Run(HarnessModel):
     id: str = Field(default_factory=new_id, min_length=1)
     task_id: str = Field(min_length=1)
+    real_model_access_confirmed: bool = False
     real_web_access_confirmed: bool = False
+    content_block_snapshot: list[dict[str, Any]] = Field(default_factory=list, max_length=16)
+    content_block_snapshot_hash: str | None = Field(default=None, min_length=64, max_length=64)
+    content_block_snapshot_files: dict[str, str] = Field(default_factory=dict, max_length=16)
+    allow_external_model_inputs_snapshot: bool = False
+    vision_preprocess_snapshot: dict[str, Any] | None = None
+    approved_side_effect_tools: list[str] = Field(default_factory=list, max_length=32)
+    execution_plan: dict[str, Any] | None = None
+    execution_plan_hash: str | None = Field(default=None, min_length=64, max_length=64)
+    execution_plan_redacted: bool = False
     status: RunStatus = RunStatus.QUEUED
     current_step: str | None = Field(default=None, min_length=1)
     started_at: datetime | None = None

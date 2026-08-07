@@ -1,0 +1,33 @@
+{
+  "schema_version": "benchmark-v1",
+  "name": "code-repair-v1",
+  "baseline_variant": "single_agent",
+  "variants": [
+    "single_agent",
+    "current_multi_agent",
+    "without_reviewers",
+    "gpt_deepseek_mix"
+  ],
+  "cases": [
+    {
+      "id": "patched-tests",
+      "description": "Code repair must apply the proposed patch in an isolated workspace and pass the declared tests.",
+      "quality_criteria": {
+        "required_artifact_types": ["patch", "test_report", "final_report"],
+        "required_eval_checks": ["patched_local_test_command"],
+        "final_artifact_type": "final_report",
+        "min_final_artifact_chars": 1,
+        "require_completed_run": true,
+        "verify_artifact_hashes": true
+      }
+    }
+  ],
+  "prices": [],
+  "value_gate": {
+    "min_quality_gain_percentage_points": 10.0,
+    "max_quality_regression_percentage_points": 0.0,
+    "min_rework_reduction_percent": 25.0,
+    "max_cost_ratio": 1.5,
+    "max_duration_ratio": 1.5
+  }
+}

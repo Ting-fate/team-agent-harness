@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 import xml.etree.ElementTree as ElementTree
-from typing import Any, BinaryIO, Iterator, Protocol
+from typing import Any, BinaryIO, Callable, Iterator, Protocol
 from uuid import uuid4
 
 if os.name == "nt":
@@ -27,7 +27,10 @@ from app.core.model_runtime import (
     ModelResponse,
     context_message_from_envelope,
     default_reasoning_effort_for_model,
+    model_allow_mock_fallback_from_config,
+    model_fallbacks_from_config,
 )
+from app.core.multimodal import multimodal_source_refs
 from app.core.models import (
     AgentDefinition,
     AgentRunStatus,
@@ -191,16 +194,19 @@ class LocalCodeExecutor:
         model_gateway: ModelGateway | None = None,
         artifact_store: ArtifactStore | None = None,
         patch_workspace_preparer: PatchWorkspacePreparer | None = None,
+        model_request_binder: Callable[[Run, ModelRequest], ModelRequest] | None = None,
         workspace_root: str | Path = "output/local_code_workspaces",
     ) -> None:
         self.model_gateway = model_gateway or ModelGateway()
         self.artifact_store = artifact_store
         self.patch_workspace_preparer = patch_workspace_preparer
+        self.model_request_binder = model_request_binder
         self.workspace_root = Path(workspace_root).expanduser().resolve()
 
     def supports(self, task: Task, step: WorkflowStep) -> bool:
         return (
             task.workflow_pack == CODE_EXECUTOR_PACK
+            and step.execution_source == "workflow_pack"
             and step.name in CODE_EXECUTOR_STEPS
             and bool(task.inputs.get("repository_path"))
         )
@@ -400,6 +406,8 @@ class LocalCodeExecutor:
             ),
             max_tokens=_max_tokens(agent, default=4000),
         )
+        if self.model_request_binder is not None:
+            model_request = self.model_request_binder(run, model_request)
         model_response = self.model_gateway.complete(model_request)
         content = _patch_artifact_content(task, run, snapshot, model_response)
         return AgentStepOutput(
@@ -409,7 +417,7 @@ class LocalCodeExecutor:
                     type=ArtifactType.PATCH,
                     filename="local_code_patch.md",
                     content=content,
-                    source_refs=sorted(snapshot.files),
+                    source_refs=_artifact_source_refs(context, snapshot.files),
                 )
             ],
             risk_notes=[
@@ -483,6 +491,8 @@ class LocalCodeExecutor:
                 extra=f"\n\n## Test Result\n\n{test_result.markdown()}\n",
                 max_tokens=_max_tokens(agent, default=3000),
             )
+            if self.model_request_binder is not None:
+                model_request = self.model_request_binder(run, model_request)
             model_response = self.model_gateway.complete(model_request)
         content = _test_artifact_content(
             task,
@@ -502,7 +512,7 @@ class LocalCodeExecutor:
                     type=ArtifactType.TEST_REPORT,
                     filename="local_code_test_report.md",
                     content=content,
-                    source_refs=sorted(snapshot.files),
+                    source_refs=_artifact_source_refs(context, snapshot.files),
                 )
             ],
             risk_notes=[
@@ -1146,6 +1156,10 @@ def _is_sensitive_name(name: str) -> bool:
     return "api_key" in normalized or "private_key" in normalized
 
 
+def _artifact_source_refs(context: dict[str, Any], repository_files: dict[str, str]) -> list[str]:
+    return list(dict.fromkeys([*sorted(repository_files), *multimodal_source_refs(context)]))
+
+
 def _model_request(
     *,
     task: Task,
@@ -1163,46 +1177,70 @@ def _model_request(
         provider,
         model,
     )
+    model_content_blocks = context.get("_model_content_blocks")
+    required_capabilities = [
+        item
+        for item in context.get("required_model_capabilities", [])
+        if isinstance(item, str)
+    ]
+    if isinstance(model_content_blocks, list) and any(
+        isinstance(item, dict) and item.get("type") == "image_ref" for item in model_content_blocks
+    ) and "vision" not in required_capabilities:
+        required_capabilities.append("vision")
+    messages = [
+        ModelMessage(
+            role="user",
+            content=_snapshot_safe_text(f"Task: {task.title}\nGoal: {task.goal}", snapshot),
+        ),
+        ModelMessage(
+            role="user",
+            content=context_message_from_envelope(_model_safe_context(context, snapshot)),
+        ),
+        ModelMessage(
+            role="user",
+            content=_snapshot_safe_text(
+                (
+                    f"Step: {step.name}\n"
+                    f"Instruction: {instruction}\n"
+                    f"Constraints: {task.constraints}\n"
+                    f"Acceptance criteria: {task.acceptance_criteria}\n"
+                    f"Repository context:\n{_snapshot_markdown(snapshot)}"
+                    f"{extra}"
+                ),
+                snapshot,
+            ),
+        ),
+    ]
+    if isinstance(model_content_blocks, list) and model_content_blocks:
+        messages.append(ModelMessage(role="user", content=model_content_blocks))
     return ModelRequest(
         provider=provider,
         model=model,
         system_prompt=_snapshot_safe_text(agent.system_prompt, snapshot),
-        messages=[
-            ModelMessage(
-                role="user",
-                content=_snapshot_safe_text(f"Task: {task.title}\nGoal: {task.goal}", snapshot),
-            ),
-            ModelMessage(
-                role="user",
-                content=context_message_from_envelope(_model_safe_context(context, snapshot)),
-            ),
-            ModelMessage(
-                role="user",
-                content=_snapshot_safe_text(
-                    (
-                        f"Step: {step.name}\n"
-                        f"Instruction: {instruction}\n"
-                        f"Constraints: {task.constraints}\n"
-                        f"Acceptance criteria: {task.acceptance_criteria}\n"
-                        f"Repository context:\n{_snapshot_markdown(snapshot)}"
-                        f"{extra}"
-                    ),
-                    snapshot,
-                ),
-            ),
-        ],
+        messages=messages,
         temperature=_optional_float(agent.model_settings.get("temperature")),
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
         tools_allowed=step.allowed_tools,
+        fallbacks=model_fallbacks_from_config(agent.model_settings),
         metadata={
             "task_title": _snapshot_safe_text(task.title, snapshot),
             "step_name": step.name,
             "agent_id": agent.id,
+            "agent_run_id": context.get("agent_run_id"),
             "agent_role": agent.role,
             "context_keys": sorted(context.keys()),
             "local_code_executor": True,
             "repository_files": sorted(snapshot.files),
+            "allow_mock_fallback": model_allow_mock_fallback_from_config(agent.model_settings),
+            "required_model_capabilities": required_capabilities,
+            "run_bound": isinstance(context.get("run_id"), str) and bool(context.get("run_id")),
+            "real_model_access_confirmed": context.get("real_model_access_confirmed") is True,
+            "content_block_hashes": [
+                str(item.get("sha256"))
+                for item in context.get("content_blocks", [])
+                if isinstance(item, dict) and item.get("sha256")
+            ],
         },
     )
 

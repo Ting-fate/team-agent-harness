@@ -91,6 +91,7 @@ class ContextInjector:
             "step_name": step.name,
             "step_objective": {
                 "name": step.name,
+                "objective": step.objective or step.name,
                 "phase": step.phase,
                 "required_inputs": step.required_inputs,
                 "required_artifacts": step.required_artifacts,
@@ -99,6 +100,9 @@ class ContextInjector:
                 "produces_artifact_type": step.produces_artifact_type,
                 "requires_eval_pass": step.requires_eval_pass,
                 "ownership": step.ownership,
+                "acceptance_criteria": [
+                    criterion.model_dump(mode="json") for criterion in step.acceptance_criteria
+                ],
             },
             "allowed_tools": step.allowed_tools,
             "required_inputs": step.required_inputs,
