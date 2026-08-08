@@ -341,6 +341,12 @@ def test_background_run_returns_before_executor_completes(tmp_path, monkeypatch)
         tmp_path / "artifacts",
         executor_factory=lambda: executor,
     )
+    background_run_completed = _observe_worker_action(
+        monkeypatch,
+        app.state.harness.run_worker,
+        "background_run_completed",
+        expected_outcome=RunStatus.COMPLETED.value,
+    )
     original_update_run_lock = app.state.harness.storage.update_run_lock
     heartbeat_failures = 0
 
@@ -376,9 +382,11 @@ def test_background_run_returns_before_executor_completes(tmp_path, monkeypatch)
         _wait_for_lock_heartbeat(app.state.harness.storage, active_lock.id, first_heartbeat)
 
         executor.release.set()
-        completed = _wait_for_terminal_run(client, submitted["id"])
+        _wait_for_event(background_run_completed, "background run completion")
+        completed = app.state.harness.storage.get_run(submitted["id"])
 
-        assert completed["status"] == RunStatus.COMPLETED.value
+        assert completed is not None
+        assert completed.status == RunStatus.COMPLETED
         assert heartbeat_failures == 1
         _wait_for_queue_status(
             app.state.harness.storage,
@@ -474,6 +482,12 @@ def test_background_approval_queues_next_segment_during_previous_segment_cleanup
                 raise RuntimeError("previous queue segment cleanup was not released")
 
     monkeypatch.setattr(worker, "_execute", pause_after_first_approval_segment)
+    background_run_completed = _observe_worker_action(
+        monkeypatch,
+        worker,
+        "background_run_completed",
+        expected_outcome=RunStatus.COMPLETED.value,
+    )
 
     with TestClient(app) as client:
         task = client.post(
@@ -494,9 +508,9 @@ def test_background_approval_queues_next_segment_during_previous_segment_cleanup
             f"/runs/{waiting_run['id']}/runtime-jobs/{patch_job['id']}/approve?background=true"
         )
         assert first.status_code == 202
-        assert executor.started.wait(timeout=1)
+        _wait_for_event(executor.started, "approved step execution")
         executor.release.set()
-        assert previous_segment_returned.wait(timeout=2)
+        _wait_for_event(previous_segment_returned, "previous segment return")
 
         current_run = client.get(f"/runs/{waiting_run['id']}").json()
         assert current_run["status"] == RunStatus.WAITING.value
@@ -512,8 +526,10 @@ def test_background_approval_queues_next_segment_during_previous_segment_cleanup
         assert second.status_code == 202
 
         allow_previous_cleanup.set()
-        completed = _wait_for_terminal_run(client, waiting_run["id"])
-        assert completed["status"] == RunStatus.COMPLETED.value
+        _wait_for_event(background_run_completed, "background run completion")
+        completed = app.state.harness.storage.get_run(waiting_run["id"])
+        assert completed is not None
+        assert completed.status == RunStatus.COMPLETED
         assert app.state.harness.storage.get_runtime_job(test_job["id"]).status == RuntimeJobStatus.COMPLETED
 
 
@@ -792,6 +808,12 @@ def test_worker_retries_transient_queue_item_read_without_stopping(tmp_path, mon
     state = app.state.harness
     original_get = state.storage.get_run_queue_item
     failures = 0
+    background_run_completed = _observe_worker_action(
+        monkeypatch,
+        state.run_worker,
+        "background_run_completed",
+        expected_outcome=RunStatus.COMPLETED.value,
+    )
 
     def fail_first_queue_item_read(item_id):
         nonlocal failures
@@ -815,9 +837,11 @@ def test_worker_retries_transient_queue_item_read_without_stopping(tmp_path, mon
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        completed = _wait_for_terminal_run(client, submitted["id"])
+        _wait_for_event(background_run_completed, "background run completion")
+        completed = state.storage.get_run(submitted["id"])
 
-        assert completed["status"] == RunStatus.COMPLETED.value
+        assert completed is not None
+        assert completed.status == RunStatus.COMPLETED
         assert failures == 1
         assert state.run_worker.is_running is True
         _wait_for_worker_unscheduled(state.run_worker, submitted["id"])
@@ -960,6 +984,12 @@ def test_worker_retries_terminal_queue_write_without_state_contradiction(tmp_pat
     state = app.state.harness
     original_update = state.storage.update_run_queue_item
     failures = 0
+    background_run_completed = _observe_worker_action(
+        monkeypatch,
+        state.run_worker,
+        "background_run_completed",
+        expected_outcome=RunStatus.COMPLETED.value,
+    )
 
     def fail_first_terminal_queue_write(item):
         nonlocal failures
@@ -983,9 +1013,11 @@ def test_worker_retries_terminal_queue_write_without_state_contradiction(tmp_pat
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        completed = _wait_for_terminal_run(client, submitted["id"])
+        _wait_for_event(background_run_completed, "background run completion")
+        completed = state.storage.get_run(submitted["id"])
 
-        assert completed["status"] == RunStatus.COMPLETED.value
+        assert completed is not None
+        assert completed.status == RunStatus.COMPLETED
         _wait_for_queue_status(
             state.storage,
             submitted["id"],
@@ -1000,6 +1032,12 @@ def test_worker_retries_transient_terminal_lock_release_failure(tmp_path, monkey
     state = app.state.harness
     original_update = state.storage.update_run_lock
     failures = 0
+    background_run_completed = _observe_worker_action(
+        monkeypatch,
+        state.run_worker,
+        "background_run_completed",
+        expected_outcome=RunStatus.COMPLETED.value,
+    )
 
     def fail_first_release(lock):
         nonlocal failures
@@ -1023,15 +1061,12 @@ def test_worker_retries_transient_terminal_lock_release_failure(tmp_path, monkey
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        completed = _wait_for_terminal_run(client, submitted["id"])
+        _wait_for_event(background_run_completed, "background run completion")
+        completed = state.storage.get_run(submitted["id"])
 
-        assert completed["status"] == RunStatus.COMPLETED.value
-        deadline = monotonic() + 1
-        while monotonic() < deadline:
-            locks = state.storage.list_run_locks_for_run(submitted["id"])
-            if locks and all(lock.status == RunLockStatus.RELEASED for lock in locks):
-                break
-            sleep(0.01)
+        assert completed is not None
+        assert completed.status == RunStatus.COMPLETED
+        locks = state.storage.list_run_locks_for_run(submitted["id"])
         assert locks and all(lock.status == RunLockStatus.RELEASED for lock in locks)
         assert failures == 1
         assert state.run_worker.is_running is True
@@ -1047,9 +1082,11 @@ def test_worker_reconciles_terminal_queue_state_after_persistent_write_failure(
     state = app.state.harness
     original_update = state.storage.update_run_queue_item
     fail_terminal_writes = True
+    terminal_queue_write_attempted = Event()
 
     def fail_terminal_queue_writes(item):
         if fail_terminal_writes and item.status == RunQueueItemStatus.COMPLETED:
+            terminal_queue_write_attempted.set()
             raise StorageError("persistent terminal queue write failure")
         return original_update(item)
 
@@ -1068,8 +1105,10 @@ def test_worker_reconciles_terminal_queue_state_after_persistent_write_failure(
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        completed = _wait_for_terminal_run(client, submitted["id"])
-        assert completed["status"] == RunStatus.COMPLETED.value
+        _wait_for_event(terminal_queue_write_attempted, "terminal queue write attempt")
+        completed = state.storage.get_run(submitted["id"])
+        assert completed is not None
+        assert completed.status == RunStatus.COMPLETED
         assert state.storage.list_run_queue_items_for_run(submitted["id"])[0].status == RunQueueItemStatus.RUNNING
 
     fail_terminal_writes = False
@@ -1571,6 +1610,12 @@ def test_worker_trace_failure_does_not_interrupt_background_run(tmp_path, monkey
     worker = app.state.harness.run_worker
     original_record = worker.trace_logger.record
     failed_actions: list[str] = []
+    background_run_completed = _observe_worker_action(
+        monkeypatch,
+        worker,
+        "background_run_completed",
+        expected_outcome=RunStatus.COMPLETED.value,
+    )
 
     def fail_background_trace(*, run_id, event_type, payload, agent_run_id=None, duration_ms=None):
         action = payload.get("action")
@@ -1600,9 +1645,11 @@ def test_worker_trace_failure_does_not_interrupt_background_run(tmp_path, monkey
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        completed = _wait_for_terminal_run(client, submitted["id"])
+        _wait_for_event(background_run_completed, "background run completion")
+        completed = app.state.harness.storage.get_run(submitted["id"])
 
-        assert completed["status"] == RunStatus.COMPLETED.value
+        assert completed is not None
+        assert completed.status == RunStatus.COMPLETED
         assert failed_actions == ["background_run_queued", "background_run_started"]
         assert worker.is_running is True
 
@@ -1625,6 +1672,27 @@ def _wait_for_event(
     if event.wait(timeout=timeout):
         return
     raise AssertionError(f"{description} was not observed within {timeout} seconds")
+
+
+def _observe_worker_action(
+    monkeypatch,
+    worker,
+    expected_action: str,
+    *,
+    expected_outcome: str | None = None,
+) -> Event:
+    observed = Event()
+    original_record = worker._record
+
+    def observe(action, run_id, queue_item_id, outcome=None):
+        original_record(action, run_id, queue_item_id, outcome)
+        if action == expected_action and (
+            expected_outcome is None or outcome == expected_outcome
+        ):
+            observed.set()
+
+    monkeypatch.setattr(worker, "_record", observe)
+    return observed
 
 
 def _wait_for_lock_heartbeat(storage, lock_id: str, previous: str, timeout: float = 1) -> None:

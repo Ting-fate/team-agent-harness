@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import socket
 from threading import Event
-from time import monotonic, sleep
 from types import SimpleNamespace
 
 import pytest
@@ -919,6 +918,16 @@ def test_background_research_does_not_gain_real_browser_access_after_submission(
             return self.delegate.execute(**kwargs)
 
     app.state.harness.executor_factory = BlockingExecutor
+    background_run_completed = Event()
+    worker = app.state.harness.run_worker
+    original_worker_record = worker._record
+
+    def observe_worker_record(action, run_id, queue_item_id, outcome=None):
+        original_worker_record(action, run_id, queue_item_id, outcome)
+        if action == "background_run_completed" and outcome == "completed":
+            background_run_completed.set()
+
+    monkeypatch.setattr(worker, "_record", observe_worker_record)
     search_client = FakeBrowserSearchClient()
     fetch_client = FakeBrowserFetchClient()
 
@@ -946,18 +955,14 @@ def test_background_research_does_not_gain_real_browser_access_after_submission(
             provider.fetch_client = fetch_client
             release_plan.set()
 
-            deadline = monotonic() + 5
-            while monotonic() < deadline:
-                completed = client.get(f"/runs/{run['id']}").json()
-                if completed["status"] in {"completed", "failed"}:
-                    break
-                sleep(0.02)
-            else:
+            if not background_run_completed.wait(timeout=15):
                 raise AssertionError("background research run did not finish")
+            completed = app.state.harness.storage.get_run(run["id"])
         finally:
             release_plan.set()
 
-    assert completed["status"] == "completed"
+    assert completed is not None
+    assert completed.status.value == "completed"
     assert search_client.calls == []
     assert fetch_client.calls == []
 
