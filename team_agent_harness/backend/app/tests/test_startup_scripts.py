@@ -401,10 +401,48 @@ def test_launcher_status_distinguishes_project_service_from_other_port_owner() -
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for launcher behavior testing")
+def test_launcher_reads_base_python_from_project_venv_metadata(tmp_path: Path) -> None:
+    unicode_root = tmp_path / "\u8def\u5f84\u9a8c\u8bc1"
+    venv_root = unicode_root / ".venv"
+    venv_python = venv_root / "Scripts" / "python.exe"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.touch()
+    base_python = unicode_root / "\u57fa\u7840-python.exe"
+    (venv_root / "pyvenv.cfg").write_text(
+        f"home = {tmp_path}\nexecutable = {base_python}\n",
+        encoding="utf-8",
+    )
+    launcher_path = str(LAUNCHER).replace("'", "''")
+    venv_python_path = str(venv_python).replace("'", "''")
+    base_python_path = str(base_python).replace("'", "''")
+    command = f"""
+. '{launcher_path}' -FunctionsOnly
+[string]::Equals(
+    (Get-PythonBaseExecutable '{venv_python_path}'),
+    '{base_python_path}',
+    [System.StringComparison]::OrdinalIgnoreCase
+) | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not result.stderr.strip(), result.stderr
+    assert json.loads(result.stdout.strip()) is True
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for launcher behavior testing")
 def test_launcher_recognizes_only_expected_project_service_commands() -> None:
     launcher_path = str(LAUNCHER).replace("'", "''")
     command = f"""
 . '{launcher_path}' -FunctionsOnly
+$HarnessBasePython = Join-Path $Root "test-base-python.exe"
 $harness = [PSCustomObject]@{{
     ExecutablePath = $HarnessPython
     CommandLine = ('"{{0}}" -m uvicorn app.main:app --host 127.0.0.1 --port 8014' -f $HarnessPython)

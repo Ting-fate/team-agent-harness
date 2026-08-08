@@ -55,20 +55,33 @@ def test_workflow_packs_define_bounded_context_budgets_by_position() -> None:
         assert actual == expected[pack.name]
 
 
-def test_active_research_routes_use_bounded_output_budgets() -> None:
-    config = json.loads((PROJECT_ROOT / "config/model-routing.local.json").read_text(encoding="utf-8"))
-
+def test_active_routes_use_bounded_output_budgets() -> None:
+    checked_in_expected = {
+        "code_rd_institutional-context_reader": 4096,
+        "code_rd_institutional-planner": 700,
+        "code_rd_institutional-review_gate": 4096,
+        "code_rd_institutional-dispatcher": 500,
+        "code_rd_institutional-implementation_executor": 1000,
+        "code_rd_institutional-test_executor": 800,
+        "code_rd_institutional-context_reviewer": 4096,
+        "code_rd_institutional-synthesizer": 700,
+        "code_rd_institutional-final_reviewer": 4096,
+        "code_rd_institutional-final_approver": 500,
+    }
+    checked_in_config = json.loads(
+        (PROJECT_ROOT / "config/model-routing.litellm.example.json").read_text(encoding="utf-8")
+    )
     assert {
-        agent_id: config["agents"][agent_id]["max_tokens"]
-        for agent_id in (
-            "research-planner",
-            "research-searcher",
-            "research-reader",
-            "research-verifier",
-            "research-writer",
-            "research-reviewer",
-        )
-    } == {
+        agent_id: checked_in_config["agents"][agent_id]["max_tokens"]
+        for agent_id in checked_in_expected
+    } == checked_in_expected
+
+    local_routing_path = PROJECT_ROOT / "config/model-routing.local.json"
+    if not local_routing_path.is_file():
+        return
+
+    local_config = json.loads(local_routing_path.read_text(encoding="utf-8"))
+    local_expected = {
         "research-planner": 1000,
         "research-searcher": 256,
         "research-reader": 4096,
@@ -76,3 +89,6 @@ def test_active_research_routes_use_bounded_output_budgets() -> None:
         "research-writer": 700,
         "research-reviewer": 400,
     }
+    assert {
+        agent_id: local_config["agents"][agent_id]["max_tokens"] for agent_id in local_expected
+    } == local_expected

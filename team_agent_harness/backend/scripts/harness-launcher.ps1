@@ -26,7 +26,7 @@ function Get-PythonBaseExecutable {
     try {
         $venvRoot = Split-Path -Parent (Split-Path -Parent $PythonPath)
         $venvConfig = Join-Path $venvRoot "pyvenv.cfg"
-        foreach ($line in Get-Content -LiteralPath $venvConfig -ErrorAction Stop) {
+        foreach ($line in Get-Content -LiteralPath $venvConfig -Encoding UTF8 -ErrorAction Stop) {
             $match = [regex]::Match($line, "^\s*executable\s*=\s*(.+?)\s*$")
             if ($match.Success) {
                 return $match.Groups[1].Value

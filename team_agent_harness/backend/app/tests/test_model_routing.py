@@ -107,11 +107,13 @@ def test_checked_in_litellm_routes_use_gpt55_except_long_context_review_roles() 
         "code_rd_institutional-review_gate",
         "research-reader",
     }
-    for relative_path in [
-        "config/model-routing.local.json",
-        "config/model-routing.litellm.example.json",
-    ]:
-        routing = json.loads((PROJECT_ROOT / relative_path).read_text(encoding="utf-8"))
+    routing_paths = [PROJECT_ROOT / "config/model-routing.litellm.example.json"]
+    local_routing_path = PROJECT_ROOT / "config/model-routing.local.json"
+    if local_routing_path.is_file():
+        routing_paths.append(local_routing_path)
+
+    for routing_path in routing_paths:
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
         agents = routing["agents"]
         deepseek_agents = {
             agent_id

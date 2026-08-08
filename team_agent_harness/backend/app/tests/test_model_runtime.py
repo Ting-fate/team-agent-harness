@@ -1243,18 +1243,20 @@ def test_openai_compatible_adapter_rejects_missing_completion_status(
         _complete_static_response(response)
 
 
-@pytest.mark.parametrize(
-    "relative_path",
-    ["config/model-routing.local.json", "config/model-routing.litellm.example.json"],
-)
-def test_checked_in_deepseek_routes_have_minimum_response_budget(relative_path: str) -> None:
-    config = json.loads((PROJECT_ROOT / relative_path).read_text(encoding="utf-8"))
-    deepseek_routes = [
-        route for route in config["agents"].values() if route.get("model") == "deepseek-v4-pro"
-    ]
+def test_checked_in_deepseek_routes_have_minimum_response_budget() -> None:
+    routing_paths = [PROJECT_ROOT / "config/model-routing.litellm.example.json"]
+    local_routing_path = PROJECT_ROOT / "config/model-routing.local.json"
+    if local_routing_path.is_file():
+        routing_paths.append(local_routing_path)
 
-    assert deepseek_routes
-    assert all(route.get("max_tokens", 0) >= 4096 for route in deepseek_routes)
+    for routing_path in routing_paths:
+        config = json.loads(routing_path.read_text(encoding="utf-8"))
+        deepseek_routes = [
+            route for route in config["agents"].values() if route.get("model") == "deepseek-v4-pro"
+        ]
+
+        assert deepseek_routes
+        assert all(route.get("max_tokens", 0) >= 4096 for route in deepseek_routes)
 
 
 def test_litellm_gpt55_chat_request_maps_xhigh_reasoning_effort_to_high(

@@ -827,7 +827,13 @@ def test_worker_recovers_storage_error_after_run_activation(tmp_path, monkeypatc
     app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
     state = app.state.harness
     original_get_task = state.storage.get_task
+    original_update_queue_item = state.storage.update_run_queue_item
+    original_record = state.run_worker._record
     injected = False
+    terminal_queue_write_started = Event()
+    background_run_completed = Event()
+    allow_terminal_queue_write = Event()
+    terminal_window: dict[str, object] = {}
 
     def fail_once_after_run_activation(task_id):
         nonlocal injected
@@ -836,7 +842,33 @@ def test_worker_recovers_storage_error_after_run_activation(tmp_path, monkeypatc
             raise StorageError("transient task read after run activation")
         return original_get_task(task_id)
 
+    def pause_first_terminal_queue_write(item):
+        should_pause = (
+            item.status == RunQueueItemStatus.COMPLETED
+            and not terminal_queue_write_started.is_set()
+        )
+        if should_pause:
+            persisted_run = state.storage.get_run(item.run_id)
+            persisted_item = state.storage.get_run_queue_item(item.id)
+            terminal_window["run_status"] = persisted_run.status if persisted_run else None
+            terminal_window["queue_status"] = persisted_item.status if persisted_item else None
+            terminal_queue_write_started.set()
+            if not allow_terminal_queue_write.wait(timeout=15):
+                raise RuntimeError("terminal queue write was not released")
+        return original_update_queue_item(item)
+
+    def observe_worker_record(action, run_id, queue_item_id, outcome=None):
+        original_record(action, run_id, queue_item_id, outcome)
+        if action == "background_run_completed":
+            background_run_completed.set()
+
     monkeypatch.setattr(state.storage, "get_task", fail_once_after_run_activation)
+    monkeypatch.setattr(
+        state.storage,
+        "update_run_queue_item",
+        pause_first_terminal_queue_write,
+    )
+    monkeypatch.setattr(state.run_worker, "_record", observe_worker_record)
 
     with TestClient(app) as client:
         task = client.post(
@@ -851,10 +883,27 @@ def test_worker_recovers_storage_error_after_run_activation(tmp_path, monkeypatc
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        completed = _wait_for_terminal_run(client, submitted["id"])
+        try:
+            _wait_for_event(
+                terminal_queue_write_started,
+                "terminal queue write",
+            )
+            assert terminal_window == {
+                "run_status": RunStatus.COMPLETED,
+                "queue_status": RunQueueItemStatus.RUNNING,
+            }
+        finally:
+            allow_terminal_queue_write.set()
 
+        _wait_for_event(
+            background_run_completed,
+            "background run completion",
+        )
+
+        completed = state.storage.get_run(submitted["id"])
+        assert completed is not None
         assert injected is True
-        assert completed["status"] == RunStatus.COMPLETED.value
+        assert completed.status == RunStatus.COMPLETED
         queue_items = state.storage.list_run_queue_items_for_run(submitted["id"])
         assert queue_items[-1].status == RunQueueItemStatus.COMPLETED
         assert state.run_worker.is_running is True
@@ -1431,7 +1480,9 @@ def test_worker_terminalizes_waiting_run_after_segment_internal_failure(tmp_path
     app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
     state = app.state.harness
     failure_injected = Event()
+    terminalization_finished = Event()
     original_update = run_control.RunCoordinator._update_queue_item_for_current_run
+    original_record = state.run_worker._record
 
     def fail_after_run_waits(coordinator, item):
         persisted_run = coordinator.storage.get_run(item.run_id)
@@ -1445,6 +1496,13 @@ def test_worker_terminalizes_waiting_run_after_segment_internal_failure(tmp_path
         "_update_queue_item_for_current_run",
         fail_after_run_waits,
     )
+
+    def observe_worker_record(action, run_id, queue_item_id, outcome=None):
+        original_record(action, run_id, queue_item_id, outcome)
+        if action == "background_run_failed":
+            terminalization_finished.set()
+
+    monkeypatch.setattr(state.run_worker, "_record", observe_worker_record)
 
     with TestClient(app) as client:
         task = client.post(
@@ -1460,15 +1518,20 @@ def test_worker_terminalizes_waiting_run_after_segment_internal_failure(tmp_path
             json={"task_id": task["id"], "background": True},
         ).json()
 
-        assert failure_injected.wait(timeout=5)
-        persisted_run = _wait_for_terminal_run(client, submitted["id"])
-        _wait_for_queue_status(
-            state.storage,
-            submitted["id"],
-            [RunQueueItemStatus.FAILED],
+        _wait_for_event(
+            failure_injected,
+            "waiting-run failure injection",
         )
-        assert persisted_run["status"] == RunStatus.FAILED.value
-        assert persisted_run["finished_at"] is not None
+        _wait_for_event(
+            terminalization_finished,
+            "waiting-run terminalization",
+        )
+        persisted_run = state.storage.get_run(submitted["id"])
+        queue_items = state.storage.list_run_queue_items_for_run(submitted["id"])
+        assert persisted_run is not None
+        assert persisted_run.status == RunStatus.FAILED
+        assert persisted_run.finished_at is not None
+        assert [item.status for item in queue_items] == [RunQueueItemStatus.FAILED]
         agent_runs = state.storage.list_agent_runs_for_run(submitted["id"])
         sessions = state.storage.list_agent_sessions_for_run(submitted["id"])
         jobs = state.storage.list_runtime_jobs_for_run(submitted["id"])
@@ -1552,6 +1615,16 @@ def _wait_for_terminal_run(client: TestClient, run_id: str, timeout: float = 5) 
             return run
         sleep(0.02)
     raise AssertionError(f"run did not finish within {timeout} seconds: {run_id}")
+
+
+def _wait_for_event(
+    event: Event,
+    description: str,
+    timeout: float = 15,
+) -> None:
+    if event.wait(timeout=timeout):
+        return
+    raise AssertionError(f"{description} was not observed within {timeout} seconds")
 
 
 def _wait_for_lock_heartbeat(storage, lock_id: str, previous: str, timeout: float = 1) -> None:
