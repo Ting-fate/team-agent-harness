@@ -27,6 +27,10 @@ from app.core.models import (
 from app.core.runner import AgentArtifactOutput, AgentStepOutput
 from app.core.storage import StorageError
 from app.main import create_app
+from app.tests.worker_test_utils import (
+    ASYNC_WORKER_TIMEOUT_SECONDS,
+    wait_for_worker_event,
+)
 
 
 class BlockingExecutor:
@@ -374,7 +378,7 @@ def test_background_run_returns_before_executor_completes(tmp_path, monkeypatch)
         assert response.status_code == 201
         submitted = response.json()
         assert submitted["status"] in {RunStatus.QUEUED.value, RunStatus.RUNNING.value}
-        assert executor.started.wait(timeout=5)
+        wait_for_worker_event(executor.started, "background executor start")
         assert client.get(f"/runs/{submitted['id']}").json()["status"] == RunStatus.RUNNING.value
         active_lock = app.state.harness.storage.get_active_run_lock(submitted["id"])
         assert active_lock is not None
@@ -382,7 +386,7 @@ def test_background_run_returns_before_executor_completes(tmp_path, monkeypatch)
         _wait_for_lock_heartbeat(app.state.harness.storage, active_lock.id, first_heartbeat)
 
         executor.release.set()
-        _wait_for_event(background_run_completed, "background run completion")
+        wait_for_worker_event(background_run_completed, "background run completion")
         completed = app.state.harness.storage.get_run(submitted["id"])
 
         assert completed is not None
@@ -430,7 +434,7 @@ def test_background_approval_returns_before_resumed_step_and_is_idempotent(tmp_p
             RunStatus.QUEUED.value,
             RunStatus.RUNNING.value,
         }
-        assert executor.started.wait(timeout=5)
+        wait_for_worker_event(executor.started, "approved step execution start")
 
         duplicate = client.post(
             f"/runs/{waiting_run['id']}/runtime-jobs/{patch_job['id']}/approve?background=true"
@@ -508,9 +512,9 @@ def test_background_approval_queues_next_segment_during_previous_segment_cleanup
             f"/runs/{waiting_run['id']}/runtime-jobs/{patch_job['id']}/approve?background=true"
         )
         assert first.status_code == 202
-        _wait_for_event(executor.started, "approved step execution")
+        wait_for_worker_event(executor.started, "approved step execution")
         executor.release.set()
-        _wait_for_event(previous_segment_returned, "previous segment return")
+        wait_for_worker_event(previous_segment_returned, "previous segment return")
 
         current_run = client.get(f"/runs/{waiting_run['id']}").json()
         assert current_run["status"] == RunStatus.WAITING.value
@@ -526,7 +530,7 @@ def test_background_approval_queues_next_segment_during_previous_segment_cleanup
         assert second.status_code == 202
 
         allow_previous_cleanup.set()
-        _wait_for_event(background_run_completed, "background run completion")
+        wait_for_worker_event(background_run_completed, "background run completion")
         completed = app.state.harness.storage.get_run(waiting_run["id"])
         assert completed is not None
         assert completed.status == RunStatus.COMPLETED
@@ -794,6 +798,7 @@ def test_worker_recovers_queued_run_with_running_queue_item_and_orphaned_lock(tm
             state.storage,
             run.id,
             [RunQueueItemStatus.CANCELLED, RunQueueItemStatus.COMPLETED],
+            timeout=ASYNC_WORKER_TIMEOUT_SECONDS,
         )
         queue_items = state.storage.list_run_queue_items_for_run(run.id)
         assert queue_items[0].id == old_queue_item.id
@@ -837,7 +842,7 @@ def test_worker_retries_transient_queue_item_read_without_stopping(tmp_path, mon
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        _wait_for_event(background_run_completed, "background run completion")
+        wait_for_worker_event(background_run_completed, "background run completion")
         completed = state.storage.get_run(submitted["id"])
 
         assert completed is not None
@@ -908,7 +913,7 @@ def test_worker_recovers_storage_error_after_run_activation(tmp_path, monkeypatc
             json={"task_id": task["id"], "background": True},
         ).json()
         try:
-            _wait_for_event(
+            wait_for_worker_event(
                 terminal_queue_write_started,
                 "terminal queue write",
             )
@@ -919,7 +924,7 @@ def test_worker_recovers_storage_error_after_run_activation(tmp_path, monkeypatc
         finally:
             allow_terminal_queue_write.set()
 
-        _wait_for_event(
+        wait_for_worker_event(
             background_run_completed,
             "background run completion",
         )
@@ -959,7 +964,7 @@ def test_worker_stop_leaves_backlog_persisted_and_restartable(tmp_path) -> None:
             "/runs",
             json={"task_id": task_ids[0], "background": True},
         ).json()
-        assert executor.started.wait(timeout=1)
+        wait_for_worker_event(executor.started, "shutdown test executor start")
         second = client.post(
             "/runs",
             json={"task_id": task_ids[1], "background": True},
@@ -1013,7 +1018,7 @@ def test_worker_retries_terminal_queue_write_without_state_contradiction(tmp_pat
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        _wait_for_event(background_run_completed, "background run completion")
+        wait_for_worker_event(background_run_completed, "background run completion")
         completed = state.storage.get_run(submitted["id"])
 
         assert completed is not None
@@ -1061,7 +1066,7 @@ def test_worker_retries_transient_terminal_lock_release_failure(tmp_path, monkey
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        _wait_for_event(background_run_completed, "background run completion")
+        wait_for_worker_event(background_run_completed, "background run completion")
         completed = state.storage.get_run(submitted["id"])
 
         assert completed is not None
@@ -1105,7 +1110,7 @@ def test_worker_reconciles_terminal_queue_state_after_persistent_write_failure(
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        _wait_for_event(terminal_queue_write_attempted, "terminal queue write attempt")
+        wait_for_worker_event(terminal_queue_write_attempted, "terminal queue write attempt")
         completed = state.storage.get_run(submitted["id"])
         assert completed is not None
         assert completed.status == RunStatus.COMPLETED
@@ -1118,6 +1123,7 @@ def test_worker_reconciles_terminal_queue_state_after_persistent_write_failure(
             recovered_app.state.harness.storage,
             submitted["id"],
             [RunQueueItemStatus.COMPLETED],
+            timeout=ASYNC_WORKER_TIMEOUT_SECONDS,
         )
 
 
@@ -1557,11 +1563,11 @@ def test_worker_terminalizes_waiting_run_after_segment_internal_failure(tmp_path
             json={"task_id": task["id"], "background": True},
         ).json()
 
-        _wait_for_event(
+        wait_for_worker_event(
             failure_injected,
             "waiting-run failure injection",
         )
-        _wait_for_event(
+        wait_for_worker_event(
             terminalization_finished,
             "waiting-run terminalization",
         )
@@ -1645,7 +1651,7 @@ def test_worker_trace_failure_does_not_interrupt_background_run(tmp_path, monkey
             "/runs",
             json={"task_id": task["id"], "background": True},
         ).json()
-        _wait_for_event(background_run_completed, "background run completion")
+        wait_for_worker_event(background_run_completed, "background run completion")
         completed = app.state.harness.storage.get_run(submitted["id"])
 
         assert completed is not None
@@ -1654,7 +1660,11 @@ def test_worker_trace_failure_does_not_interrupt_background_run(tmp_path, monkey
         assert worker.is_running is True
 
 
-def _wait_for_terminal_run(client: TestClient, run_id: str, timeout: float = 5) -> dict[str, object]:
+def _wait_for_terminal_run(
+    client: TestClient,
+    run_id: str,
+    timeout: float = ASYNC_WORKER_TIMEOUT_SECONDS,
+) -> dict[str, object]:
     deadline = monotonic() + timeout
     while monotonic() < deadline:
         run = client.get(f"/runs/{run_id}").json()
@@ -1662,16 +1672,6 @@ def _wait_for_terminal_run(client: TestClient, run_id: str, timeout: float = 5) 
             return run
         sleep(0.02)
     raise AssertionError(f"run did not finish within {timeout} seconds: {run_id}")
-
-
-def _wait_for_event(
-    event: Event,
-    description: str,
-    timeout: float = 15,
-) -> None:
-    if event.wait(timeout=timeout):
-        return
-    raise AssertionError(f"{description} was not observed within {timeout} seconds")
 
 
 def _observe_worker_action(
@@ -1730,7 +1730,7 @@ def _wait_for_runtime_job_status(
     run_id: str,
     job_id: str,
     expected: str,
-    timeout: float = 5,
+    timeout: float = ASYNC_WORKER_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     deadline = monotonic() + timeout
     while monotonic() < deadline:
@@ -1746,7 +1746,7 @@ def _wait_for_run_status(
     client: TestClient,
     run_id: str,
     expected: str,
-    timeout: float = 5,
+    timeout: float = ASYNC_WORKER_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     deadline = monotonic() + timeout
     while monotonic() < deadline:

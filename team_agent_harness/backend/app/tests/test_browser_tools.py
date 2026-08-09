@@ -36,6 +36,7 @@ from app.api import (
 )
 from app.main import create_app
 from app.packs.research import get_research_pack
+from app.tests.worker_test_utils import wait_for_worker_event
 
 
 class FakeBrowserSearchClient:
@@ -949,14 +950,16 @@ def test_background_research_does_not_gain_real_browser_access_after_submission(
             assert response.status_code == 201, response.text
             run = response.json()
             assert run["real_web_access_confirmed"] is False
-            assert plan_started.wait(timeout=2)
+            wait_for_worker_event(plan_started, "background research plan start")
 
             provider.search_client = search_client
             provider.fetch_client = fetch_client
             release_plan.set()
 
-            if not background_run_completed.wait(timeout=15):
-                raise AssertionError("background research run did not finish")
+            wait_for_worker_event(
+                background_run_completed,
+                "background research run completion",
+            )
             completed = app.state.harness.storage.get_run(run["id"])
         finally:
             release_plan.set()
