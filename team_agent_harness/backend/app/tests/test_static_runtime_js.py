@@ -6,6 +6,7 @@ import pytest
 
 
 RUNTIME_JS = Path(__file__).parents[1] / "static" / "runtime.js"
+NODE_SUBPROCESS_TIMEOUT_SECONDS = 30
 
 
 def _run_node(assertions: str) -> None:
@@ -20,7 +21,7 @@ def _run_node(assertions: str) -> None:
         encoding="utf-8",
         errors="replace",
         check=False,
-        timeout=10,
+        timeout=NODE_SUBPROCESS_TIMEOUT_SECONDS,
     )
     assert result.returncode == 0, result.stderr or result.stdout
 
@@ -30,31 +31,70 @@ def test_api_timeout_and_caller_abort_cover_response_body_read() -> None:
         r"""
 const assert = require("node:assert/strict");
 
+const bodyReadsStarted = [];
 function stalledResponse(signal) {
+  let markBodyReadStarted;
+  bodyReadsStarted.push(new Promise((resolve) => {
+    markBodyReadStarted = resolve;
+  }));
   return {
     ok: true,
     status: 200,
     headers: { get: () => "application/json" },
     text: () => new Promise((resolve, reject) => {
       signal.addEventListener("abort", () => reject(new Error("body aborted")), { once: true });
+      markBodyReadStarted();
     }),
   };
 }
 
+const testWatchdog = setTimeout(() => {
+  console.error(new Error("body-read abort test did not settle"));
+  process.exitCode = 1;
+}, 5000);
+
 (async () => {
+  const scheduledTimeouts = [];
   const api = HarnessRuntime.createApi({
     fetchImpl: async (_path, options) => stalledResponse(options.signal),
+    setTimeoutImpl: (callback, delay) => {
+      const timeout = {
+        active: true,
+        delay,
+        fire: () => {
+          assert.equal(timeout.active, true);
+          callback();
+        },
+      };
+      scheduledTimeouts.push(timeout);
+      return timeout;
+    },
+    clearTimeoutImpl: (timeout) => {
+      timeout.active = false;
+    },
   });
-  await assert.rejects(api("/slow-body", { timeoutMs: 20 }), /请求超时或已取消/);
+  const slowBody = api("/slow-body", { timeoutMs: 20 });
+  await bodyReadsStarted[0];
+  assert.equal(scheduledTimeouts[0].delay, 20);
+  scheduledTimeouts[0].fire();
+  await assert.rejects(slowBody, /请求超时或已取消/);
+  assert.equal(scheduledTimeouts[0].active, false);
 
   const caller = new AbortController();
   const pending = api("/caller-abort", { timeoutMs: 1000, signal: caller.signal });
-  setTimeout(() => caller.abort(), 10);
+  await bodyReadsStarted[1];
+  assert.equal(scheduledTimeouts[1].delay, 1000);
+  caller.abort();
   await assert.rejects(pending, /请求超时或已取消/);
-})().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+  assert.equal(scheduledTimeouts[1].active, false);
+})().then(
+  () => clearTimeout(testWatchdog),
+  (error) => {
+    clearTimeout(testWatchdog);
+    console.error(error);
+    process.exitCode = 1;
+  },
+);
 """
     )
 

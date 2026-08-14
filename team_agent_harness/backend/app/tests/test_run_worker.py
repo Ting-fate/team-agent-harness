@@ -1283,7 +1283,7 @@ def test_worker_recovers_storage_error_after_run_activation(tmp_path, monkeypatc
         assert state.run_worker.is_running is True
 
 
-def test_worker_stop_leaves_backlog_persisted_and_restartable(tmp_path) -> None:
+def test_worker_stop_leaves_backlog_persisted_and_restartable(tmp_path, monkeypatch) -> None:
     executor = BlockingExecutor()
     app = create_app(
         tmp_path / "harness.sqlite3",
@@ -1291,6 +1291,12 @@ def test_worker_stop_leaves_backlog_persisted_and_restartable(tmp_path) -> None:
         executor_factory=lambda: executor,
     )
     state = app.state.harness
+    background_run_completed = _observe_worker_action(
+        monkeypatch,
+        state.run_worker,
+        "background_run_completed",
+        expected_outcome=RunStatus.COMPLETED.value,
+    )
 
     with TestClient(app) as client:
         task_ids = []
@@ -1318,6 +1324,7 @@ def test_worker_stop_leaves_backlog_persisted_and_restartable(tmp_path) -> None:
         assert state.run_worker.stop(timeout=0.01) is False
         assert executor.steps == ["clarify_requirements"]
         executor.release.set()
+        wait_for_worker_event(background_run_completed, "shutdown test run completion")
         assert state.run_worker.stop(timeout=5) is True
         assert _wait_for_terminal_run(client, first["id"])["status"] == RunStatus.COMPLETED.value
         assert client.get(f"/runs/{second['id']}").json()["status"] == RunStatus.QUEUED.value
