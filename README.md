@@ -119,8 +119,13 @@ post-fix isolated Chrome pass covered `1440`, `390`, and `320` pixel layouts,
 found no page-level horizontal overflow, application request failure, console
 warning, or console error, and exercised task selection with Arrow/Enter plus
 Run selection with End/Space. Narrow navigation and detail-tab rows use bounded
-horizontal scrolling. These are local worktree results; remote GitHub Actions
-status is reported separately after publication.
+horizontal scrolling. The published code snapshot at commit `5643b69` passed
+[GitHub Actions run `31795016194`](https://github.com/Ting-fate/team-agent-harness/actions/runs/31795016194)
+on Windows Python 3.12, 3.13, and 3.14; every job reported
+`1325 passed, 1 skipped, 1 warning`. The final CI fixes are test-only: they
+replace wall-clock races with explicit completion barriers and isolate the
+setup state-machine test from repeated environment-wide `pip check` timing.
+Production worker, launcher, model, and request timeout behavior is unchanged.
 
 ## Developer Setup
 
