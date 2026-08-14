@@ -98,18 +98,23 @@ command and tool boundary.
 ## Verification
 
 The 2026-08-14 release candidate passed the full local backend suite with
-`1314 passed, 5 skipped, 1 warning`, plus compile, dependency, JavaScript,
+`1321 passed, 5 skipped, 1 warning`, plus compile, dependency, JavaScript,
 PowerShell, YAML/JSON, whitespace, and high-confidence credential checks. A
 fresh temporary-data Uvicorn service also completed a six-step mock Research
 run through the real stdio MCP process: all 12 tools were present, the quality
 report passed 28 checks, the final artifact was hash-bound and readable, and no
 error trace remained. The MCP adapter now enforces one monotonic wall-clock
 deadline across every HTTP call in a tool invocation and bounds cached Run
-bindings to a 128-entry LRU. Launcher rollback restores a replaceable prior
-Harness, credential files use same-directory atomic replacement, work-state
-inspection fails closed after 20 Runs, and both Run listboxes implement roving
-keyboard navigation. No paid model was called. The normal Harness and LiteLLM
-services then passed live health checks on ports `8014` and `4000`. A fresh
+bindings to a 128-entry LRU. Launcher startup verifies an occupied Harness port
+before support-service side effects, binds later readiness checks to the same
+PID and creation time, and requires a real interpreter file before starting or
+restarting Harness. Credential files use same-directory atomic replacement;
+ACL restoration failure rolls back content and permissions, while an incomplete
+rollback retains the original backup. Service rollback restores a replaceable
+prior Harness, work-state inspection fails closed after 20 Runs, and both Run
+listboxes implement roving keyboard navigation. No paid model was called. The
+normal Harness and LiteLLM services then passed live health checks on ports
+`8014` and `4000`. A fresh
 post-fix isolated Chrome pass covered `1440`, `390`, and `320` pixel layouts,
 found no page-level horizontal overflow, application request failure, console
 warning, or console error, and exercised task selection with Arrow/Enter plus

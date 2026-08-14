@@ -5,6 +5,7 @@ param(
     [int]$ChromeDebugPort = 9223,
     [int]$ModelTimeoutSeconds = 180,
     [int]$LiteLlmMaxRetries = 0,
+    [string]$HarnessPython = "",
     [string]$LiteLlmPython = "",
     [string]$EnvFile = "",
     [switch]$FunctionsOnly
@@ -72,14 +73,15 @@ $LiteLlmConfig = Join-Path $ConfigDir "litellm.config.example.yaml"
 $LocalRoutingConfig = Join-Path $ConfigDir "model-routing.local.json"
 $ExampleRoutingConfig = Join-Path $ConfigDir "model-routing.litellm.example.json"
 $RoutingConfig = if (Test-Path $LocalRoutingConfig) { $LocalRoutingConfig } else { $ExampleRoutingConfig }
-$Python = Join-Path $Root ".venv\Scripts\python.exe"
+$DefaultHarnessPython = Join-Path $Root ".venv\Scripts\python.exe"
+$Python = if ($HarnessPython) { $HarnessPython } else { $DefaultHarnessPython }
 $DefaultLiteLlmPython = Join-Path $Root ".venv-litellm\Scripts\python.exe"
 $LiteLlmPythonExe = if ($LiteLlmPython) {
     $LiteLlmPython
 } elseif (Test-Path $DefaultLiteLlmPython) {
     $DefaultLiteLlmPython
 } else {
-    $Python
+    $DefaultHarnessPython
 }
 $LiteLlmRunner = Join-Path $PSScriptRoot "run_litellm_proxy.py"
 $ChromeCdpProxy = Join-Path $PSScriptRoot "chrome_cdp_proxy.py"
@@ -268,7 +270,7 @@ function Test-ChromeProxyCommandArguments {
         [int]$Port
     )
     return $Arguments.Count -eq 8 `
-        -and (Test-SameExecutablePath $Arguments[0] $Python) `
+        -and (Test-SameExecutablePath $Arguments[0] $DefaultHarnessPython) `
         -and (Test-SameExecutablePath $Arguments[1] $ChromeCdpProxy) `
         -and $Arguments[2] -ceq "--host" `
         -and $Arguments[3] -ceq "127.0.0.1" `
@@ -280,6 +282,7 @@ function Test-ChromeProxyCommandArguments {
 
 $HarnessBasePython = Get-PythonBaseExecutable $Python
 $LiteLlmBasePython = Get-PythonBaseExecutable $LiteLlmPythonExe
+$ChromeProxyBasePython = Get-PythonBaseExecutable $DefaultHarnessPython
 
 function Get-ProcessCreationTicks {
     param([object]$ProcessInfo)
@@ -511,7 +514,7 @@ function Test-ChromeProxyProcessInfo {
         if (-not $processInfo -or -not $processInfo.CommandLine) {
             return $false
         }
-        $expectedExecutables = @($Python, $HarnessBasePython)
+        $expectedExecutables = @($DefaultHarnessPython, $ChromeProxyBasePython)
         $executableMatches = @($expectedExecutables | Where-Object {
             $_ -and (Test-SameExecutablePath $processInfo.ExecutablePath $_)
         }).Count -gt 0
@@ -780,6 +783,40 @@ function Test-HarnessEndpoint {
     }
 }
 
+function Get-RevalidatedHarnessListener {
+    param(
+        [int]$Port,
+        [object]$InitialIdentity
+    )
+    $processId = Get-ListenerProcessId -Port $Port
+    if (-not $processId) {
+        if ($InitialIdentity) {
+            throw "The Team Agent Harness process on port $Port changed during startup; the verified instance disappeared."
+        }
+        return $null
+    }
+    $processInfo = Get-UniqueListenerProcessInfo -Port $Port
+    $identity = Get-ProcessInfoIdentity $processInfo
+    if (
+        -not $identity `
+        -or [int]$identity.ProcessId -ne [int]$processId `
+        -or -not (Test-HarnessProcessInfo -ProcessInfo $processInfo -Port $Port)
+    ) {
+        throw "Port $Port is occupied by PID $processId, but it is not the expected Team Agent Harness service."
+    }
+    if ($InitialIdentity -and -not (Test-SameProcessInstance $processInfo $InitialIdentity)) {
+        throw "The Team Agent Harness process on port $Port changed during startup; refusing to probe a replacement instance."
+    }
+    if (-not (Test-HarnessEndpoint -Port $Port)) {
+        throw "The expected Team Agent Harness process on port $Port did not pass its readiness checks."
+    }
+    return [PSCustomObject]@{
+        ProcessId = [int]$processId
+        ProcessInfo = $processInfo
+        Identity = $identity
+    }
+}
+
 function Get-HarnessLiteLlmProxyEnabled {
     param([int]$Port)
     $providerResponse = Invoke-LocalHttpGet -Uri "http://127.0.0.1:$Port/model-providers" |
@@ -1043,14 +1080,26 @@ if ($FunctionsOnly) {
 
 $StartedServices = [System.Collections.Generic.List[object]]::new()
 try {
+$InitialHarnessIdentity = $null
+$InitialHarnessPid = Get-ListenerProcessId -Port $HarnessPort
+if ($InitialHarnessPid) {
+    $InitialHarnessInfo = Get-UniqueListenerProcessInfo -Port $HarnessPort
+    $InitialHarnessIdentity = Get-ProcessInfoIdentity $InitialHarnessInfo
+    if (
+        -not $InitialHarnessIdentity `
+        -or [int]$InitialHarnessIdentity.ProcessId -ne [int]$InitialHarnessPid `
+        -or -not (Test-HarnessProcessInfo -ProcessInfo $InitialHarnessInfo -Port $HarnessPort)
+    ) {
+        throw "Port $HarnessPort is occupied by PID $InitialHarnessPid, but it is not the expected Team Agent Harness service."
+    }
+} elseif (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+    throw "Python venv not found: $Python"
+}
+
 try {
     Import-LocalEnvFile $LocalEnvFile
 } catch {
     Add-SupportWarning "Local environment file could not be loaded: $($_.Exception.Message)"
-}
-
-if (-not (Test-Path $Python)) {
-    throw "Python venv not found: $Python"
 }
 
 $env:TEAM_AGENT_ALLOW_REAL_MODEL_CALLS = "1"
@@ -1198,20 +1247,13 @@ if ($LiteLlmReady) {
     Remove-Item Env:LITELLM_BASE_URL -ErrorAction SilentlyContinue
 }
 
-$HarnessPid = Get-ListenerProcessId -Port $HarnessPort
-if ($HarnessPid) {
-    $HarnessInfo = Get-UniqueListenerProcessInfo -Port $HarnessPort
-    $HarnessIdentity = Get-ProcessInfoIdentity $HarnessInfo
-    if (
-        -not $HarnessIdentity `
-        -or [int]$HarnessIdentity.ProcessId -ne [int]$HarnessPid `
-        -or -not (Test-HarnessProcessInfo -ProcessInfo $HarnessInfo -Port $HarnessPort)
-    ) {
-        throw "Port $HarnessPort is occupied by PID $HarnessPid, but it is not the expected Team Agent Harness service."
-    }
-    if (-not (Test-HarnessEndpoint -Port $HarnessPort)) {
-        throw "The expected Team Agent Harness process on port $HarnessPort did not pass its readiness checks."
-    }
+$HarnessListener = Get-RevalidatedHarnessListener `
+    -Port $HarnessPort `
+    -InitialIdentity $InitialHarnessIdentity
+$HarnessPid = if ($HarnessListener) { [int]$HarnessListener.ProcessId } else { $null }
+if ($HarnessListener) {
+    $HarnessInfo = $HarnessListener.ProcessInfo
+    $HarnessIdentity = $HarnessListener.Identity
     $existingProxyEnabled = Get-HarnessLiteLlmProxyEnabled -Port $HarnessPort
     $workState = if ($existingProxyEnabled -ne $LiteLlmReady) {
         Get-HarnessWorkState -Port $HarnessPort
@@ -1223,6 +1265,9 @@ if ($HarnessPid) {
         -CurrentProxyReady $LiteLlmReady `
         -WorkState $workState
     if ($reuseAction -eq "restart_idle") {
+        if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+            throw "Python venv not found: $Python"
+        }
         if (Stop-ExpectedHarnessProcess `
             -ProcessId $HarnessPid `
             -Port $HarnessPort `
@@ -1253,6 +1298,9 @@ if ($HarnessPid) {
     }
 }
 if (-not $HarnessPid) {
+    if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+        throw "Python venv not found: $Python"
+    }
     $HarnessService = Start-HarnessService -Port $HarnessPort
     [void]$StartedServices.Add($HarnessService)
 }
@@ -1274,7 +1322,7 @@ if ($env:TEAM_AGENT_ALLOW_BROWSER_ACCESS -eq "1" -and $env:TEAM_AGENT_BROWSER_PR
         Add-SupportWarning "Chrome CDP proxy is unavailable. Harness remains available without browser access."
     } else {
         try {
-            $BrowserProxyProcess = Start-Process -FilePath $Python `
+            $BrowserProxyProcess = Start-Process -FilePath $DefaultHarnessPython `
                 -ArgumentList @($ChromeCdpProxy, "--host", "127.0.0.1", "--port", "$BrowserProxyPort", "--chrome-debug-port", "$ChromeDebugPort") `
                 -WorkingDirectory $Root `
                 -RedirectStandardOutput $ChromeProxyLog `

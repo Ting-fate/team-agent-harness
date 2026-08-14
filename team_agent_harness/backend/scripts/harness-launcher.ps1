@@ -325,6 +325,14 @@ function Read-EnvFile {
     return $values
 }
 
+function Set-LauncherFileAccessControl {
+    param(
+        [string]$Path,
+        [object]$AccessControl
+    )
+    [System.IO.File]::SetAccessControl($Path, $AccessControl)
+}
+
 function Commit-AtomicEnvFile {
     param(
         [string]$TemporaryPath,
@@ -332,14 +340,30 @@ function Commit-AtomicEnvFile {
     )
     if (Test-Path -LiteralPath $DestinationPath) {
         $destinationAcl = [System.IO.File]::GetAccessControl($DestinationPath)
-        [System.IO.File]::SetAccessControl($TemporaryPath, $destinationAcl)
+        Set-LauncherFileAccessControl -Path $TemporaryPath -AccessControl $destinationAcl
         $directory = [System.IO.Path]::GetDirectoryName($DestinationPath)
         $fileName = [System.IO.Path]::GetFileName($DestinationPath)
         $backupPath = Join-Path $directory ".$fileName.$([Guid]::NewGuid().ToString('N')).bak"
+        $backupCanBeRemoved = $false
         try {
             [System.IO.File]::Replace($TemporaryPath, $DestinationPath, $backupPath, $true)
+            try {
+                Set-LauncherFileAccessControl -Path $DestinationPath -AccessControl $destinationAcl
+                $backupCanBeRemoved = $true
+            } catch {
+                $commitError = $_
+                try {
+                    [System.IO.File]::Copy($backupPath, $DestinationPath, $true)
+                    Set-LauncherFileAccessControl -Path $DestinationPath -AccessControl $destinationAcl
+                    $backupCanBeRemoved = $true
+                } catch {
+                    $rollbackError = $_
+                    throw "Atomic environment file commit failed and rollback was incomplete. Original backup retained at '$backupPath'. Commit error: $($commitError.Exception.Message) Rollback error: $($rollbackError.Exception.Message)"
+                }
+                throw $commitError
+            }
         } finally {
-            if (Test-Path -LiteralPath $backupPath) {
+            if ($backupCanBeRemoved -and (Test-Path -LiteralPath $backupPath)) {
                 Remove-Item -LiteralPath $backupPath -Force
             }
         }

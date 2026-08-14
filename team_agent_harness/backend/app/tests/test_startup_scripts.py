@@ -29,6 +29,24 @@ HARNESS_REQUIRED_PATHS = (
     "/workflow-packs/{pack_name}/team-template",
     "/runs/{run_id}/team",
 )
+POWERSHELL_PROTECTED_ACL_HELPERS = r"""
+function Set-ProtectedTestFileAcl([string]$Path) {
+    $directory = Split-Path -Parent $Path
+    $directoryAcl = [System.IO.Directory]::GetAccessControl($directory)
+    $directoryAcl.SetAccessRuleProtection($false, $true)
+    [System.IO.Directory]::SetAccessControl($directory, $directoryAcl)
+    $fileAcl = [System.IO.File]::GetAccessControl($Path)
+    $fileAcl.SetAccessRuleProtection($true, $true)
+    [System.IO.File]::SetAccessControl($Path, $fileAcl)
+}
+function Get-TestAclSemantics([string]$Path) {
+    $acl = [System.IO.File]::GetAccessControl($Path)
+    $sections = [System.Security.AccessControl.AccessControlSections]::Owner `
+        -bor [System.Security.AccessControl.AccessControlSections]::Group `
+        -bor [System.Security.AccessControl.AccessControlSections]::Access
+    return "$($acl.AreAccessRulesProtected)|$($acl.GetSecurityDescriptorSddlForm($sections))"
+}
+"""
 
 
 def _service_handler(
@@ -239,6 +257,12 @@ def _configured_start_script_environment() -> dict[str, str]:
     return environment
 
 
+def _reuse_start_script_environment(*, configured: bool = False) -> dict[str, str]:
+    environment = _configured_start_script_environment() if configured else _start_script_environment()
+    environment["TEAM_AGENT_ALLOW_BROWSER_ACCESS"] = "0"
+    return environment
+
+
 def test_start_script_prefers_dedicated_litellm_environment() -> None:
     script = (ROOT / "scripts" / "start-litellm-harness.ps1").read_text(encoding="utf-8")
 
@@ -247,7 +271,30 @@ def test_start_script_prefers_dedicated_litellm_environment() -> None:
 
     assert dedicated_assignment in script
     assert dedicated_selection in script
-    assert script.index(dedicated_selection) < script.index("$Python\n}")
+    selection = script[script.index("$LiteLlmPythonExe =") : script.index("$LiteLlmRunner =")]
+    assert "$DefaultHarnessPython" in selection
+    assert "$Python" not in selection
+
+
+def test_start_script_keeps_harness_python_out_of_support_runtimes() -> None:
+    script = (ROOT / "scripts" / "start-litellm-harness.ps1").read_text(encoding="utf-8")
+    chrome_arguments = script[
+        script.index("function Test-ChromeProxyCommandArguments") : script.index("$HarnessBasePython =")
+    ]
+    chrome_identity = script[
+        script.index("function Test-ChromeProxyProcessInfo") : script.index("function Test-ChromeProxyProcess {")
+    ]
+    chrome_start = script[
+        script.index("$BrowserProxyReady = $false") : script.index("Write-Host \"LiteLLM Proxy:")
+    ]
+
+    assert "$DefaultHarnessPython" in chrome_arguments
+    assert "$DefaultHarnessPython" in chrome_identity
+    assert "$ChromeProxyBasePython" in script
+    assert "$Python" not in chrome_arguments
+    assert "$Python" not in chrome_identity
+    assert "Start-Process -FilePath $DefaultHarnessPython" in chrome_start
+    assert "Start-Process -FilePath $Python" not in chrome_start
 
 
 def test_start_script_requires_atomic_browser_proxy_with_pinned_egress() -> None:
@@ -320,6 +367,32 @@ def test_start_script_gates_litellm_before_starting_control_plane() -> None:
         harness_gate:harness_start
     ]
     assert harness_start < script.index("$BrowserProxyProcess = Start-Process")
+
+
+def test_start_script_preflights_harness_before_side_effects_and_revalidates_later() -> None:
+    script = (ROOT / "scripts" / "start-litellm-harness.ps1").read_text(encoding="utf-8")
+    executable_body = script[script.index("$StartedServices =") :]
+
+    preflight_listener = executable_body.index("$InitialHarnessPid = Get-ListenerProcessId")
+    preflight_identity = executable_body.index("Test-HarnessProcessInfo", preflight_listener)
+    harness_python_guard = "Test-Path -LiteralPath $Python -PathType Leaf"
+    preflight_python = executable_body.index(f"elseif (-not ({harness_python_guard}))")
+    output_creation = executable_body.index("New-Item -ItemType Directory -Force $OutputDir")
+    litellm_probe = executable_body.index("$LiteLlmPid = Get-ListenerProcessId")
+    later_listener = executable_body.index("$HarnessListener = Get-RevalidatedHarnessListener")
+    restart_block = executable_body[
+        executable_body.index('if ($reuseAction -eq "restart_idle")') : executable_body.index(
+            '} elseif ($reuseAction -eq "reuse_active")'
+        )
+    ]
+    assert "[string]$HarnessPython" in script
+    assert preflight_listener < preflight_identity < preflight_python
+    assert preflight_python < output_creation < litellm_probe < later_listener
+    assert later_listener < executable_body.rindex(f"if (-not ({harness_python_guard}))")
+    assert restart_block.index(harness_python_guard) < restart_block.index(
+        "Stop-ExpectedHarnessProcess"
+    )
+    assert executable_body.count(harness_python_guard) == 3
 
 
 def test_download_entry_resolves_setup_relative_to_the_extracted_repository() -> None:
@@ -498,6 +571,8 @@ def test_start_script_keeps_healthy_services_when_env_is_invalid(tmp_path: Path)
                 str(litellm_port),
                 "-HarnessPort",
                 str(harness_port),
+                "-HarnessPython",
+                sys.executable,
                 "-BrowserProxyPort",
                 str(browser_port),
                 "-LiteLlmPython",
@@ -506,7 +581,7 @@ def test_start_script_keeps_healthy_services_when_env_is_invalid(tmp_path: Path)
                 str(invalid_env),
             ],
             cwd=ROOT,
-            env=_start_script_environment(),
+            env=_reuse_start_script_environment(),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -538,11 +613,15 @@ def test_start_script_litellm_port_conflict_is_only_a_support_warning(tmp_path: 
                 str(litellm_port),
                 "-HarnessPort",
                 str(harness_port),
+                "-HarnessPython",
+                sys.executable,
                 "-LiteLlmPython",
                 str(tmp_path / "missing-litellm-python.exe"),
+                "-EnvFile",
+                str(tmp_path / "missing.env"),
             ],
             cwd=ROOT,
-            env=_configured_start_script_environment(),
+            env=_reuse_start_script_environment(configured=True),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -584,11 +663,98 @@ def test_start_script_checks_litellm_process_identity_before_http_probe() -> Non
 
 def test_start_script_checks_harness_and_chrome_process_identity_before_http() -> None:
     script = (ROOT / "scripts" / "start-litellm-harness.ps1").read_text(encoding="utf-8")
-    harness_path = script[script.index("$HarnessPid = Get-ListenerProcessId") : script.index("if (-not $HarnessPid)")]
+    harness_path = script[
+        script.index("function Get-RevalidatedHarnessListener") : script.index(
+            "function Get-HarnessLiteLlmProxyEnabled"
+        )
+    ]
     chrome_path = script[script.index("$BrowserProxyPid = Get-ListenerProcessId") : script.index("} elseif (-not (Test-Path $ChromeCdpProxy))")]
 
-    assert harness_path.index("Test-HarnessProcess") < harness_path.index("Test-HarnessEndpoint")
+    assert harness_path.index("Test-HarnessProcessInfo") < harness_path.index("Test-SameProcessInstance")
+    assert harness_path.index("Test-SameProcessInstance") < harness_path.index("Test-HarnessEndpoint")
     assert chrome_path.index("Test-ChromeProxyProcess") < chrome_path.index("Test-ChromeProxyEndpoint")
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for startup behavior testing")
+def test_start_script_revalidation_rejects_replaced_instance_before_http() -> None:
+    start_script = str(ROOT / "scripts" / "start-litellm-harness.ps1").replace("'", "''")
+    command = f"""
+. '{start_script}' -FunctionsOnly
+$script:HttpCalls = 0
+$script:ListenerPid = 4242
+$initialCreation = [DateTime]::UtcNow.AddMinutes(-5)
+$script:CurrentCreation = $initialCreation.AddSeconds(1)
+$initialIdentity = [PSCustomObject]@{{
+    ProcessId = 4242
+    CreationTicks = $initialCreation.Ticks
+}}
+function Get-ListenerProcessId {{ return $script:ListenerPid }}
+function Get-UniqueListenerProcessInfo {{
+    return [PSCustomObject]@{{
+        ProcessId = 4242
+        CreationDate = $script:CurrentCreation
+        ExecutablePath = $Python
+        CommandLine = ''
+    }}
+}}
+function Test-HarnessProcessInfo {{ return $true }}
+function Test-HarnessEndpoint {{
+    $script:HttpCalls++
+    return $true
+}}
+$replacedRejected = $false
+try {{
+    [void](Get-RevalidatedHarnessListener -Port 8014 -InitialIdentity $initialIdentity)
+}} catch {{
+    $replacedRejected = $_.Exception.Message -like '*changed during startup*'
+}}
+$callsAfterReplacement = $script:HttpCalls
+$script:ListenerPid = $null
+$disappearedRejected = $false
+try {{
+    [void](Get-RevalidatedHarnessListener -Port 8014 -InitialIdentity $initialIdentity)
+}} catch {{
+    $disappearedRejected = $_.Exception.Message -like '*verified instance disappeared*'
+}}
+$callsAfterDisappearance = $script:HttpCalls
+$freePortResult = Get-RevalidatedHarnessListener -Port 8014 -InitialIdentity $null
+$callsAfterInitialFreePort = $script:HttpCalls
+$script:ListenerPid = 4242
+$script:CurrentCreation = $initialCreation
+$sameInstance = Get-RevalidatedHarnessListener -Port 8014 -InitialIdentity $initialIdentity
+[PSCustomObject]@{{
+    ReplacedRejected = $replacedRejected
+    CallsAfterReplacement = $callsAfterReplacement
+    DisappearedRejected = $disappearedRejected
+    CallsAfterDisappearance = $callsAfterDisappearance
+    InitialFreePortReturnedNull = $null -eq $freePortResult
+    CallsAfterInitialFreePort = $callsAfterInitialFreePort
+    SameInstancePid = $sameInstance.ProcessId
+    FinalHttpCalls = $script:HttpCalls
+}} | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip()) == {
+        "ReplacedRejected": True,
+        "CallsAfterReplacement": 0,
+        "DisappearedRejected": True,
+        "CallsAfterDisappearance": 0,
+        "InitialFreePortReturnedNull": True,
+        "CallsAfterInitialFreePort": 0,
+        "SameInstancePid": 4242,
+        "FinalHttpCalls": 1,
+    }
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for startup behavior testing")
@@ -745,7 +911,7 @@ def test_start_script_cleans_verified_descendant_listener_after_parent_exits(tmp
     port = _unused_loopback_port()
     start_script = str(ROOT / "scripts" / "start-litellm-harness.ps1").replace("'", "''")
     powershell_path = str(POWERSHELL).replace("'", "''")
-    python_path = str(ROOT / ".venv" / "Scripts" / "python.exe").replace("'", "''")
+    python_path = str(Path(sys.executable)).replace("'", "''")
     root_path = str(ROOT).replace("'", "''")
     child_command = f"""
 $child = Start-Process -FilePath '{python_path}' `
@@ -757,7 +923,7 @@ Start-Sleep -Seconds 4
 """
     encoded_child_command = base64.b64encode(child_command.encode("utf-16-le")).decode("ascii")
     command = f"""
-. '{start_script}' -FunctionsOnly
+. '{start_script}' -FunctionsOnly -HarnessPython '{python_path}'
 $spawned = Start-Process -FilePath '{powershell_path}' `
     -ArgumentList @('-NoProfile', '-EncodedCommand', '{encoded_child_command}') `
     -WindowStyle Hidden `
@@ -940,13 +1106,15 @@ def test_start_script_rejects_unrelated_harness_shape_without_sending_http(tmp_p
                 str(ROOT / "scripts" / "start-litellm-harness.ps1"),
                 "-HarnessPort",
                 str(harness_port),
+                "-HarnessPython",
+                str(tmp_path / "missing-harness-python.exe"),
                 "-LiteLlmPython",
                 str(tmp_path / "missing-litellm-python.exe"),
                 "-EnvFile",
                 str(tmp_path / "missing.env"),
             ],
             cwd=ROOT,
-            env=_start_script_environment(),
+            env=_reuse_start_script_environment(),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -958,6 +1126,65 @@ def test_start_script_rejects_unrelated_harness_shape_without_sending_http(tmp_p
     assert result.returncode != 0
     assert "not the expected Team Agent Harness service" in result.stderr
     assert requests == []
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for startup behavior testing")
+@pytest.mark.parametrize("harness_python_kind", ["missing", "directory"])
+def test_start_script_invalid_harness_python_fails_before_support_side_effects(
+    tmp_path: Path,
+    harness_python_kind: str,
+) -> None:
+    project_root = tmp_path / "isolated-project"
+    copied_scripts = project_root / "scripts"
+    copied_scripts.mkdir(parents=True)
+    copied_start_script = copied_scripts / "start-litellm-harness.ps1"
+    shutil.copy2(ROOT / "scripts" / "start-litellm-harness.ps1", copied_start_script)
+    harness_port = _unused_loopback_port()
+    browser_port = _unused_loopback_port()
+    requests: list[str] = []
+    harness_python = tmp_path / f"{harness_python_kind}-harness-python"
+    if harness_python_kind == "directory":
+        harness_python.mkdir()
+
+    with _healthy_service("litellm", requests) as litellm_port:
+        result = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(copied_start_script),
+                "-HarnessPort",
+                str(harness_port),
+                "-HarnessPython",
+                str(harness_python),
+                "-LiteLlmPort",
+                str(litellm_port),
+                "-LiteLlmPython",
+                sys.executable,
+                "-BrowserProxyPort",
+                str(browser_port),
+                "-EnvFile",
+                str(tmp_path / "missing.env"),
+            ],
+            cwd=project_root,
+            env=_configured_start_script_environment(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+
+    assert result.returncode != 0
+    assert "Python venv not found" in result.stderr
+    assert requests == []
+    assert not (project_root / "output").exists()
+    for port in (harness_port, browser_port):
+        with pytest.raises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=0.2)
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for startup behavior testing")
@@ -975,6 +1202,8 @@ def test_start_script_missing_credentials_do_not_block_existing_harness(tmp_path
                 str(ROOT / "scripts" / "start-litellm-harness.ps1"),
                 "-HarnessPort",
                 str(harness_port),
+                "-HarnessPython",
+                sys.executable,
                 "-LiteLlmPort",
                 str(unused_support_port),
                 "-LiteLlmPython",
@@ -983,7 +1212,7 @@ def test_start_script_missing_credentials_do_not_block_existing_harness(tmp_path
                 str(tmp_path / "missing.env"),
             ],
             cwd=ROOT,
-            env=_start_script_environment(),
+            env=_reuse_start_script_environment(),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1219,27 +1448,24 @@ def test_launcher_save_env_atomically_preserves_acl_and_leaves_no_temp_file(tmp_
     command = f"""
 . '{launcher_path}' -FunctionsOnly
 $script:EnvFile = '{env_path}'
-function Get-AclSemantics([string]$Path) {{
-    $acl = [System.IO.File]::GetAccessControl($Path)
-    $rules = @($acl.GetAccessRules(
-        $true,
-        $true,
-        [System.Security.Principal.SecurityIdentifier]
-    ) | ForEach-Object {{
-        "$($_.IdentityReference.Value)|$($_.AccessControlType)|$([int]$_.FileSystemRights)|$($_.InheritanceFlags)|$($_.PropagationFlags)|$($_.IsInherited)"
-    }} | Sort-Object)
-    return "$($acl.Owner)|$($acl.Group)|$($rules -join ';')"
-}}
-$beforeAcl = Get-AclSemantics $script:EnvFile
+{POWERSHELL_PROTECTED_ACL_HELPERS}
+Set-ProtectedTestFileAcl $script:EnvFile
+$directoryProtected = [System.IO.Directory]::GetAccessControl((Split-Path -Parent $script:EnvFile)).AreAccessRulesProtected
+$beforeProtected = [System.IO.File]::GetAccessControl($script:EnvFile).AreAccessRulesProtected
+$beforeAcl = Get-TestAclSemantics $script:EnvFile
 Save-EnvFile `
     -LiteLlmApiKey 'local-value' `
     -OpenAiApiKey 'openai-value' `
     -OpenAiApiBase 'https://relay.invalid/v1' `
     -DeepSeekApiKey 'deepseek-value'
-$afterAcl = Get-AclSemantics $script:EnvFile
+$afterProtected = [System.IO.File]::GetAccessControl($script:EnvFile).AreAccessRulesProtected
+$afterAcl = Get-TestAclSemantics $script:EnvFile
 $tempPattern = ".$(Split-Path -Leaf $script:EnvFile).*.tmp"
 $backupPattern = ".$(Split-Path -Leaf $script:EnvFile).*.bak"
 [PSCustomObject]@{{
+    DirectoryProtected = $directoryProtected
+    BeforeProtected = $beforeProtected
+    AfterProtected = $afterProtected
     SameAcl = $beforeAcl -ceq $afterAcl
     TempCount = @(Get-ChildItem -LiteralPath (Split-Path -Parent $script:EnvFile) -Filter $tempPattern).Count
     BackupCount = @(Get-ChildItem -LiteralPath (Split-Path -Parent $script:EnvFile) -Filter $backupPattern).Count
@@ -1258,6 +1484,9 @@ $backupPattern = ".$(Split-Path -Leaf $script:EnvFile).*.bak"
 
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip())
+    assert payload["DirectoryProtected"] is False, payload
+    assert payload["BeforeProtected"] is True, payload
+    assert payload["AfterProtected"] is True, payload
     assert payload["SameAcl"] is True, payload
     assert payload["TempCount"] == 0
     assert payload["BackupCount"] == 0
@@ -1312,14 +1541,157 @@ $tempPattern = ".$(Split-Path -Leaf $script:EnvFile).*.tmp"
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for launcher behavior testing")
+def test_launcher_acl_commit_failure_rolls_back_original_file(tmp_path: Path) -> None:
+    env_file = tmp_path / "launcher.env"
+    original = "# original\nOPENAI_API_KEY=old\n"
+    env_file.write_text(original, encoding="utf-8")
+    original_on_disk = env_file.read_bytes().decode("utf-8")
+    launcher_path = str(LAUNCHER).replace("'", "''")
+    env_path = str(env_file).replace("'", "''")
+    temporary_path = str(tmp_path / "launcher.tmp").replace("'", "''")
+    command = f"""
+. '{launcher_path}' -FunctionsOnly
+{POWERSHELL_PROTECTED_ACL_HELPERS}
+Set-ProtectedTestFileAcl '{env_path}'
+$beforeAcl = Get-TestAclSemantics '{env_path}'
+$beforeProtected = [System.IO.File]::GetAccessControl('{env_path}').AreAccessRulesProtected
+$directoryProtected = [System.IO.Directory]::GetAccessControl((Split-Path -Parent '{env_path}')).AreAccessRulesProtected
+$script:AclCallCount = 0
+function Set-LauncherFileAccessControl([string]$Path, [object]$AccessControl) {{
+    $script:AclCallCount++
+    if ($script:AclCallCount -eq 2) {{ throw 'forced destination ACL failure' }}
+    [System.IO.File]::SetAccessControl($Path, $AccessControl)
+}}
+[System.IO.File]::WriteAllText('{temporary_path}', 'replacement')
+$failed = $false
+try {{
+    Commit-AtomicEnvFile -TemporaryPath '{temporary_path}' -DestinationPath '{env_path}'
+}} catch {{
+    $failed = $_.Exception.Message -eq 'forced destination ACL failure'
+}}
+$backupPattern = ".$(Split-Path -Leaf '{env_path}').*.bak"
+$afterAcl = Get-TestAclSemantics '{env_path}'
+$afterProtected = [System.IO.File]::GetAccessControl('{env_path}').AreAccessRulesProtected
+[PSCustomObject]@{{
+    Failed = $failed
+    AclCallCount = $script:AclCallCount
+    DirectoryProtected = $directoryProtected
+    BeforeProtected = $beforeProtected
+    AfterProtected = $afterProtected
+    SameAcl = $beforeAcl -ceq $afterAcl
+    Content = [System.IO.File]::ReadAllText('{env_path}')
+    TempExists = Test-Path -LiteralPath '{temporary_path}'
+    BackupCount = @(Get-ChildItem -LiteralPath (Split-Path -Parent '{env_path}') -Filter $backupPattern).Count
+}} | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip()) == {
+        "Failed": True,
+        "AclCallCount": 3,
+        "DirectoryProtected": False,
+        "BeforeProtected": True,
+        "AfterProtected": True,
+        "SameAcl": True,
+        "Content": original_on_disk,
+        "TempExists": False,
+        "BackupCount": 0,
+    }
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for launcher behavior testing")
+def test_launcher_incomplete_acl_rollback_retains_original_backup(tmp_path: Path) -> None:
+    env_file = tmp_path / "launcher.env"
+    original = "# original\nOPENAI_API_KEY=old\n"
+    env_file.write_text(original, encoding="utf-8")
+    original_on_disk = env_file.read_bytes().decode("utf-8")
+    launcher_path = str(LAUNCHER).replace("'", "''")
+    env_path = str(env_file).replace("'", "''")
+    temporary_path = str(tmp_path / "launcher.tmp").replace("'", "''")
+    command = f"""
+. '{launcher_path}' -FunctionsOnly
+{POWERSHELL_PROTECTED_ACL_HELPERS}
+Set-ProtectedTestFileAcl '{env_path}'
+$beforeAcl = Get-TestAclSemantics '{env_path}'
+$beforeProtected = [System.IO.File]::GetAccessControl('{env_path}').AreAccessRulesProtected
+$directoryProtected = [System.IO.Directory]::GetAccessControl((Split-Path -Parent '{env_path}')).AreAccessRulesProtected
+$script:AclCallCount = 0
+function Set-LauncherFileAccessControl([string]$Path, [object]$AccessControl) {{
+    $script:AclCallCount++
+    if ($script:AclCallCount -gt 1) {{ throw 'forced ACL failure' }}
+    [System.IO.File]::SetAccessControl($Path, $AccessControl)
+}}
+[System.IO.File]::WriteAllText('{temporary_path}', 'replacement')
+$failureMessage = ''
+try {{
+    Commit-AtomicEnvFile -TemporaryPath '{temporary_path}' -DestinationPath '{env_path}'
+}} catch {{
+    $failureMessage = $_.Exception.Message
+}}
+$backupPattern = ".$(Split-Path -Leaf '{env_path}').*.bak"
+$backups = @(Get-ChildItem -LiteralPath (Split-Path -Parent '{env_path}') -Filter $backupPattern)
+[PSCustomObject]@{{
+    FailureMentionsRetainedBackup = $failureMessage -like '*rollback was incomplete*Original backup retained*'
+    AclCallCount = $script:AclCallCount
+    Content = [System.IO.File]::ReadAllText('{env_path}')
+    TempExists = Test-Path -LiteralPath '{temporary_path}'
+    BackupCount = $backups.Count
+    BackupContent = if ($backups.Count -eq 1) {{ [System.IO.File]::ReadAllText($backups[0].FullName) }} else {{ '' }}
+    BackupProtected = if ($backups.Count -eq 1) {{ [System.IO.File]::GetAccessControl($backups[0].FullName).AreAccessRulesProtected }} else {{ $false }}
+    BackupSameAcl = if ($backups.Count -eq 1) {{ (Get-TestAclSemantics $backups[0].FullName) -ceq $beforeAcl }} else {{ $false }}
+    BeforeProtected = $beforeProtected
+    DirectoryProtected = $directoryProtected
+}} | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip()) == {
+        "FailureMentionsRetainedBackup": True,
+        "AclCallCount": 3,
+        "Content": original_on_disk,
+        "TempExists": False,
+        "BackupCount": 1,
+        "BackupContent": original_on_disk,
+        "BackupProtected": True,
+        "BackupSameAcl": True,
+        "BeforeProtected": True,
+        "DirectoryProtected": False,
+    }
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for launcher behavior testing")
 def test_launcher_readiness_requires_verified_project_process_before_http(tmp_path: Path) -> None:
     unrelated_requests: list[str] = []
     with ExitStack() as stack:
         ready_port = stack.enter_context(_running_project_harness(tmp_path / "harness"))
         unrelated_port = stack.enter_context(_healthy_service("harness", unrelated_requests))
         launcher_path = str(LAUNCHER).replace("'", "''")
+        python_path = str(Path(sys.executable)).replace("'", "''")
+        base_python_path = str(Path(getattr(sys, "_base_executable", sys.executable))).replace("'", "''")
         command = f"""
 . '{launcher_path}' -FunctionsOnly
+$script:HarnessPython = '{python_path}'
+$script:HarnessBasePython = '{base_python_path}'
 [PSCustomObject]@{{
     Ready = Test-HarnessUiReady -Port {ready_port}
     Unrelated = Test-HarnessUiReady -Port {unrelated_port}
@@ -1387,8 +1759,12 @@ $now = [DateTime]::UtcNow
 def test_launcher_async_readiness_probe_is_single_flight(tmp_path: Path) -> None:
     with _running_project_harness(tmp_path / "harness") as harness_port:
         launcher_path = str(LAUNCHER).replace("'", "''")
+        python_path = str(Path(sys.executable)).replace("'", "''")
+        base_python_path = str(Path(getattr(sys, "_base_executable", sys.executable))).replace("'", "''")
         command = f"""
 . '{launcher_path}' -FunctionsOnly
+$script:HarnessPython = '{python_path}'
+$script:HarnessBasePython = '{base_python_path}'
 $first = Start-HarnessUiProbe -Port {harness_port}
 $second = Start-HarnessUiProbe -Port {harness_port}
 $deadline = [DateTime]::UtcNow.AddSeconds(10)
