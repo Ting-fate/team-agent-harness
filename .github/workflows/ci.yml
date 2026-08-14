@@ -15,7 +15,7 @@ concurrency:
 jobs:
   backend:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
