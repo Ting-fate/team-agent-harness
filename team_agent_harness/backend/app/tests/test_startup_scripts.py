@@ -441,7 +441,31 @@ def test_setup_never_passes_provider_credentials_to_child_commands() -> None:
 def test_setup_version_gate_and_ready_state_are_idempotent(tmp_path: Path) -> None:
     setup_path = str(SETUP).replace("'", "''")
     state_path = str(tmp_path / "ready state.json").replace("'", "''")
-    python_path = str(Path(sys.executable)).replace("'", "''")
+    fake_python = tmp_path / "fake-python.cmd"
+    fake_python.write_bytes(
+        b"@echo off\r\n"
+        b'if "%~1"=="-c" goto python_code\r\n'
+        b'if "%~1"=="-m" goto python_module\r\n'
+        b"exit /b 1\r\n"
+        b":python_code\r\n"
+        b'if "%~2"=="import json" goto python_probe\r\n'
+        b'if not "%~2"=="import sys; print(f\'{sys.version_info.major}.{sys.version_info.minor}\')" exit /b 1\r\n'
+        b'if not "%~3"=="" exit /b 1\r\n'
+        b'>>"%~dp0python-calls.txt" echo version\r\n'
+        b"echo 3.13\r\n"
+        b"exit /b 0\r\n"
+        b":python_probe\r\n"
+        b'if not "%~3"=="" exit /b 1\r\n'
+        b'>>"%~dp0python-calls.txt" echo probe\r\n'
+        b"exit /b 0\r\n"
+        b":python_module\r\n"
+        b'if not "%~2"=="pip" exit /b 1\r\n'
+        b'if not "%~3"=="check" exit /b 1\r\n'
+        b'if not "%~4"=="" exit /b 1\r\n'
+        b'>>"%~dp0python-calls.txt" echo pip-check\r\n'
+        b"exit /b 0\r\n"
+    )
+    python_path = str(fake_python).replace("'", "''")
     command = f"""
 . '{setup_path}' -FunctionsOnly
 $before = Test-EnvironmentReady -PythonExe '{python_path}' -StatePath '{state_path}' -DependencyHash 'test-hash' -ProbeCode \"import json\"
@@ -477,6 +501,20 @@ $second = Test-EnvironmentReady -PythonExe '{python_path}' -StatePath '{state_pa
         "Before": False,
         "First": True,
         "Second": True,
+    }
+    assert (tmp_path / "python-calls.txt").read_text(encoding="ascii").splitlines() == [
+        "version",
+        "version",
+        "probe",
+        "pip-check",
+        "version",
+        "probe",
+        "pip-check",
+    ]
+    assert json.loads((tmp_path / "ready state.json").read_text(encoding="utf-8-sig")) == {
+        "schema_version": 2,
+        "dependency_hash": "test-hash",
+        "python": "3.13",
     }
 
 
