@@ -94,6 +94,19 @@ class AgentLoopExecutor:
             agent=agent,
             allowed_tools=frozenset(step.allowed_tools),
             real_web_access_confirmed=run.real_web_access_confirmed,
+            confirmed_real_web_tools=(
+                None
+                if run.confirmed_real_web_tools is None
+                else frozenset(run.confirmed_real_web_tools)
+            ),
+            confirmed_real_web_tool_routes=(
+                None
+                if run.confirmed_real_web_tool_routes is None
+                else frozenset(
+                    (route.name, route.provider)
+                    for route in run.confirmed_real_web_tool_routes
+                )
+            ),
             enforce_side_effect_approval=True,
             approved_side_effect_tools=frozenset(run.approved_side_effect_tools),
         )

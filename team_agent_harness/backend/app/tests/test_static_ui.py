@@ -63,11 +63,21 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "运行队列" in index_response.text
     assert "执行控制台" in index_response.text
     assert "当前工作台" in index_response.text
+    assert 'id="teamConfigurator"' in index_response.text
+    assert 'id="teamConfigStatus"' in index_response.text
+    assert 'id="teamConfigSummary"' in index_response.text
+    assert 'id="teamConfigurationWarnings"' in index_response.text
+    assert 'id="teamAssignments"' in index_response.text
+    assert 'id="useCustomTeam" type="checkbox"' in index_response.text
+    assert not re.search(r'id="useCustomTeam"[^>]*\bchecked\b', index_response.text)
+    assert 'id="resetTeamSelectionButton"' in index_response.text
+    assert "本次运行团队" in index_response.text
+    assert "自动识别模式沿用识别出的 Pack 路由；选择明确工作流后才能配置团队" in index_response.text
     assert "workflowCurrentPanel" in index_response.text
     assert "workflowCurrentBadge" in index_response.text
     assert "workflowRunCurrentButton" in index_response.text
     assert "workflowTraceCurrentButton" in index_response.text
-    assert "20260702-run-console" in index_response.text
+    assert "20260810-consent-snapshot-v4" in index_response.text
     assert "globalRunBar" in index_response.text
     assert "globalRunTaskButton" in index_response.text
     assert "globalTraceButton" in index_response.text
@@ -95,6 +105,8 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert 'aria-selected="true"' in index_response.text
     assert 'aria-controls="chainPanel"' in index_response.text
     assert 'role="tabpanel"' in index_response.text
+    assert 'data-tab="chain" tabindex="0"' in index_response.text
+    assert index_response.text.count('tabindex="-1"') >= 3
     assert css_response.status_code == 200
     assert "text/css" in css_response.headers["content-type"]
     assert "--sidebar-width" in css_response.text
@@ -118,15 +130,40 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert ".record-group.archive" in css_response.text
     assert ".item-card.related" in css_response.text
     assert ".current-run-grid" in css_response.text
+    assert ".team-configurator" in css_response.text
+    assert ".team-assignment-list" in css_response.text
+    assert ".team-route-grid" in css_response.text
+    assert "repeat(auto-fit, minmax(min(100%, 180px), 1fr))" in css_response.text
     assert "#refreshButton.refreshing::before" in css_response.text
     assert "@keyframes button-spin" in css_response.text
     assert "@media (max-width: 820px)" in css_response.text
     assert runtime_response.status_code == 200
     assert "createRefreshCoordinator" in runtime_response.text
+    assert "authorizeRunRoutes" in runtime_response.text
+    assert "collectPackRealModelRoutes" in runtime_response.text
+    assert "createTaskAfterRunAuthorization" in runtime_response.text
     assert "const text = await response.text()" in runtime_response.text
     assert js_response.status_code == 200
     assert "javascript" in js_response.headers["content-type"]
     assert "renderPackOverview" in js_response.text
+    assert "renderTeamConfigurator" in js_response.text
+    assert "teamTemplatesByPack" in js_response.text
+    assert "teamTemplateRequests" in js_response.text
+    assert "invalidateTeamTemplates" in js_response.text
+    assert "/team-template" in js_response.text
+    assert "team-selection-v1" in js_response.text
+    assert "validateTeamTemplatePayload" in js_response.text
+    assert "updateTeamAssignment" in js_response.text
+    assert 'renderTeamConfigurator({ focusId: target.id })' in js_response.text
+    assert 'focus({ preventScroll: true })' in js_response.text
+    assert "defaultTeamModel" in js_response.text
+    assert "仅影响下一次运行" in js_response.text
+    assert "工具上限" in js_response.text
+    assert "运行预算" in js_response.text
+    assert "data-team-field" in js_response.text
+    assert "data-team-slot" in js_response.text
+    assert 'target.value === "deepseek" ? "deepseek" : "openai"' in js_response.text
+    assert 'route.provider !== "litellm_proxy"' in js_response.text
     assert "selectedPackDetail" in js_response.text
     assert "formatModelConfig" in js_response.text
     assert "renderProviderOverview" in js_response.text
@@ -173,6 +210,13 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert 'role="option"' in js_response.text
     assert "aria-selected" in js_response.text
     assert "item.setAttribute(\"aria-selected\"" in js_response.text
+    assert "function activateDetailTab" in js_response.text
+    assert "item.tabIndex = isActive ? 0 : -1" in js_response.text
+    assert 'event.key === "ArrowRight"' in js_response.text
+    assert 'event.key === "ArrowLeft"' in js_response.text
+    assert 'event.key === "Home"' in js_response.text
+    assert 'event.key === "End"' in js_response.text
+    assert "activateDetailTab(detailTabs[targetIndex], { focus: true })" in js_response.text
     assert 'removeAttribute("aria-label")' in js_response.text
     assert "coordinationLabel" in js_response.text
     assert "formatReturnContract" in js_response.text
@@ -256,15 +300,33 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "凭据已配置" in js_response.text
     assert "confirmRealProviderRun" in js_response.text
     assert "confirmRealProviderRunForPack" in js_response.text
+    assert "routesForTeamSelection" in js_response.text
+    assert "groupedTeamRoutesForConfirmation" in js_response.text
+    assert "本次团队路由" in js_response.text
+    assert "assertTeamProvidersReady" in js_response.text
+    assert "validatedTeamSelectionForPack" in js_response.text
+    assert 'api("/team-selections/validate"' in js_response.text
+    assert 'Object.prototype.hasOwnProperty.call(options, "teamSelection")' in js_response.text
+    assert "runRequest.team_selection = teamSelection" in js_response.text
+    assert "confirm_real_models: authorization.confirmRealModels" in js_response.text
+    assert "confirm_real_web: authorization.confirmRealWeb" in js_response.text
+    assert "confirmed_real_web_tools: authorization.confirmedWebToolKeys" in js_response.text
+    assert "confirmed_real_web_tool_routes: authorization.confirmedWebToolRoutes" in js_response.text
+    assert "authorizationReceipt" in js_response.text
+    assert "els.useCustomTeam.checked" in js_response.text
+    assert "本次运行沿用 Pack 当前路由，不发送自定义团队" in js_response.text
+    assert "providerByName(route.provider)?.enabled" in js_response.text
+    assert "state.teamTemplateRequests.has(els.workflowPack.value)" in js_response.text
+    assert "请先完成 GPT / DeepSeek 渠道配置" in js_response.text
     assert "window.confirm" in js_response.text
     assert "确认运行真实模型调用" in js_response.text
     assert "真实模型调用" in js_response.text
     assert "real_calls" in js_response.text
     assert "enabled" in js_response.text
     assert "model_config" in js_response.text
-    assert "skipConfirm" in js_response.text
+    assert "skipConfirm" not in js_response.text
     assert 'api("/workflow-packs", requestOptions)' in js_response.text
-    assert "/workflow-packs/${encodeURIComponent(els.workflowPack.value)}" in js_response.text
+    assert "/workflow-packs/${encodeURIComponent(packName)}" in js_response.text
     assert "async function loadSelectedPackDetail" in js_response.text
     assert 'els.workflowPack.addEventListener("change"' in js_response.text
     assert "renderFailureSummary" in js_response.text
@@ -339,6 +401,25 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "saveInstitutionalPresetButton" in js_response.text
 
 
+def test_task_and_run_listboxes_use_roving_keyboard_navigation(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        response = client.get("/static/app.js")
+    assert response.status_code == 200
+    js = response.text
+
+    assert "function syncListboxTabStop" in js
+    assert "function moveListboxFocus" in js
+    assert "window.HarnessRuntime.listboxNavigationIndex(" in js
+    assert "event.key," in js
+    assert 'event.key === "Enter" || event.key === " "' in js
+    assert "event.preventDefault()" in js
+    assert 'syncListboxTabStop(els.taskList, "[data-task-id]")' in js
+    assert 'syncListboxTabStop(els.runList, "[data-run-id]")' in js
+    assert 'moveListboxFocus(event, els.taskList, "[data-task-id]")' in js
+    assert 'moveListboxFocus(event, els.runList, "[data-run-id]")' in js
+
+
 def test_static_ui_guards_long_polling_and_duplicate_mutations(tmp_path) -> None:
     app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
     with TestClient(app) as client:
@@ -356,6 +437,32 @@ def test_static_ui_guards_long_polling_and_duplicate_mutations(tmp_path) -> None
     assert 'healthBadge.textContent = "连接异常"' in js
     assert "pendingWritebackActions" in js
     assert "if (state.isBusy)" in js
+
+
+def test_runtime_poll_restores_focus_for_rebuilt_dynamic_controls(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+        runtime_js = client.get("/static/runtime.js").text
+
+    refresh = js[js.index("async function refreshDataOnce") : js.index("function realRoutesForPack")]
+    assert "function captureRuntimeFocus" in js
+    assert "function canRestoreRuntimeFocus" in js
+    assert "function restoreRuntimeFocus" in js
+    assert 'document.querySelectorAll("[data-runtime-focus-key]")' in js
+    assert 'target.closest(\'[aria-hidden="true"], [hidden]\')' in js
+    assert "target.disabled" in js
+    assert "target.checkVisibility" in js
+    assert 'target.focus({ preventScroll: true })' in js
+    assert "normalizeRuntimeTextSelection" in runtime_js
+    assert "target.setSelectionRange(" in js
+    assert 'data-runtime-focus-key="task:' in js
+    assert 'data-runtime-focus-key="run:' in js
+    assert 'data-runtime-focus-key="console-run:' in js
+    assert 'data-runtime-focus-key="job:' in js
+    assert 'data-runtime-focus-key="artifact:' in js
+    assert refresh.index("captureRuntimeFocus()") < refresh.index("renderRunConsole()")
+    assert refresh.index("await renderRunDetails()") < refresh.index("restoreRuntimeFocus(runtimeFocus)")
 
 
 def test_static_ui_dom_ids_match_javascript_selectors(tmp_path) -> None:
@@ -384,3 +491,365 @@ def test_static_ui_navigation_and_tabs_target_real_panels(tmp_path) -> None:
     assert view_targets <= html_ids
     assert shortcut_targets <= html_ids
     assert tab_targets <= html_ids
+
+
+def test_create_and_run_checks_native_form_validity_before_any_side_effect(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    handler = js[
+        js.index('els.runTaskButton.addEventListener("click"') : js.index(
+            'els.runSelectedButton.addEventListener("click"'
+        )
+    ]
+    validity = handler.index("els.taskForm.reportValidity()")
+
+    assert "if (!els.taskForm.reportValidity())" in handler
+    for side_effect in (
+        "runAction(",
+        "buildTaskPayload()",
+        "resolveWorkflowPackForPayload",
+        "validatedTeamSelectionForPack",
+        "persistTask(",
+        "submitAuthorizedRun(",
+    ):
+        assert validity < handler.index(side_effect)
+
+
+def test_real_web_confirmation_is_current_explicit_and_fail_closed(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    authorization = js[
+        js.index("async function authorizeRunForPack") : js.index(
+            "function showRunAuthorizationCancelled"
+        )
+    ]
+    submit_authorized = js[
+        js.index("async function submitAuthorizedRun") : js.index(
+            "function shouldUseVisibleCustomTeamForTask"
+        )
+    ]
+    run_task = js[js.index("async function runTask") : js.index("function isHostTestJob")]
+    create_and_run = js[
+        js.index('els.runTaskButton.addEventListener("click"') : js.index(
+            'els.runSelectedButton.addEventListener("click"'
+        )
+    ]
+
+    assert "async function refreshToolProvidersForRun" in js
+    assert 'api("/tool-providers", { timeoutMs: 10000 })' in js
+    assert authorization.index("refreshToolProvidersForRun()") < authorization.index(
+        "webTools: realWebToolsForPack(freshPack)"
+    )
+    assert "confirmWeb: (tools) => confirmRealWebSearchRun(task, tools)" in authorization
+    assert "const authorization = await authorizeRunForPack" in run_task
+    assert "confirm_real_web: authorization.confirmRealWeb" in submit_authorized
+    assert "confirmed_real_web_tools: authorization.confirmedWebToolKeys" in submit_authorized
+    assert "confirmed_real_web_tool_routes: authorization.confirmedWebToolRoutes" in submit_authorized
+    assert "return submitAuthorizedRun(task, teamSelection, authorization)" in run_task
+    assert "skipWebConfirm" not in create_and_run
+    assert create_and_run.index("const authorization = await authorizeRunForPack") < create_and_run.index(
+        "createTaskAfterRunAuthorization"
+    )
+    assert "finalAuthorization" in create_and_run
+    assert "payload.inputs" in create_and_run
+
+
+def test_real_model_confirmation_refreshes_provider_state_before_submission(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    assert "async function refreshModelProvidersForRun" in js
+    refresh_model_providers = js[
+        js.index("async function refreshModelProvidersForRun") : js.index(
+            "async function refreshToolProvidersForRun"
+        )
+    ]
+    submit_authorized = js[
+        js.index("async function submitAuthorizedRun") : js.index(
+            "function shouldUseVisibleCustomTeamForTask"
+        )
+    ]
+    run_task = js[js.index("async function runTask") : js.index("function isHostTestJob")]
+    create_and_run = js[
+        js.index('els.runTaskButton.addEventListener("click"') : js.index(
+            'els.runSelectedButton.addEventListener("click"'
+        )
+    ]
+
+    assert 'api("/model-providers", { timeoutMs: 10000 })' in refresh_model_providers
+    assert "if (!Array.isArray(modelProviders) || !modelProviders.length)" in refresh_model_providers
+    assert "state.modelProviders = modelProviders" in refresh_model_providers
+    authorization = js[
+        js.index("async function authorizeRunForPack") : js.index(
+            "function showRunAuthorizationCancelled"
+        )
+    ]
+    assert authorization.index("refreshWorkflowPackForRun(packName)") < authorization.index(
+        "assertPackProvidersReady(freshPack)"
+    )
+    assert authorization.index("refreshModelProvidersForRun()") < authorization.index(
+        "assertPackProvidersReady(freshPack)"
+    )
+    assert authorization.index("assertPackProvidersReady(freshPack)") < authorization.index(
+        "assertTeamProvidersReady(teamSelection)"
+    )
+    assert authorization.index("refreshModelProvidersForRun()") < authorization.index(
+        "const realModelRoutes = ["
+    )
+    assert "collectVisionPreprocessRealModelRoutes" in authorization
+    assert "...realModelRoutesForRun(packName, teamSelection)" in authorization
+    assert "confirmModels: (routes) => confirmRealProviderRun(task, teamSelection, routes)" in authorization
+    assert run_task.index("const authorization = await authorizeRunForPack") < run_task.index(
+        "submitAuthorizedRun(task, teamSelection, authorization)"
+    )
+    assert "confirm_real_models: authorization.confirmRealModels" in submit_authorized
+    assert "options.authorizationReceipt || null" in run_task
+    assert "task.inputs" in run_task
+    assert create_and_run.index("const authorization = await authorizeRunForPack") < create_and_run.index(
+        "createTaskAfterRunAuthorization"
+    )
+
+
+def test_create_and_run_requires_authorization_before_task_mutation(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    handler = js[
+        js.index('els.runTaskButton.addEventListener("click"') : js.index(
+            'els.runSelectedButton.addEventListener("click"'
+        )
+    ]
+    authorization = handler.index("const authorization = await authorizeRunForPack")
+    cancellation_gate = handler.index("if (!authorization.authorized)")
+    guarded_mutation = handler.index("createTaskAfterRunAuthorization")
+    create_callback = handler.index("createTask: () => persistTask(")
+    submit_callback = handler.index("submitRun: (task, finalAuthorization) => submitAuthorizedRun(")
+
+    assert authorization < cancellation_gate < guarded_mutation < create_callback < submit_callback
+    assert "runTask(task.id" not in handler
+    assert "createTask: () => createTask(" not in handler
+    assert "authorizationReceipt" not in handler
+
+
+def test_create_and_run_has_no_client_gate_after_task_persistence(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    handler = js[
+        js.index('els.runTaskButton.addEventListener("click"') : js.index(
+            'els.runSelectedButton.addEventListener("click"'
+        )
+    ]
+    create_callback = handler.index("createTask: () => persistTask(")
+    after_create = handler[create_callback:]
+
+    for forbidden in (
+        "authorizeRunForPack(",
+        "validatedTeamSelectionForPack(",
+        "assertPackProvidersReady(",
+        "assertTeamProvidersReady(",
+        "window.confirm(",
+    ):
+        assert forbidden not in after_create
+    assert "submitAuthorizedRun(" in after_create
+
+
+def test_run_authorization_refreshes_and_replaces_strict_pack_snapshot(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    refresh_pack = js[
+        js.index("async function refreshWorkflowPackForRun") : js.index(
+            "function teamSelectionPayload"
+        )
+    ]
+    validation = js[
+        js.index("function validateWorkflowPackForRun") : js.index(
+            "async function refreshWorkflowPackForRun"
+        )
+    ]
+
+    assert 'api(`/workflow-packs/${encodeURIComponent(packName)}`, { timeoutMs: 10000 })' in refresh_pack
+    assert "validateWorkflowPackForRun(freshPack, packName)" in refresh_pack
+    assert "state.packs = state.packs.map" in refresh_pack
+    assert "pack.agents" in validation
+    assert "pack.steps" in validation
+    assert "agent.pack_name !== packName" in validation
+    assert "step.agent_role" in validation
+    assert "step.depends_on" in validation
+
+
+def test_default_pack_and_provider_catalog_readiness_fail_closed(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    provider_refresh = js[
+        js.index("async function refreshModelProvidersForRun") : js.index(
+            "async function refreshToolProvidersForRun"
+        )
+    ]
+    pack_readiness = js[
+        js.index("function assertPackProvidersReady") : js.index(
+            "function assertTeamProvidersReady"
+        )
+    ]
+
+    assert "if (!Array.isArray(modelProviders) || !modelProviders.length)" in provider_refresh
+    assert "new Set(modelProviders.map((provider) => provider.name)).size" in provider_refresh
+    assert "pack.agents" in pack_readiness
+    assert "model_config" in pack_readiness
+    assert "providerByName(route.provider)?.enabled === true" in pack_readiness
+
+
+def test_run_authorization_includes_task_vision_routes_before_creation(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+        runtime_js = client.get("/static/runtime.js").text
+
+    authorization = js[
+        js.index("async function authorizeRunForPack") : js.index(
+            "function showRunAuthorizationCancelled"
+        )
+    ]
+    create_and_run = js[
+        js.index('els.runTaskButton.addEventListener("click"') : js.index(
+            'els.runSelectedButton.addEventListener("click"'
+        )
+    ]
+    run_task = js[js.index("async function runTask") : js.index("function isHostTestJob")]
+
+    assert "collectVisionPreprocessRealModelRoutes" in authorization
+    assert "vision_preprocess_fallback" not in js
+    assert "vision_preprocess_fallback" not in runtime_js
+    assert "taskInputs" in authorization
+    assert "modelRoutes: realModelRoutes" in authorization
+    assert create_and_run.index("payload.inputs") < create_and_run.index("persistTask(")
+    assert "authorizeRunForPack(resolvedPack, teamSelection, payload.inputs)" in create_and_run
+    assert "authorizeRunForPack(" in run_task
+    assert "task.inputs" in run_task
+
+
+def test_real_web_targets_use_latest_pack_step_and_agent_permission_intersection(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    real_web = js[
+        js.index("function realWebToolsForPack") : js.index(
+            "function confirmRealWebSearchRunForPack"
+        )
+    ]
+    authorization = js[
+        js.index("async function authorizeRunForPack") : js.index(
+            "function showRunAuthorizationCancelled"
+        )
+    ]
+
+    assert "collectPackRealWebTools(pack, state.toolProviders)" in real_web
+    assert "packUsesWebSearch" not in js
+    assert "realWebToolsForPack(freshPack)" in authorization
+
+
+def test_auto_workflow_cannot_submit_hidden_custom_team(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    configurator = js[js.index("function renderTeamConfigurator") : js.index("function updateTeamAssignment")]
+    create_and_run = js[
+        js.index('els.runTaskButton.addEventListener("click"') : js.index(
+            'els.runSelectedButton.addEventListener("click"'
+        )
+    ]
+
+    assert 'const supportsCustomTeam = Boolean(packName && packName !== "auto")' in configurator
+    assert "els.useCustomTeam.checked = false" in configurator
+    assert "els.useCustomTeam.disabled = state.isBusy || !supportsCustomTeam" in configurator
+    assert 'els.workflowPack.value !== "auto" && els.useCustomTeam.checked' in create_and_run
+    assert create_and_run.index("customTeamRequested") < create_and_run.index(
+        "resolveWorkflowPackForPayload"
+    )
+    assert "const teamSelection = customTeamRequested" in create_and_run
+
+
+def test_existing_task_uses_only_visible_same_pack_custom_team(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        js = client.get("/static/app.js").text
+
+    selector = js[
+        js.index("function shouldUseVisibleCustomTeamForTask") : js.index(
+            "async function runTask"
+        )
+    ]
+    run_task = js[js.index("async function runTask") : js.index("function isHostTestJob")]
+
+    assert 'els.workflowPack.value !== "auto"' in selector
+    assert "els.workflowPack.value === task.workflow_pack" in selector
+    assert "els.useCustomTeam.checked" in selector
+    assert "shouldUseVisibleCustomTeamForTask(task)" in run_task
+    assert "els.useCustomTeam.checked\n" not in run_task
+
+
+def test_team_fallback_editor_covers_zero_to_four_routes_and_disabled_state(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        css = client.get("/static/styles.css").text
+        js = client.get("/static/app.js").text
+
+    assert "const MAX_TEAM_FALLBACKS = 4" in js
+    assert 'data-team-action="add-fallback"' in js
+    assert 'data-team-action="remove-fallback"' in js
+    assert 'data-team-fallback-index="${fallbackIndex}"' in js
+    assert "function renderTeamFallbackRoutes" in js
+    assert "function updateTeamFallbacks" in js
+    assert "function normalizeTeamRoute" in js
+    assert "function assertUniqueTeamRouteTargets" in js
+    assert 'querySelectorAll("select, input, button[data-team-action]")' in js
+    assert 'renderTeamConfigurator({ focusId: target.id })' in js
+    assert 'document.getElementById(options.focusId)?.focus({ preventScroll: true })' in js
+    assert ".team-fallback-section" in css
+    assert ".team-fallback-row" in css
+
+
+def test_semantic_text_colors_meet_wcag_aa_contrast(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    with TestClient(app) as client:
+        css = client.get("/static/styles.css").text
+
+    def token(name: str) -> str:
+        marker = f"--{name}: "
+        start = css.index(marker) + len(marker)
+        return css[start : css.index(";", start)].strip()
+
+    def relative_luminance(color: str) -> float:
+        channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+        normalized = [
+            channel / 12.92
+            if channel <= 0.04045
+            else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * normalized[0] + 0.7152 * normalized[1] + 0.0722 * normalized[2]
+
+    def contrast_ratio(foreground: str, background: str) -> float:
+        lighter, darker = sorted(
+            (relative_luminance(foreground), relative_luminance(background)),
+            reverse=True,
+        )
+        return (lighter + 0.05) / (darker + 0.05)
+
+    assert contrast_ratio(token("muted"), "#ffffff") >= 4.5
+    assert contrast_ratio(token("muted"), token("surface-soft")) >= 4.5
+    assert contrast_ratio(token("ok"), token("ok-soft")) >= 4.5
+    assert contrast_ratio("#ffffff", token("primary")) >= 4.5

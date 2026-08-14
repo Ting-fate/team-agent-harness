@@ -15,6 +15,7 @@ from app.core.models import (
     EvalResult,
     EvalStatus,
     Handoff,
+    ConfirmedRealWebToolRoute,
     Run,
     RunStatus,
     RuntimeJob,
@@ -78,10 +79,79 @@ def test_run_status_enum_accepts_known_statuses() -> None:
     assert run.model_dump(mode="json")["status"] == "running"
 
 
-def test_legacy_run_json_defaults_real_web_access_to_unconfirmed() -> None:
+def test_fresh_run_json_defaults_real_web_snapshots_to_fail_closed_empty_lists() -> None:
     run = Run.model_validate_json('{"id":"run-1","task_id":"task-1"}')
 
     assert run.real_web_access_confirmed is False
+    assert run.confirmed_real_web_tools == []
+    assert run.confirmed_real_web_tool_routes == []
+
+    with pytest.raises(ValidationError, match="legacy"):
+        Run(
+            task_id="task-1",
+            confirmed_real_web_tools=None,
+            confirmed_real_web_tool_routes=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("execution_plan", "plan_hash"),
+    [
+        ({}, None),
+        (None, "a" * 64),
+    ],
+)
+def test_run_rejects_incomplete_execution_plan_pair(
+    execution_plan: dict[str, object] | None,
+    plan_hash: str | None,
+) -> None:
+    with pytest.raises(ValidationError, match="must either both be present or both be absent"):
+        Run(
+            task_id="task-1",
+            execution_plan=execution_plan,
+            execution_plan_hash=plan_hash,
+        )
+
+
+def test_run_normalizes_and_bounds_confirmed_real_web_tools() -> None:
+    run = Run(
+        task_id="task-1",
+        real_web_access_confirmed=True,
+        confirmed_real_web_tools=[" web_search ", "fetch_page"],
+        confirmed_real_web_tool_routes=[
+            {"name": " web_search ", "provider": " TAVILY "},
+            {"name": "fetch_page", "provider": "tavily"},
+        ],
+    )
+
+    assert run.confirmed_real_web_tools == ["fetch_page", "web_search"]
+    assert run.confirmed_real_web_tool_routes == [
+        ConfirmedRealWebToolRoute(name="fetch_page", provider="tavily"),
+        ConfirmedRealWebToolRoute(name="web_search", provider="tavily"),
+    ]
+
+    with pytest.raises(ValidationError, match="duplicate"):
+        Run(
+            task_id="task-1",
+            real_web_access_confirmed=True,
+            confirmed_real_web_tools=["web_search", "web_search"],
+            confirmed_real_web_tool_routes=[
+                {"name": "web_search", "provider": "tavily"},
+            ],
+        )
+    with pytest.raises(ValidationError, match="Unsupported real web tool"):
+        Run(
+            task_id="task-1",
+            real_web_access_confirmed=True,
+            confirmed_real_web_tools=["shell"],
+            confirmed_real_web_tool_routes=[{"name": "shell", "provider": "local"}],
+        )
+    with pytest.raises(ValidationError, match="partial|match"):
+        Run(
+            task_id="task-1",
+            real_web_access_confirmed=True,
+            confirmed_real_web_tools=["web_search"],
+        )
 
 
 def test_run_status_enum_rejects_unknown_status() -> None:

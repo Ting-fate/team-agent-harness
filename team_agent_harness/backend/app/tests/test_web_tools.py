@@ -172,6 +172,8 @@ def test_web_search_uses_fake_tavily_client_and_redacts_trace(tool_env, monkeypa
         agent=agent,
         allowed_tools=frozenset({"web_search"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"web_search"}),
+        confirmed_real_web_tool_routes=frozenset({("web_search", "tavily")}),
     )
 
     result = gateway.call_tool(context, "web_search", {"query": "multi agent harness private topic", "max_results": 1})
@@ -219,6 +221,8 @@ def test_web_search_rejects_unsafe_urls_and_normalizes_external_text_before_trac
         agent=agent,
         allowed_tools=frozenset({"web_search"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"web_search"}),
+        confirmed_real_web_tool_routes=frozenset({("web_search", "tavily")}),
     )
 
     result = gateway.call_tool(context, "web_search", {"query": "safe query", "max_results": 3})
@@ -255,6 +259,8 @@ def test_fetch_page_returns_queryless_public_source_url(tool_env, monkeypatch: p
         agent=agent,
         allowed_tools=frozenset({"fetch_page"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"fetch_page"}),
+        confirmed_real_web_tool_routes=frozenset({("fetch_page", "tavily")}),
     )
 
     result = gateway.call_tool(
@@ -279,6 +285,8 @@ def test_fetch_page_rejects_private_or_local_urls(tool_env, monkeypatch: pytest.
         agent=agent,
         allowed_tools=frozenset({"fetch_page"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"fetch_page"}),
+        confirmed_real_web_tool_routes=frozenset({("fetch_page", "tavily")}),
     )
 
     with pytest.raises(ToolPermissionError):
@@ -307,6 +315,8 @@ def test_fetch_page_rejects_oversized_url(tool_env, monkeypatch: pytest.MonkeyPa
         agent=agent,
         allowed_tools=frozenset({"fetch_page"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"fetch_page"}),
+        confirmed_real_web_tool_routes=frozenset({("fetch_page", "tavily")}),
     )
 
     with pytest.raises(ToolValidationError, match="too long"):
@@ -354,6 +364,8 @@ def test_fetch_page_rejects_non_public_urls(url: str, tool_env, monkeypatch: pyt
         agent=agent,
         allowed_tools=frozenset({"fetch_page"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"fetch_page"}),
+        confirmed_real_web_tool_routes=frozenset({("fetch_page", "tavily")}),
     )
 
     with pytest.raises(ToolPermissionError):
@@ -378,6 +390,8 @@ def test_fetch_page_requires_tavily_key_before_real_network_call(tool_env, monke
         agent=agent,
         allowed_tools=frozenset({"fetch_page"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"fetch_page"}),
+        confirmed_real_web_tool_routes=frozenset({("fetch_page", "tavily")}),
     )
 
     with pytest.raises(ToolValidationError):
@@ -432,6 +446,8 @@ def test_fetch_page_rejects_hostname_that_resolves_to_private_ip(
         agent=agent,
         allowed_tools=frozenset({"fetch_page"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"fetch_page"}),
+        confirmed_real_web_tool_routes=frozenset({("fetch_page", "tavily")}),
     )
 
     with pytest.raises(ToolPermissionError):
@@ -462,6 +478,8 @@ def test_fetch_page_truncates_large_page_body(tool_env, monkeypatch: pytest.Monk
         agent=agent,
         allowed_tools=frozenset({"fetch_page"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"fetch_page"}),
+        confirmed_real_web_tool_routes=frozenset({("fetch_page", "tavily")}),
     )
 
     result = gateway.call_tool(context, "fetch_page", {"url": "https://example.com/public", "max_bytes": 32})
@@ -550,6 +568,38 @@ def test_research_run_requires_server_side_confirmation_for_real_web_tools(
 
     assert response.status_code == 400
     assert "confirm_real_web" in response.text
+
+
+def test_run_rejects_explicit_real_web_tools_when_confirmation_is_false(
+    tmp_path,
+) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Reject contradictory web consent",
+                "goal": "Do not accept tool names without the real-web confirmation bit.",
+                "workflow_pack": "research",
+            },
+        ).json()
+        response = client.post(
+            "/runs",
+            json={
+                "task_id": task["id"],
+                "confirm_real_web": False,
+                "confirmed_real_web_tools": ["web_search"],
+                "confirmed_real_web_tool_routes": [
+                    {"name": "web_search", "provider": "tavily"},
+                ],
+            },
+        )
+        persisted_runs = app.state.harness.storage.list_runs()
+
+    assert response.status_code == 400, response.text
+    assert "must be empty" in response.text
+    assert persisted_runs == []
 
 
 def test_simple_fetch_rejects_redirect_to_localhost_before_following(

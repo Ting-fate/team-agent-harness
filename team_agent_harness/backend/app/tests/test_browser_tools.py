@@ -19,7 +19,8 @@ from app.core.browser_tools import (
 )
 from app.core.model_runtime import ModelGateway, ModelRequest, ModelResponse
 from app.core.context_injection import ContextBudgetExceeded
-from app.core.models import AgentDefinition, AgentRun, Run, Task
+from app.core.execution_plan import execution_plan_from_pack
+from app.core.models import AgentDefinition, AgentRun, ArtifactType, Run, Task
 from app.core.runner import WorkflowRunnerError
 from app.core.storage import SQLiteStorage
 from app.core.tool_gateway import ToolContext, ToolPermissionError, ToolValidationError, create_mock_gateway
@@ -194,6 +195,7 @@ def test_browser_tool_catalog_requires_reachable_proxy_without_fake_client(monke
 def test_browser_tool_catalog_treats_fake_client_as_available(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEAM_AGENT_ALLOW_BROWSER_ACCESS", "1")
     monkeypatch.setenv("TEAM_AGENT_BROWSER_PROVIDER", "edge")
+    monkeypatch.setenv("TEAM_AGENT_BROWSER_CDP_URL", "http://127.0.0.1:1")
 
     catalog = browser_tool_provider_catalog(BrowserToolProvider(search_client=FakeBrowserSearchClient()))
 
@@ -236,6 +238,8 @@ def test_browser_search_uses_fake_client_and_redacts_trace(
         agent=agent,
         allowed_tools=frozenset({"browser_search"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"browser_search"}),
+        confirmed_real_web_tool_routes=frozenset({("browser_search", "edge")}),
     )
 
     result = gateway.call_tool(context, "browser_search", {"query": "browser harness private topic", "max_results": 2})
@@ -763,6 +767,8 @@ def test_browser_fetch_rejects_unsafe_initial_and_final_urls(
         agent=agent,
         allowed_tools=frozenset({"browser_fetch"}),
         real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"browser_fetch"}),
+        confirmed_real_web_tool_routes=frozenset({("browser_fetch", "edge")}),
     )
 
     with pytest.raises(ToolPermissionError):
@@ -968,6 +974,314 @@ def test_background_research_does_not_gain_real_browser_access_after_submission(
     assert completed.status.value == "completed"
     assert search_client.calls == []
     assert fetch_client.calls == []
+
+
+def test_background_research_keeps_tavily_snapshot_when_browser_becomes_available(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_BROWSER_ACCESS", "1")
+    monkeypatch.setenv("TEAM_AGENT_BROWSER_PROVIDER", "edge")
+    monkeypatch.setenv("TEAM_AGENT_BROWSER_SEARCH_ENGINE", "bing")
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_WEB_SEARCH", "1")
+    monkeypatch.setenv("TEAM_AGENT_WEB_SEARCH_PROVIDER", "tavily")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr("app.core.browser_tools._browser_proxy_health", lambda: False)
+    monkeypatch.setattr(
+        "app.core.web_tools.socket.getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))],
+    )
+    tavily_search = FakeTavilySearchClient()
+    tavily_fetch = FakeTavilyFetchClient()
+    browser_provider = BrowserToolProvider()
+    browser_search = FakeBrowserSearchClient()
+    browser_fetch = FakeBrowserFetchClient()
+    app = create_app(
+        tmp_path / "harness.sqlite3",
+        tmp_path / "artifacts",
+        config_root=tmp_path,
+        web_tool_provider=WebToolProvider(
+            search_client=tavily_search,
+            fetch_client=tavily_fetch,
+        ),
+        browser_tool_provider=browser_provider,
+    )
+    plan_started = Event()
+    release_plan = Event()
+    original_executor_factory = app.state.harness.executor_factory
+
+    class BlockingExecutor:
+        def __init__(self) -> None:
+            self.delegate = original_executor_factory()
+
+        def execute(self, **kwargs):
+            if kwargs["step"].name == "plan_research":
+                plan_started.set()
+                if not release_plan.wait(timeout=5):
+                    raise RuntimeError("test did not release the planning step")
+            return self.delegate.execute(**kwargs)
+
+    app.state.harness.executor_factory = BlockingExecutor
+    background_run_completed = Event()
+    worker = app.state.harness.run_worker
+    original_worker_record = worker._record
+
+    def observe_worker_record(action, run_id, queue_item_id, outcome=None):
+        original_worker_record(action, run_id, queue_item_id, outcome)
+        if action == "background_run_completed" and outcome == "completed":
+            background_run_completed.set()
+
+    monkeypatch.setattr(worker, "_record", observe_worker_record)
+
+    with TestClient(app) as client:
+        try:
+            task = client.post(
+                "/tasks",
+                json={
+                    "title": "Freeze Tavily authorization",
+                    "goal": "Do not inherit browser access after submission.",
+                    "workflow_pack": "research",
+                    "inputs": {"topic": "run-scoped web authorization"},
+                },
+            ).json()
+            response = client.post(
+                "/runs",
+                json={
+                    "task_id": task["id"],
+                    "confirm_real_web": True,
+                    "background": True,
+                },
+            )
+            assert response.status_code == 201, response.text
+            run = response.json()
+            assert run["confirmed_real_web_tools"] == ["fetch_page", "web_search"]
+            assert run["confirmed_real_web_tool_routes"] == [
+                {"name": "fetch_page", "provider": "tavily"},
+                {"name": "web_search", "provider": "tavily"},
+            ]
+            wait_for_worker_event(plan_started, "background Tavily plan start")
+
+            browser_provider.search_client = browser_search
+            browser_provider.fetch_client = browser_fetch
+            release_plan.set()
+            wait_for_worker_event(
+                background_run_completed,
+                "background Tavily run completion",
+            )
+            completed = app.state.harness.storage.get_run(run["id"])
+            trace = app.state.harness.trace_logger.list_for_run(run["id"])
+        finally:
+            release_plan.set()
+
+    assert completed is not None
+    assert completed.status.value == "completed"
+    assert completed.confirmed_real_web_tools == ["fetch_page", "web_search"]
+    assert [route.model_dump(mode="json") for route in completed.confirmed_real_web_tool_routes] == [
+        {"name": "fetch_page", "provider": "tavily"},
+        {"name": "web_search", "provider": "tavily"},
+    ]
+    assert browser_search.calls == []
+    assert browser_fetch.calls == []
+    assert tavily_search.calls == [{"query": "run-scoped web authorization", "max_results": 3}]
+    assert tavily_fetch.calls == [
+        "https://example.com/tavily-fallback",
+        "https://example.com/tavily-fallback",
+    ]
+    assert not any(
+        event.payload.get("tool") in {"browser_search", "browser_fetch"}
+        for event in trace
+    )
+
+
+def test_run_rejects_stale_explicit_real_web_tool_snapshot_before_persistence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_BROWSER_ACCESS", "1")
+    monkeypatch.setenv("TEAM_AGENT_BROWSER_PROVIDER", "edge")
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_WEB_SEARCH", "1")
+    monkeypatch.setenv("TEAM_AGENT_WEB_SEARCH_PROVIDER", "tavily")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr("app.core.browser_tools._browser_proxy_health", lambda: False)
+    browser_provider = BrowserToolProvider()
+    app = create_app(
+        tmp_path / "harness.sqlite3",
+        tmp_path / "artifacts",
+        config_root=tmp_path,
+        web_tool_provider=WebToolProvider(
+            search_client=FakeTavilySearchClient(),
+            fetch_client=FakeTavilyFetchClient(),
+        ),
+        browser_tool_provider=browser_provider,
+    )
+
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Reject stale authorization",
+                "goal": "Bind the consent receipt to current provider state.",
+                "workflow_pack": "research",
+            },
+        ).json()
+        stale_catalog = [
+            provider
+            for provider in client.get("/tool-providers").json()
+            if provider["enabled"] and provider["real_calls"]
+        ]
+        stale_tools = sorted(provider["name"] for provider in stale_catalog)
+        stale_routes = sorted(
+            (
+                {"name": provider["name"], "provider": provider["provider"]}
+                for provider in stale_catalog
+            ),
+            key=lambda route: (route["name"], route["provider"]),
+        )
+        assert stale_tools == ["fetch_page", "web_search"]
+
+        browser_provider.search_client = FakeBrowserSearchClient()
+        browser_provider.fetch_client = FakeBrowserFetchClient()
+        response = client.post(
+            "/runs",
+            json={
+                "task_id": task["id"],
+                "confirm_real_web": True,
+                "confirmed_real_web_tools": stale_tools,
+                "confirmed_real_web_tool_routes": stale_routes,
+            },
+        )
+        persisted_runs = app.state.harness.storage.list_runs()
+
+    assert response.status_code == 400, response.text
+    assert "confirmed_real_web_tools" in response.text
+    assert persisted_runs == []
+
+
+def test_run_real_web_snapshot_is_derived_from_frozen_narrowed_execution_plan(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_BROWSER_ACCESS", "1")
+    monkeypatch.setenv("TEAM_AGENT_BROWSER_PROVIDER", "edge")
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_WEB_SEARCH", "1")
+    monkeypatch.setenv("TEAM_AGENT_WEB_SEARCH_PROVIDER", "tavily")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "app.core.web_tools.socket.getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))],
+    )
+    browser_search = FakeBrowserSearchClient()
+    browser_fetch = FakeBrowserFetchClient()
+    base_plan = execution_plan_from_pack(get_research_pack())
+    narrowed_plan = base_plan.model_copy(
+        update={
+            "source": "operator",
+            "final_artifact_type": ArtifactType.RESEARCH_NOTE,
+            "agent_snapshots": [],
+            "steps": [
+                step.model_copy(
+                    update={
+                        "dependencies": (
+                            []
+                            if index == 0
+                            else [base_plan.steps[index - 1].step_id]
+                        ),
+                        "tool_permissions": [
+                            tool
+                            for tool in step.tool_permissions
+                            if tool not in {"browser_search", "browser_fetch"}
+                        ]
+                    }
+                )
+                for index, step in enumerate(base_plan.steps)
+            ],
+        }
+    )
+    app = create_app(
+        tmp_path / "harness.sqlite3",
+        tmp_path / "artifacts",
+        config_root=tmp_path,
+        web_tool_provider=WebToolProvider(
+            search_client=FakeTavilySearchClient(),
+            fetch_client=FakeTavilyFetchClient(),
+        ),
+        browser_tool_provider=BrowserToolProvider(
+            search_client=browser_search,
+            fetch_client=browser_fetch,
+        ),
+    )
+
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Narrow browser permissions",
+                "goal": "Authorize only tools retained by the frozen dynamic plan.",
+                "workflow_pack": "research",
+                "inputs": {"topic": "frozen plan authorization"},
+            },
+        ).json()
+        response = client.post(
+            "/runs",
+            json={
+                "task_id": task["id"],
+                "confirm_real_web": True,
+                "confirmed_real_web_tools": ["fetch_page", "web_search"],
+                "confirmed_real_web_tool_routes": [
+                    {"name": "fetch_page", "provider": "tavily"},
+                    {"name": "web_search", "provider": "tavily"},
+                ],
+                "execution_plan": narrowed_plan.model_dump(mode="json"),
+            },
+        )
+
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert run["confirmed_real_web_tools"] == ["fetch_page", "web_search"]
+    assert run["confirmed_real_web_tool_routes"] == [
+        {"name": "fetch_page", "provider": "tavily"},
+        {"name": "web_search", "provider": "tavily"},
+    ]
+    assert browser_search.calls == []
+    assert browser_fetch.calls == []
+
+
+@pytest.mark.parametrize(
+    "snapshot_payload",
+    [
+        {"confirmed_real_web_tools": None},
+        {"confirmed_real_web_tool_routes": None},
+        {
+            "confirmed_real_web_tools": None,
+            "confirmed_real_web_tool_routes": None,
+        },
+        {"confirmed_real_web_tools": [], "confirmed_real_web_tool_routes": None},
+    ],
+)
+def test_run_rejects_explicit_null_or_partial_real_web_snapshot_before_persistence(
+    tmp_path,
+    snapshot_payload: dict[str, object],
+) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Reject null web snapshot",
+                "goal": "Distinguish omitted compatibility fields from explicit null.",
+                "workflow_pack": "research",
+            },
+        ).json()
+        response = client.post(
+            "/runs",
+            json={"task_id": task["id"], **snapshot_payload},
+        )
+        persisted_runs = app.state.harness.storage.list_runs()
+
+    assert response.status_code == 400, response.text
+    assert "real-web" in response.text or "confirmed_real_web" in response.text
+    assert persisted_runs == []
 
 
 def test_research_run_fails_closed_when_browser_search_fails_and_only_mock_web_is_available(

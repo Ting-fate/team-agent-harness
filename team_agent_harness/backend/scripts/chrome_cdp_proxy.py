@@ -758,6 +758,17 @@ def _handler_factory(state: ChromeProxyState) -> type[BaseHTTPRequestHandler]:
                 return
             parsed = urlparse(self.path)
             try:
+                if parsed.path == "/shutdown":
+                    if parsed.query or int(self.headers.get("Content-Length", "0") or "0") != 0:
+                        raise RuntimeError("Shutdown request must not contain a body or query.")
+                    state.close()
+                    self._send_json({"status": "stopping"})
+                    threading.Thread(
+                        target=self.server.shutdown,
+                        name="chrome-cdp-proxy-shutdown",
+                        daemon=True,
+                    ).start()
+                    return
                 if parsed.path != "/navigate-eval":
                     self._send_json({"error": "not_found"}, status=404)
                     return

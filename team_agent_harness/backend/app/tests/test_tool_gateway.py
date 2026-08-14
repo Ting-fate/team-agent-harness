@@ -7,6 +7,7 @@ from app.core.storage import SQLiteStorage
 from app.core.tool_gateway import (
     ToolContext,
     ToolDefinition,
+    ToolGateway,
     ToolGatewayError,
     ToolPermissionError,
     ToolValidationError,
@@ -148,6 +149,148 @@ def test_gateway_requires_explicit_side_effect_approval_in_agent_loop_mode(tool_
     assert gateway.call_tool(approved_context, "run_test_command", {"command": "pytest -q"})[
         "status"
     ] == "mocked"
+
+
+def test_gateway_binds_real_web_calls_to_run_tool_snapshot_and_keeps_legacy_behavior(tool_env) -> None:
+    _, logger, _, context, _ = tool_env
+    gateway = ToolGateway(logger)
+    tool_names = ["web_search", "browser_search", "browser_fetch"]
+    active_providers = {
+        "web_search": "tavily",
+        "browser_search": "edge",
+        "browser_fetch": "edge",
+    }
+    for tool_name in tool_names:
+        gateway.register_tool(
+            ToolDefinition(
+                name=tool_name,
+                description=f"Test {tool_name}.",
+                required_fields=frozenset(),
+                handler=lambda _payload, name=tool_name: {"tool": name},
+                real_web_call_enabled=lambda: True,
+                real_web_provider=lambda name=tool_name: active_providers[name],
+            )
+        )
+    agent = AgentDefinition(
+        id="real-web-agent",
+        pack_name="research",
+        role="Searcher",
+        system_prompt="Use only confirmed web tools.",
+        tool_permissions=tool_names,
+    )
+    snapshotted = ToolContext(
+        run_id=context.run_id,
+        agent_run_id=context.agent_run_id,
+        agent=agent,
+        allowed_tools=frozenset(tool_names),
+        real_web_access_confirmed=True,
+        confirmed_real_web_tools=frozenset({"web_search"}),
+        confirmed_real_web_tool_routes=frozenset({("web_search", "tavily")}),
+    )
+
+    assert gateway.call_tool(snapshotted, "web_search", {}) == {"tool": "web_search"}
+    with pytest.raises(ToolPermissionError, match="run tool snapshot"):
+        gateway.call_tool(snapshotted, "browser_search", {})
+    with pytest.raises(ToolPermissionError, match="run tool snapshot"):
+        gateway.call_tool(snapshotted, "browser_fetch", {})
+
+    active_providers["web_search"] = "other-provider"
+    with pytest.raises(ToolPermissionError, match="run tool snapshot"):
+        gateway.call_tool(snapshotted, "web_search", {})
+
+    partial = ToolContext(
+        **{
+            **snapshotted.__dict__,
+            "confirmed_real_web_tool_routes": None,
+        }
+    )
+    with pytest.raises(ToolPermissionError, match="incomplete"):
+        gateway.call_tool(partial, "web_search", {})
+
+    legacy = ToolContext(
+        **{
+            **snapshotted.__dict__,
+            "confirmed_real_web_tools": None,
+            "confirmed_real_web_tool_routes": None,
+        }
+    )
+    assert gateway.call_tool(legacy, "browser_search", {}) == {"tool": "browser_search"}
+
+
+def test_restarted_run_preserves_web_route_snapshot_and_rejects_provider_drift(tmp_path) -> None:
+    database_path = tmp_path / "harness.sqlite3"
+    active_provider = {"name": "tavily"}
+    agent = AgentDefinition(
+        id="restart-web-agent",
+        pack_name="research",
+        role="Searcher",
+        system_prompt="Use only the persisted web route.",
+        tool_permissions=["web_search"],
+    )
+    with SQLiteStorage(database_path) as storage:
+        storage.init_schema()
+        task = storage.create_task(
+            Task(id="restart-web-task", title="Task", goal="Goal", workflow_pack="research")
+        )
+        run = storage.create_run(
+            Run(
+                id="restart-web-run",
+                task_id=task.id,
+                real_web_access_confirmed=True,
+                confirmed_real_web_tools=["web_search"],
+                confirmed_real_web_tool_routes=[
+                    {"name": "web_search", "provider": "tavily"},
+                ],
+            )
+        )
+        storage.create_agent_definition(agent)
+        storage.create_agent_run(
+            AgentRun(
+                id="restart-web-agent-run",
+                run_id=run.id,
+                agent_id=agent.id,
+                step_name="search",
+            )
+        )
+
+    with SQLiteStorage(database_path) as storage:
+        storage.init_schema()
+        restored = storage.get_run("restart-web-run")
+        assert restored is not None
+        assert restored.confirmed_real_web_tools == ["web_search"]
+        assert [
+            route.model_dump(mode="json")
+            for route in restored.confirmed_real_web_tool_routes or []
+        ] == [{"name": "web_search", "provider": "tavily"}]
+
+        gateway = ToolGateway(TraceLogger(storage))
+        gateway.register_tool(
+            ToolDefinition(
+                name="web_search",
+                description="Test restarted web authorization.",
+                required_fields=frozenset(),
+                handler=lambda _payload: {"status": "called"},
+                real_web_call_enabled=lambda: True,
+                real_web_provider=lambda: active_provider["name"],
+            )
+        )
+        context = ToolContext(
+            run_id=restored.id,
+            agent_run_id="restart-web-agent-run",
+            agent=agent,
+            allowed_tools=frozenset({"web_search"}),
+            real_web_access_confirmed=restored.real_web_access_confirmed,
+            confirmed_real_web_tools=frozenset(restored.confirmed_real_web_tools or []),
+            confirmed_real_web_tool_routes=frozenset(
+                (route.name, route.provider)
+                for route in restored.confirmed_real_web_tool_routes or []
+            ),
+        )
+
+        assert gateway.call_tool(context, "web_search", {}) == {"status": "called"}
+        active_provider["name"] = "other-provider"
+        with pytest.raises(ToolPermissionError, match="run tool snapshot"):
+            gateway.call_tool(context, "web_search", {})
 
 
 def test_gateway_rejects_unknown_tool(tool_env) -> None:

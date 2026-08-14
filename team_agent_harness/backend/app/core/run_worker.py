@@ -20,7 +20,7 @@ from app.core.models import (
 from app.core.run_control import RunCoordinationConflict, RunCoordinator
 from app.core.runner import WorkflowRunner
 from app.core.runtime_control import RuntimeActionResult, RuntimeControlConflict, RuntimeController
-from app.core.storage import SQLiteStorage, StorageError
+from app.core.storage import RunRecordIntegrityError, SQLiteStorage, StorageError
 from app.core.trace import TraceLogger
 from app.packs.base import WorkflowPack
 
@@ -273,7 +273,15 @@ class RunWorker:
 
     def _recover_interrupted_runs(self) -> None:
         coordinator = RunCoordinator(self.storage, self.trace_logger)
-        for run in self.storage.list_runs_requiring_worker_recovery():
+        recovery_run_ids = set(self.storage.list_run_ids_requiring_worker_recovery())
+        for run_id in self.storage.list_run_ids():
+            try:
+                run = self.storage.get_run(run_id)
+            except RunRecordIntegrityError as exc:
+                self._terminalize_invalid_run_record(run_id, exc)
+                continue
+            if run is None or run_id not in recovery_run_ids:
+                continue
             coordinator.release_orphaned_locks(run.id)
             queue_items = self.storage.list_run_queue_items_for_run(run.id)
             if run.status == RunStatus.QUEUED:
@@ -447,7 +455,15 @@ class RunWorker:
         return None
 
     def _execute(self, queue_item: RunQueueItem) -> None:
-        run = self.storage.get_run(queue_item.run_id)
+        try:
+            run = self.storage.get_run(queue_item.run_id)
+        except RunRecordIntegrityError as exc:
+            self._terminalize_invalid_run_record(
+                queue_item.run_id,
+                exc,
+                queue_item_id=queue_item.id,
+            )
+            return
         if run is None:
             return
         if run.status == RunStatus.RUNNING and queue_item.status in {
@@ -500,6 +516,80 @@ class RunWorker:
             run.id,
             queue_item.id,
             result.status.value,
+        )
+
+    def _terminalize_incomplete_execution_plan_pair(
+        self,
+        run_id: str,
+        *,
+        queue_item_id: str = "startup-recovery",
+    ) -> None:
+        with self.storage.transaction():
+            failed = self.storage.terminalize_incomplete_execution_plan_pair(run_id)
+            RuntimeController(self.storage, self.trace_logger).terminalize_open_runtime_state(
+                run_id,
+                reason="incomplete_execution_plan_pair",
+            )
+            now = utc_now()
+            for item in self.storage.list_run_queue_items_for_run(run_id):
+                if item.status not in {RunQueueItemStatus.QUEUED, RunQueueItemStatus.RUNNING}:
+                    continue
+                self.storage.update_run_queue_item(
+                    item.model_copy(
+                        update={
+                            "status": RunQueueItemStatus.FAILED,
+                            "updated_at": now,
+                            "message": "Background run stopped because its frozen execution plan is incomplete.",
+                        }
+                    )
+                )
+            RunCoordinator(self.storage, self.trace_logger).release_orphaned_locks(run_id)
+        self._record(
+            "background_run_failed",
+            failed.id,
+            queue_item_id,
+            "execution_plan_integrity",
+        )
+
+    def _terminalize_invalid_run_record(
+        self,
+        run_id: str,
+        error: RunRecordIntegrityError,
+        *,
+        queue_item_id: str = "startup-recovery",
+    ) -> None:
+        if error.reason == "incomplete_execution_plan_pair":
+            self._terminalize_incomplete_execution_plan_pair(
+                run_id,
+                queue_item_id=queue_item_id,
+            )
+            return
+
+        with self.storage.transaction():
+            RuntimeController(self.storage, self.trace_logger).terminalize_open_runtime_state(
+                run_id,
+                reason="invalid_run_record",
+            )
+            now = utc_now()
+            for item in self.storage.list_run_queue_items_for_run(run_id):
+                if item.status not in {RunQueueItemStatus.QUEUED, RunQueueItemStatus.RUNNING}:
+                    continue
+                self.storage.update_run_queue_item(
+                    item.model_copy(
+                        update={
+                            "status": RunQueueItemStatus.FAILED,
+                            "updated_at": now,
+                            "message": "Background run stopped because its persisted Run record is invalid.",
+                        }
+                    )
+                )
+            RunCoordinator(self.storage, self.trace_logger).release_orphaned_locks(run_id)
+            self.storage.quarantine_invalid_run_record(run_id)
+        self._record(
+            "background_run_failed",
+            run_id,
+            queue_item_id,
+            "run_record_integrity",
         )
 
     def _requeue_interrupted_segment(

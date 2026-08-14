@@ -102,6 +102,42 @@ def test_runner_rejects_persisted_plan_without_agent_snapshots(
     assert storage.list_agent_runs_for_run(run.id) == []
 
 
+@pytest.mark.parametrize(
+    ("execution_plan", "plan_hash"),
+    [
+        ({}, None),
+        (None, "a" * 64),
+    ],
+)
+def test_runner_rejects_incomplete_execution_plan_pair_before_persistence(
+    storage: SQLiteStorage,
+    runner_factory,
+    execution_plan: dict[str, object] | None,
+    plan_hash: str | None,
+) -> None:
+    pack = get_code_rd_pack()
+    task = storage.create_task(
+        Task(
+            id="task-incomplete-plan-pair",
+            title="Reject incomplete frozen plan",
+            goal="Never execute the current Pack for an incomplete frozen plan.",
+            workflow_pack=pack.name,
+        )
+    )
+    run = Run(id="run-incomplete-plan-pair", task_id=task.id).model_copy(
+        update={
+            "execution_plan": execution_plan,
+            "execution_plan_hash": plan_hash,
+        }
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="plan and hash are incomplete"):
+        runner_factory().run(run, pack)
+
+    assert storage.get_run(run.id) is None
+    assert storage.list_agent_runs_for_run(run.id) == []
+
+
 def test_runner_completes_two_step_workflow_with_artifacts_handoff_trace_and_eval(
     storage: SQLiteStorage,
     runner_factory,

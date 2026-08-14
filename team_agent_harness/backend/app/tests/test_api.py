@@ -11,6 +11,7 @@ from app.core.models import (
     Run,
     RunLock,
     RunQueueItemStatus,
+    RunStatus,
     RuntimeJob,
     RuntimeJobStatus,
     Task,
@@ -230,6 +231,71 @@ def test_run_endpoints_preserve_the_same_serialized_run_contract(tmp_path) -> No
     assert listed == created
     assert fetched == created
     assert detailed == created
+
+
+def test_run_read_endpoints_preserve_legacy_web_snapshot_across_update(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    state = app.state.harness
+    task = state.storage.create_task(
+        Task(
+            id="legacy-run-api-task",
+            title="Legacy run API",
+            goal="Read a legacy Run without widening the create contract.",
+            workflow_pack="research",
+        )
+    )
+    raw_run = {
+        "id": "legacy-run-api",
+        "task_id": task.id,
+        "status": "completed",
+    }
+    with state.storage.transaction():
+        state.storage.conn.execute(
+            "INSERT INTO runs (id, task_id, status, data) VALUES (?, ?, ?, ?)",
+            (raw_run["id"], task.id, raw_run["status"], json.dumps(raw_run)),
+        )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        listed_before = client.get("/runs")
+        fetched_before = client.get(f"/runs/{raw_run['id']}")
+        detailed_before = client.get(f"/runs/{raw_run['id']}/detail")
+
+        assert listed_before.status_code == 200
+        assert fetched_before.status_code == 200
+        assert detailed_before.status_code == 200
+        assert listed_before.json() == [fetched_before.json()]
+        assert detailed_before.json()["run"] == fetched_before.json()
+        assert fetched_before.json()["confirmed_real_web_tools"] is None
+        assert fetched_before.json()["confirmed_real_web_tool_routes"] is None
+
+        restored = state.storage.get_run(raw_run["id"])
+        assert restored is not None
+        state.storage.update_run(
+            restored.model_copy(update={"status": RunStatus.CANCELLED})
+        )
+
+        listed_after = client.get("/runs")
+        fetched_after = client.get(f"/runs/{raw_run['id']}")
+        detailed_after = client.get(f"/runs/{raw_run['id']}/detail")
+        explicit_null = client.post(
+            "/runs",
+            json={
+                "task_id": task.id,
+                "confirmed_real_web_tools": None,
+                "confirmed_real_web_tool_routes": None,
+            },
+        )
+
+        assert listed_after.status_code == 200
+        assert fetched_after.status_code == 200
+        assert detailed_after.status_code == 200
+        assert listed_after.json() == [fetched_after.json()]
+        assert detailed_after.json()["run"] == fetched_after.json()
+        assert fetched_after.json()["status"] == "cancelled"
+        assert fetched_after.json()["confirmed_real_web_tools"] is None
+        assert fetched_after.json()["confirmed_real_web_tool_routes"] is None
+        assert explicit_null.status_code == 400
+        assert len(state.storage.list_runs()) == 1
 
 
 def test_task_creation_rejects_invalid_unicode_with_client_error(tmp_path) -> None:

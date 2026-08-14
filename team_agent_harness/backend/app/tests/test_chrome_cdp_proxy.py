@@ -5,6 +5,7 @@ import http.client
 import json
 from pathlib import Path
 import socket
+import threading
 
 import pytest
 
@@ -327,6 +328,53 @@ def test_chrome_proxy_handler_implements_atomic_cdp_bridge_protocol(monkeypatch)
     assert payload == {"error": "not_found"}
     assert _call_handler_response(handler, "GET", "/new")[0] == 404
     assert _call_handler_response(handler, "GET", "/close?target=target-1")[0] == 404
+
+
+def test_shutdown_closes_managed_chrome_before_stopping_proxy_server(tmp_path) -> None:
+    module = load_script_module()
+    events = []
+    server_stopped = threading.Event()
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            events.append("chrome-terminated")
+
+        def wait(self, timeout: float) -> None:
+            events.append(("chrome-waited", timeout))
+
+    class FakeEgress:
+        def close(self) -> None:
+            events.append("egress-closed")
+
+    class FakeServer:
+        def shutdown(self) -> None:
+            events.append("server-stopped")
+            server_stopped.set()
+
+    state = module.ChromeProxyState(
+        chrome_path="chrome.exe",
+        profile_dir=tmp_path / "profile",
+        debug_port=9223,
+        startup_timeout=0.1,
+    )
+    state.process = FakeProcess()
+    state.egress_proxy = FakeEgress()
+
+    status, payload = _call_handler_response(
+        module._handler_factory(state),
+        "POST",
+        "/shutdown",
+        server=FakeServer(),
+    )
+
+    assert status == 200
+    assert payload == {"status": "stopping"}
+    assert server_stopped.wait(timeout=1)
+    assert events[:3] == ["chrome-terminated", ("chrome-waited", 5), "egress-closed"]
+    assert events[3:] == ["server-stopped"]
 
 
 def test_bridge_rejects_browser_requests_without_client_header(monkeypatch) -> None:
@@ -1130,6 +1178,7 @@ def _call_handler_response(
     authorized: bool = True,
     host: str | list[str] = "127.0.0.1:3456",
     origin: str | None = None,
+    server=None,
 ) -> tuple[int, dict[str, object]]:
     instance = object.__new__(handler_class)
     instance.path = path
@@ -1142,6 +1191,8 @@ def _call_handler_response(
     if authorized:
         instance.headers.add_header("X-Team-Agent-Browser-Proxy", "1")
     instance.rfile = FakeReader(body)
+    if server is not None:
+        instance.server = server
     instance.send_response = lambda status: setattr(instance, "status", status)
     instance.send_header = lambda _name, _value: None
     instance.end_headers = lambda: None

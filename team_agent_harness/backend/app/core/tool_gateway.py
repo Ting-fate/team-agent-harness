@@ -106,6 +106,7 @@ class ToolDefinition:
     input_schema: dict[str, Any] | None = None
     side_effect: Literal["none", "local_write", "local_execute", "external_write"] = "none"
     real_web_call_enabled: Callable[[], bool] | None = None
+    real_web_provider: Callable[[], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,8 @@ class ToolContext:
     agent: AgentDefinition
     allowed_tools: frozenset[str]
     real_web_access_confirmed: bool = False
+    confirmed_real_web_tools: frozenset[str] | None = frozenset()
+    confirmed_real_web_tool_routes: frozenset[tuple[str, str]] | None = frozenset()
     enforce_side_effect_approval: bool = False
     approved_side_effect_tools: frozenset[str] = frozenset()
 
@@ -225,11 +228,40 @@ class ToolGateway:
         if (
             definition.real_web_call_enabled is not None
             and definition.real_web_call_enabled()
-            and not context.real_web_access_confirmed
         ):
-            raise ToolPermissionError(
-                f"Persisted real web access confirmation is required for tool: {tool_name}"
-            )
+            if not context.real_web_access_confirmed:
+                raise ToolPermissionError(
+                    f"Persisted real web access confirmation is required for tool: {tool_name}"
+                )
+            confirmed_tools = context.confirmed_real_web_tools
+            confirmed_routes = context.confirmed_real_web_tool_routes
+            if (confirmed_tools is None) != (confirmed_routes is None):
+                raise ToolPermissionError(
+                    f"Persisted real web tool snapshot is incomplete for tool: {tool_name}"
+                )
+            if confirmed_tools is None and confirmed_routes is None:
+                return
+            if definition.real_web_provider is None:
+                raise ToolPermissionError(
+                    f"Real web provider identity is unavailable for tool: {tool_name}"
+                )
+            raw_provider = definition.real_web_provider()
+            if not isinstance(raw_provider, str):
+                raise ToolPermissionError(
+                    f"Real web provider identity is unavailable for tool: {tool_name}"
+                )
+            provider = raw_provider.strip().lower()
+            if not provider:
+                raise ToolPermissionError(
+                    f"Real web provider identity is unavailable for tool: {tool_name}"
+                )
+            if (
+                tool_name not in confirmed_tools
+                or (tool_name, provider) not in confirmed_routes
+            ):
+                raise ToolPermissionError(
+                    f"Tool is not present in the persisted run tool snapshot: {tool_name}"
+                )
 
     def _validate_payload(self, definition: ToolDefinition, payload: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -313,6 +345,7 @@ def create_mock_gateway(
             real_web_call_enabled=lambda: (
                 web_tool_provider.provider_name != "mock" and web_tool_provider.real_calls_enabled
             ),
+            real_web_provider=lambda: web_tool_provider.provider_name,
         )
     )
     gateway.register_tool(
@@ -334,6 +367,7 @@ def create_mock_gateway(
             real_web_call_enabled=lambda: (
                 web_tool_provider.provider_name != "mock" and web_tool_provider.real_calls_enabled
             ),
+            real_web_provider=lambda: web_tool_provider.provider_name,
         )
     )
     gateway.register_tool(
@@ -353,6 +387,7 @@ def create_mock_gateway(
                 browser_tool_provider.provider_name != "mock"
                 and browser_tool_provider.real_calls_enabled
             ),
+            real_web_provider=lambda: browser_tool_provider.provider_name,
         )
     )
     gateway.register_tool(
@@ -366,6 +401,7 @@ def create_mock_gateway(
                 browser_tool_provider.provider_name != "mock"
                 and browser_tool_provider.real_calls_enabled
             ),
+            real_web_provider=lambda: browser_tool_provider.provider_name,
         )
     )
     gateway.register_tool(

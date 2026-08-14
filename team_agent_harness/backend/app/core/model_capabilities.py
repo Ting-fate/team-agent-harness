@@ -6,7 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 CAPABILITIES_CONFIG_ENV = "TEAM_AGENT_MODEL_CAPABILITIES_CONFIG"
@@ -22,6 +22,7 @@ class ModelCapability:
     provider: str
     model_pattern: str
     protocol: str
+    model_family: Literal["gpt", "deepseek"] | None = None
     supports_tools: bool = False
     supports_streaming: bool = False
     supports_vision: bool = False
@@ -40,6 +41,8 @@ class ModelCapability:
             raise ValueError(f"Unsupported capability schema_version: {self.schema_version}")
         if self.provider == "mock" and self.supports_vision:
             raise ValueError("The mock provider cannot declare vision support")
+        if self.model_family not in {None, "gpt", "deepseek"}:
+            raise ValueError("model_family must be gpt, deepseek, or null")
         for name in ("context_window", "max_output_tokens"):
             value = getattr(self, name)
             if value is not None and (type(value) is not int or value <= 0):
@@ -61,6 +64,7 @@ class ModelCapability:
             "provider": self.provider,
             "model_pattern": self.model_pattern,
             "protocol": self.protocol,
+            "model_family": self.model_family,
             "supports_tools": self.supports_tools,
             "supports_streaming": self.supports_streaming,
             "supports_vision": self.supports_vision,
@@ -219,11 +223,22 @@ def default_model_capability_registry() -> CapabilityRegistry:
                 provider="litellm_proxy",
                 model_pattern="gpt5.5",
                 protocol="chat_completions",
+                model_family="gpt",
                 supports_tools=True,
                 supports_streaming=True,
                 supports_vision=True,
                 supports_reasoning=True,
                 supports_web_sidecar=True,
+            ),
+            ModelCapability(
+                provider="litellm_proxy",
+                model_pattern="deepseek-v4-pro",
+                protocol="chat_completions",
+                model_family="deepseek",
+                supports_tools=True,
+                supports_streaming=True,
+                context_window=None,
+                max_output_tokens=None,
             ),
             ModelCapability(
                 provider="litellm_proxy",

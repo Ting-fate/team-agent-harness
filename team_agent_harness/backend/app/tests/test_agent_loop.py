@@ -21,7 +21,7 @@ from app.core.model_runtime import (
 from app.core.model_capabilities import CapabilityRegistry, ModelCapability
 from app.core.models import AgentDefinition, AgentRun, Run, Task, TraceEventType
 from app.core.storage import SQLiteStorage
-from app.core.tool_gateway import create_mock_gateway
+from app.core.tool_gateway import ToolDefinition, ToolGateway, create_mock_gateway
 from app.core.trace import TraceLogger
 from app.packs.base import AgentLoopPolicy, WorkflowStep
 
@@ -150,6 +150,61 @@ def test_agent_loop_calls_typed_tool_then_revises_with_observation(tmp_path: Pat
         event_types = [event.event_type for event in logger.list_for_run(run.id)]
         assert TraceEventType.TOOL_CALL in event_types
         assert TraceEventType.TOOL_RESULT in event_types
+    finally:
+        storage.close()
+
+
+def test_agent_loop_passes_exact_real_web_route_snapshot_to_gateway(tmp_path: Path) -> None:
+    responses = [
+        ModelResponse(
+            text="",
+            usage={"input_tokens": 4, "output_tokens": 1},
+            finish_reason="tool_calls",
+            raw_provider="scripted",
+            adapter="scripted",
+            mocked=False,
+            tool_calls=[ModelToolCall(id="call-web", name="web_search", arguments={})],
+        ),
+        ModelResponse(
+            text="The authorized web route was used.",
+            usage={"input_tokens": 8, "output_tokens": 4},
+            raw_provider="scripted",
+            adapter="scripted",
+            mocked=False,
+        ),
+    ]
+    storage, logger, task, run, step, agent, _, executor, request = _loop_env(tmp_path, responses)
+    calls: list[str] = []
+    gateway = ToolGateway(logger)
+    gateway.register_tool(
+        ToolDefinition(
+            name="web_search",
+            description="Use the authorized Tavily route.",
+            required_fields=frozenset(),
+            handler=lambda _payload: calls.append("tavily") or {"provider": "tavily"},
+            real_web_call_enabled=lambda: True,
+            real_web_provider=lambda: "tavily",
+        )
+    )
+    executor.tool_gateway = gateway
+    run = Run.model_validate(
+        {
+            **run.model_dump(mode="json"),
+            "real_web_access_confirmed": True,
+            "confirmed_real_web_tools": ["web_search"],
+            "confirmed_real_web_tool_routes": [
+                {"name": "web_search", "provider": "tavily"},
+            ],
+        }
+    )
+    agent = agent.model_copy(update={"tool_permissions": ["web_search"]})
+    step = step.model_copy(update={"allowed_tools": ["web_search"]})
+
+    try:
+        result = executor.execute(task=task, run=run, step=step, agent=agent, request=request)
+
+        assert result.text == "The authorized web route was used."
+        assert calls == ["tavily"]
     finally:
         storage.close()
 

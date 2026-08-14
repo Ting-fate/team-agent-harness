@@ -429,6 +429,8 @@ class WorkflowRunner:
                     pass
 
     def _run(self, run: Run, pack: WorkflowPack, *, resume_waiting: bool) -> Run:
+        if (run.execution_plan is None) != (run.execution_plan_hash is None):
+            raise WorkflowRunnerError("Persisted execution plan and hash are incomplete.")
         active_run = self._start_run(run, resume_waiting=resume_waiting)
         task = self._task_for_run(active_run)
         last_completed_agent_run: AgentRun | None = None
@@ -617,6 +619,8 @@ class WorkflowRunner:
             raise WorkflowRunnerError(_safe_error_message(exc)) from exc
 
     def _resolved_execution_plan_pack(self, run: Run, pack: WorkflowPack) -> WorkflowPack:
+        if (run.execution_plan is None) != (run.execution_plan_hash is None):
+            raise WorkflowRunnerError("Persisted execution plan and hash are incomplete.")
         if run.execution_plan is None:
             return pack
         try:

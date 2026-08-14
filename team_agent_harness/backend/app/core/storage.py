@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from threading import RLock
 from collections.abc import Iterable
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Self
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.core.models import (
+    ALLOW_LEGACY_REAL_WEB_SNAPSHOT_CONTEXT,
     AgentDefinition,
     AgentRun,
     AgentSession,
@@ -32,6 +34,13 @@ from app.core.models import (
 
 class StorageError(RuntimeError):
     pass
+
+
+class RunRecordIntegrityError(StorageError):
+    def __init__(self, run_id: str, *, reason: str = "invalid_payload") -> None:
+        super().__init__(f"Persisted run record is invalid: {run_id}")
+        self.run_id = run_id
+        self.reason = reason
 
 
 class SQLiteStorage:
@@ -278,7 +287,11 @@ class SQLiteStorage:
         return run
 
     def get_run(self, run_id: str) -> Run | None:
-        return self._get_model("runs", run_id, Run)
+        with self._lock:
+            row = self.conn.execute("SELECT data FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        return _load_persisted_run(row["data"], fallback_run_id=run_id)
 
     def list_runs(self, *, limit: int | None = None, offset: int = 0) -> list[Run]:
         order_by = "rowid DESC" if limit is not None else "id ASC"
@@ -291,16 +304,32 @@ class SQLiteStorage:
         placeholders = ", ".join("?" for _ in status_values)
         with self._lock:
             rows = self.conn.execute(
-                f"SELECT data FROM runs WHERE status IN ({placeholders}) ORDER BY id ASC",
+                f"SELECT id, data FROM runs WHERE status IN ({placeholders}) ORDER BY id ASC",
                 status_values,
             ).fetchall()
-        return [Run.model_validate_json(row["data"]) for row in rows]
+        return [
+            _load_persisted_run(row["data"], fallback_run_id=row["id"])
+            for row in rows
+        ]
 
     def list_runs_requiring_worker_recovery(self) -> list[Run]:
+        runs: list[Run] = []
+        for run_id in self.list_run_ids_requiring_worker_recovery():
+            run = self.get_run(run_id)
+            if run is not None:
+                runs.append(run)
+        return runs
+
+    def list_run_ids(self) -> list[str]:
+        with self._lock:
+            rows = self.conn.execute("SELECT id FROM runs ORDER BY id ASC").fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def list_run_ids_requiring_worker_recovery(self) -> list[str]:
         with self._lock:
             rows = self.conn.execute(
                 """
-                SELECT runs.data
+                SELECT runs.id
                 FROM runs
                 WHERE runs.status IN (?, ?)
                    OR EXISTS (
@@ -338,7 +367,72 @@ class SQLiteStorage:
                     RuntimeJobStatus.CANCELLED.value,
                 ),
             ).fetchall()
-        return [Run.model_validate_json(row["data"]) for row in rows]
+        return [str(row["id"]) for row in rows]
+
+    def terminalize_incomplete_execution_plan_pair(self, run_id: str) -> Run:
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT data FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise StorageError(f"runs row not found: {run_id}")
+            try:
+                payload = json.loads(row["data"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StorageError(f"Persisted run record is not valid JSON: {run_id}") from exc
+            if type(payload) is not dict:
+                raise StorageError(f"Persisted run record is not an object: {run_id}")
+            if payload.get("id") != run_id:
+                raise RunRecordIntegrityError(run_id, reason="identity_mismatch")
+
+            plan_present = payload.get("execution_plan") is not None
+            hash_present = payload.get("execution_plan_hash") is not None
+            if plan_present == hash_present:
+                raise StorageError(
+                    f"Persisted run does not have an incomplete execution plan pair: {run_id}"
+                )
+
+            _complete_execution_plan_pair_with_failure_sentinel(payload)
+
+            now = datetime.now(UTC)
+            payload.update(
+                {
+                    "status": RunStatus.FAILED.value,
+                    "current_step": None,
+                    "finished_at": now.isoformat(),
+                }
+            )
+            try:
+                legacy_snapshot = _prepare_persisted_run_snapshot(payload, run_id)
+                failed = _validate_persisted_run(payload, legacy_snapshot=legacy_snapshot)
+            except (RunRecordIntegrityError, ValidationError) as exc:
+                raise StorageError(f"Persisted run record cannot be terminalized: {run_id}") from exc
+            self._update_model(
+                "runs",
+                failed,
+                {
+                    "task_id": failed.task_id,
+                    "status": failed.status.value,
+                    "started_at": _dt(failed.started_at),
+                    "finished_at": _dt(failed.finished_at),
+                },
+            )
+        return failed
+
+    def quarantine_invalid_run_record(self, run_id: str) -> None:
+        now = datetime.now(UTC)
+        with self.transaction():
+            cursor = self.conn.execute(
+                """
+                UPDATE runs
+                SET status = ?, finished_at = ?
+                WHERE id = ?
+                """,
+                (RunStatus.FAILED.value, now.isoformat(), run_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError(f"runs row not found: {run_id}")
 
     def update_run(self, run: Run) -> Run:
         if run.final_artifact_id is not None:
@@ -830,6 +924,8 @@ class SQLiteStorage:
             row = self.conn.execute(f"SELECT data FROM {table} WHERE id = ?", (model_id,)).fetchone()
         if row is None:
             return None
+        if model_type is Run:
+            return _load_persisted_run(row["data"], fallback_run_id=model_id)
         return model_type.model_validate_json(row["data"])
 
     def _list_models[T: BaseModel](
@@ -856,14 +952,120 @@ class SQLiteStorage:
             raise StorageError("list offset requires a limit")
         with self._lock:
             rows = self.conn.execute(
-                f"SELECT data FROM {table}{where_sql} ORDER BY {order_by}{page_sql}",
+                f"SELECT id, data FROM {table}{where_sql} ORDER BY {order_by}{page_sql}",
                 params,
             ).fetchall()
+        if model_type is Run:
+            return [
+                _load_persisted_run(row["data"], fallback_run_id=row["id"])
+                for row in rows
+            ]
         return [model_type.model_validate_json(row["data"]) for row in rows]
 
 
 def _dump(model: BaseModel) -> str:
+    if isinstance(model, Run):
+        names = model.confirmed_real_web_tools
+        routes = model.confirmed_real_web_tool_routes
+        if names is None or routes is None:
+            if (
+                names is not None
+                or routes is not None
+                or model._legacy_real_web_snapshot_run_id != model.id
+            ):
+                raise RunRecordIntegrityError(model.id)
+            return model.model_dump_json(
+                by_alias=True,
+                exclude={
+                    "confirmed_real_web_tools",
+                    "confirmed_real_web_tool_routes",
+                },
+            )
     return model.model_dump_json(by_alias=True)
+
+
+def _load_persisted_run(raw_data: str, *, fallback_run_id: str | None = None) -> Run:
+    run_id = fallback_run_id or "unknown"
+    try:
+        payload = json.loads(raw_data)
+        if type(payload) is not dict:
+            raise ValueError("Persisted Run JSON must be an object.")
+        payload_run_id = payload.get("id")
+        if fallback_run_id is not None and payload_run_id != fallback_run_id:
+            raise RunRecordIntegrityError(fallback_run_id, reason="identity_mismatch")
+        if isinstance(payload_run_id, str) and payload_run_id:
+            run_id = payload_run_id
+        if _has_incomplete_execution_plan_pair(payload):
+            repaired_payload = payload.copy()
+            _complete_execution_plan_pair_with_failure_sentinel(repaired_payload)
+            legacy_snapshot = _prepare_persisted_run_snapshot(repaired_payload, run_id)
+            _validate_persisted_run(repaired_payload, legacy_snapshot=legacy_snapshot)
+            raise RunRecordIntegrityError(
+                run_id,
+                reason="incomplete_execution_plan_pair",
+            )
+        legacy_snapshot = _prepare_persisted_run_snapshot(payload, run_id)
+        return _validate_persisted_run(payload, legacy_snapshot=legacy_snapshot)
+    except RunRecordIntegrityError:
+        raise
+    except (TypeError, ValueError, ValidationError, json.JSONDecodeError) as exc:
+        raise RunRecordIntegrityError(run_id) from exc
+
+
+def _prepare_persisted_run_snapshot(payload: dict[str, Any], run_id: str) -> bool:
+    names_present = "confirmed_real_web_tools" in payload
+    routes_present = "confirmed_real_web_tool_routes" in payload
+    if names_present != routes_present:
+        raise RunRecordIntegrityError(run_id, reason="invalid_real_web_snapshot")
+    if names_present:
+        return False
+    payload["confirmed_real_web_tools"] = None
+    payload["confirmed_real_web_tool_routes"] = None
+    return True
+
+
+def _has_incomplete_execution_plan_pair(payload: dict[str, Any]) -> bool:
+    plan_present = payload.get("execution_plan") is not None
+    hash_present = payload.get("execution_plan_hash") is not None
+    return plan_present != hash_present
+
+
+def _complete_execution_plan_pair_with_failure_sentinel(payload: dict[str, Any]) -> None:
+    if payload.get("execution_plan") is None:
+        payload["execution_plan"] = {}
+    if payload.get("execution_plan_hash") is not None:
+        return
+
+    sentinel_hash = "0" * 64
+    try:
+        from app.core.execution_plan import ExecutionPlan, execution_plan_hash
+
+        expected_hash = execution_plan_hash(
+            ExecutionPlan.model_validate(payload["execution_plan"])
+        )
+    except (TypeError, ValueError):
+        expected_hash = None
+    if expected_hash == sentinel_hash:
+        sentinel_hash = "1" * 64
+    payload["execution_plan_hash"] = sentinel_hash
+
+
+def _validate_persisted_run(
+    payload: dict[str, Any],
+    *,
+    legacy_snapshot: bool,
+) -> Run:
+    run = Run.model_validate(
+        payload,
+        context=(
+            {ALLOW_LEGACY_REAL_WEB_SNAPSHOT_CONTEXT: True}
+            if legacy_snapshot
+            else None
+        ),
+    )
+    if legacy_snapshot:
+        run._legacy_real_web_snapshot_run_id = run.id
+    return run
 
 
 def _dt(value: Any) -> str | None:

@@ -1,3 +1,4 @@
+import json
 from threading import Event, Thread
 from time import monotonic, sleep
 
@@ -5,9 +6,11 @@ from fastapi.testclient import TestClient
 import pytest
 
 from app.core import run_control
+from app.core.execution_plan import execution_plan_from_pack, execution_plan_hash, freeze_execution_plan
 from app.core.models import (
     AgentRun,
     AgentRunStatus,
+    AgentSession,
     AgentSessionStatus,
     ArtifactType,
     EvalResult,
@@ -19,13 +22,14 @@ from app.core.models import (
     RunQueueItem,
     RunQueueItemStatus,
     RunStatus,
+    RuntimeJob,
     RuntimeJobStatus,
     Task,
     TraceEventType,
     utc_now,
 )
 from app.core.runner import AgentArtifactOutput, AgentStepOutput
-from app.core.storage import StorageError
+from app.core.storage import SQLiteStorage, StorageError
 from app.main import create_app
 from app.tests.worker_test_utils import (
     ASYNC_WORKER_TIMEOUT_SECONDS,
@@ -748,6 +752,347 @@ def test_worker_requeues_interrupted_run_from_last_completed_step(tmp_path) -> N
         assert "interrupted_run_requeued" in actions
 
 
+@pytest.mark.parametrize("missing_field", ["execution_plan", "execution_plan_hash"])
+def test_worker_terminalizes_persisted_run_with_incomplete_execution_plan_pair(
+    tmp_path,
+    missing_field: str,
+) -> None:
+    executor = RecordingExecutor()
+    app = create_app(
+        tmp_path / "harness.sqlite3",
+        tmp_path / "artifacts",
+        executor_factory=lambda: executor,
+    )
+    state = app.state.harness
+    pack = state.packs["code_rd"]
+    task = state.storage.create_task(
+        Task(
+            id=f"incomplete-plan-{missing_field}-task",
+            title="Reject an incomplete frozen plan",
+            goal="Fail closed without executing the current Pack.",
+            workflow_pack=pack.name,
+        )
+    )
+    plan = execution_plan_from_pack(pack)
+    run = Run(id=f"incomplete-plan-{missing_field}-run", task_id=task.id).model_copy(
+        update={
+            "execution_plan": None if missing_field == "execution_plan" else plan.model_dump(mode="json"),
+            "execution_plan_hash": (
+                None if missing_field == "execution_plan_hash" else execution_plan_hash(plan)
+            ),
+        }
+    )
+    state.storage.create_run(run)
+    with state.storage.transaction():
+        raw_row = state.storage.conn.execute(
+            "SELECT data FROM runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()
+        raw_payload = json.loads(raw_row["data"])
+        raw_payload.pop("confirmed_real_web_tools")
+        raw_payload.pop("confirmed_real_web_tool_routes")
+        state.storage.conn.execute(
+            "UPDATE runs SET data = ? WHERE id = ?",
+            (json.dumps(raw_payload), run.id),
+        )
+    queue_item = state.storage.create_run_queue_item(
+        RunQueueItem(
+            id=f"incomplete-plan-{missing_field}-queue",
+            run_id=run.id,
+            action="background_start_run",
+            status=RunQueueItemStatus.QUEUED,
+            metadata={"background_worker_started": True},
+        )
+    )
+
+    with TestClient(app) as client:
+        persisted = state.storage.get_run(run.id)
+        team_response = client.get(f"/runs/{run.id}/team")
+        persisted_queue_item = state.storage.get_run_queue_item(queue_item.id)
+        trace_events = state.storage.list_trace_events_for_run(run.id)
+
+    assert persisted is not None
+    assert persisted.status == RunStatus.FAILED
+    assert persisted.execution_plan is not None
+    assert persisted.execution_plan_hash is not None
+    if missing_field == "execution_plan":
+        assert persisted.execution_plan == {}
+        assert persisted.execution_plan_hash == execution_plan_hash(plan)
+    else:
+        assert persisted.execution_plan == plan.model_dump(mode="json")
+        assert persisted.execution_plan_hash != execution_plan_hash(plan)
+    assert team_response.status_code == 409
+    assert executor.steps == []
+    assert persisted_queue_item is not None
+    assert persisted_queue_item.status == RunQueueItemStatus.FAILED
+    assert any(
+        event.payload.get("action") == "background_run_failed"
+        and event.payload.get("outcome") == "execution_plan_integrity"
+        for event in trace_events
+    )
+    with SQLiteStorage(tmp_path / "harness.sqlite3") as restarted_storage:
+        restarted_storage.init_schema()
+        terminal_payload = json.loads(
+            restarted_storage.conn.execute(
+                "SELECT data FROM runs WHERE id = ?",
+                (run.id,),
+            ).fetchone()["data"]
+        )
+        assert "confirmed_real_web_tools" not in terminal_payload
+        assert "confirmed_real_web_tool_routes" not in terminal_payload
+        restarted = restarted_storage.get_run(run.id)
+        assert restarted is not None
+        assert restarted.status == RunStatus.FAILED
+        assert restarted.confirmed_real_web_tools is None
+        assert restarted.confirmed_real_web_tool_routes is None
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "explicit_null_web_snapshot",
+        "incomplete_plan_and_null_web_snapshot",
+        "payload_id_mismatch",
+        "invalid_json",
+    ],
+)
+def test_worker_quarantines_invalid_run_record_without_blocking_startup(
+    tmp_path,
+    corruption: str,
+) -> None:
+    executor = RecordingExecutor()
+    app = create_app(
+        tmp_path / "harness.sqlite3",
+        tmp_path / "artifacts",
+        executor_factory=lambda: executor,
+    )
+    state = app.state.harness
+    pack = state.packs["code_rd"]
+    frozen_plan = freeze_execution_plan(execution_plan_from_pack(pack), pack)
+
+    invalid_task = state.storage.create_task(
+        Task(
+            id=f"invalid-record-{corruption}-task",
+            title="Quarantine an invalid persisted Run",
+            goal="Keep the worker available for healthy persisted work.",
+            workflow_pack=pack.name,
+        )
+    )
+    invalid_run = state.storage.create_run(
+        Run(
+            id=f"invalid-record-{corruption}-run",
+            task_id=invalid_task.id,
+            execution_plan=frozen_plan.model_dump(mode="json"),
+            execution_plan_hash=execution_plan_hash(frozen_plan),
+        )
+    )
+    invalid_queue = state.storage.create_run_queue_item(
+        RunQueueItem(
+            id=f"invalid-record-{corruption}-queue",
+            run_id=invalid_run.id,
+            action="background_start_run",
+            metadata={"background_worker_started": True},
+        )
+    )
+    invalid_lock = state.storage.create_run_lock(
+        RunLock(
+            id=f"invalid-record-{corruption}-lock",
+            run_id=invalid_run.id,
+            owner="api:background_start_run",
+        )
+    )
+    state.storage.upsert_agent_definition(pack.agents[0])
+    invalid_agent_run = state.storage.create_agent_run(
+        AgentRun(
+            id=f"invalid-record-{corruption}-agent-run",
+            run_id=invalid_run.id,
+            agent_id=pack.agents[0].id,
+            step_name=pack.steps[0].name,
+            status=AgentRunStatus.RUNNING,
+            started_at=utc_now(),
+        )
+    )
+    invalid_session = state.storage.create_agent_session(
+        AgentSession(
+            id=f"invalid-record-{corruption}-session",
+            run_id=invalid_run.id,
+            agent_run_id=invalid_agent_run.id,
+            agent_id=invalid_agent_run.agent_id,
+            step_name=invalid_agent_run.step_name,
+            runtime="session",
+        )
+    )
+    invalid_job = state.storage.create_runtime_job(
+        RuntimeJob(
+            id=f"invalid-record-{corruption}-job",
+            run_id=invalid_run.id,
+            agent_run_id=invalid_agent_run.id,
+            agent_session_id=invalid_session.id,
+            step_name=invalid_agent_run.step_name,
+            runtime=invalid_session.runtime,
+        )
+    )
+
+    healthy_task = state.storage.create_task(
+        Task(
+            id=f"healthy-after-{corruption}-task",
+            title="Run after invalid persisted state",
+            goal="Prove startup continues after quarantine.",
+            workflow_pack=pack.name,
+        )
+    )
+    healthy_run = state.storage.create_run(
+        Run(
+            id=f"healthy-after-{corruption}-run",
+            task_id=healthy_task.id,
+            execution_plan=frozen_plan.model_dump(mode="json"),
+            execution_plan_hash=execution_plan_hash(frozen_plan),
+        )
+    )
+    state.storage.create_run_queue_item(
+        RunQueueItem(
+            id=f"healthy-after-{corruption}-queue",
+            run_id=healthy_run.id,
+            action="background_start_run",
+            metadata={"background_worker_started": True},
+        )
+    )
+
+    raw_row = state.storage.conn.execute(
+        "SELECT data FROM runs WHERE id = ?",
+        (invalid_run.id,),
+    ).fetchone()
+    raw_payload = json.loads(raw_row["data"])
+    if corruption == "explicit_null_web_snapshot":
+        raw_payload["confirmed_real_web_tools"] = None
+        raw_payload["confirmed_real_web_tool_routes"] = None
+        corrupted_data = json.dumps(raw_payload)
+    elif corruption == "incomplete_plan_and_null_web_snapshot":
+        raw_payload["execution_plan_hash"] = None
+        raw_payload["confirmed_real_web_tools"] = None
+        raw_payload["confirmed_real_web_tool_routes"] = None
+        corrupted_data = json.dumps(raw_payload)
+    elif corruption == "payload_id_mismatch":
+        raw_payload["id"] = f"payload-{invalid_run.id}"
+        corrupted_data = json.dumps(raw_payload)
+    else:
+        corrupted_data = "{invalid-json"
+    with state.storage.transaction():
+        state.storage.conn.execute(
+            "UPDATE runs SET data = ? WHERE id = ?",
+            (corrupted_data, invalid_run.id),
+        )
+
+    with TestClient(app) as client:
+        completed = _wait_for_terminal_run(client, healthy_run.id)
+        invalid_response = client.get(f"/runs/{invalid_run.id}")
+        invalid_list_response = client.get("/runs")
+
+        invalid_row = state.storage.conn.execute(
+            "SELECT status, finished_at, data FROM runs WHERE id = ?",
+            (invalid_run.id,),
+        ).fetchone()
+        persisted_queue = state.storage.get_run_queue_item(invalid_queue.id)
+        persisted_lock = state.storage.get_run_lock(invalid_lock.id)
+        persisted_agent_run = state.storage.get_agent_run(invalid_agent_run.id)
+        persisted_session = state.storage.get_agent_session(invalid_session.id)
+        persisted_job = state.storage.get_runtime_job(invalid_job.id)
+
+    assert completed["status"] == RunStatus.COMPLETED.value
+    assert invalid_response.status_code == 409
+    assert invalid_list_response.status_code == 409
+    assert invalid_row["status"] == RunStatus.FAILED.value
+    assert invalid_row["finished_at"] is not None
+    assert invalid_row["data"] == corrupted_data
+    assert persisted_queue is not None and persisted_queue.status == RunQueueItemStatus.FAILED
+    assert persisted_lock is not None and persisted_lock.status == RunLockStatus.RELEASED
+    assert persisted_agent_run is not None and persisted_agent_run.status == AgentRunStatus.CANCELLED
+    assert persisted_session is not None and persisted_session.status == AgentSessionStatus.CANCELLED
+    assert persisted_job is not None and persisted_job.status == RuntimeJobStatus.CANCELLED
+
+
+def test_worker_quarantines_invalid_terminal_run_without_active_state(tmp_path) -> None:
+    executor = RecordingExecutor()
+    app = create_app(
+        tmp_path / "harness.sqlite3",
+        tmp_path / "artifacts",
+        executor_factory=lambda: executor,
+    )
+    state = app.state.harness
+    pack = state.packs["code_rd"]
+    frozen_plan = freeze_execution_plan(execution_plan_from_pack(pack), pack)
+    invalid_task = state.storage.create_task(
+        Task(
+            id="invalid-terminal-record-task",
+            title="Quarantine an invalid terminal Run",
+            goal="Validate every persisted Run during startup.",
+            workflow_pack=pack.name,
+        )
+    )
+    invalid_run = state.storage.create_run(
+        Run(
+            id="invalid-terminal-record-run",
+            task_id=invalid_task.id,
+            execution_plan=frozen_plan.model_dump(mode="json"),
+            execution_plan_hash=execution_plan_hash(frozen_plan),
+            status=RunStatus.COMPLETED,
+            finished_at=utc_now(),
+        )
+    )
+    raw_row = state.storage.conn.execute(
+        "SELECT data FROM runs WHERE id = ?",
+        (invalid_run.id,),
+    ).fetchone()
+    raw_payload = json.loads(raw_row["data"])
+    raw_payload["confirmed_real_web_tools"] = None
+    raw_payload["confirmed_real_web_tool_routes"] = None
+    corrupted_data = json.dumps(raw_payload)
+    with state.storage.transaction():
+        state.storage.conn.execute(
+            "UPDATE runs SET data = ? WHERE id = ?",
+            (corrupted_data, invalid_run.id),
+        )
+
+    healthy_task = state.storage.create_task(
+        Task(
+            id="healthy-after-invalid-terminal-task",
+            title="Run after invalid terminal state",
+            goal="Prove startup continues after full Run validation.",
+            workflow_pack=pack.name,
+        )
+    )
+    healthy_run = state.storage.create_run(
+        Run(
+            id="healthy-after-invalid-terminal-run",
+            task_id=healthy_task.id,
+            execution_plan=frozen_plan.model_dump(mode="json"),
+            execution_plan_hash=execution_plan_hash(frozen_plan),
+        )
+    )
+    state.storage.create_run_queue_item(
+        RunQueueItem(
+            id="healthy-after-invalid-terminal-queue",
+            run_id=healthy_run.id,
+            action="background_start_run",
+            metadata={"background_worker_started": True},
+        )
+    )
+
+    with TestClient(app) as client:
+        completed = _wait_for_terminal_run(client, healthy_run.id)
+        invalid_response = client.get(f"/runs/{invalid_run.id}")
+        invalid_row = state.storage.conn.execute(
+            "SELECT status, finished_at, data FROM runs WHERE id = ?",
+            (invalid_run.id,),
+        ).fetchone()
+
+    assert completed["status"] == RunStatus.COMPLETED.value
+    assert invalid_response.status_code == 409
+    assert invalid_row["status"] == RunStatus.FAILED.value
+    assert invalid_row["finished_at"] is not None
+    assert invalid_row["data"] == corrupted_data
+
+
 def test_worker_recovers_queued_run_with_running_queue_item_and_orphaned_lock(tmp_path) -> None:
     executor = RecordingExecutor()
     app = create_app(
@@ -1323,6 +1668,67 @@ def test_worker_terminalizes_queue_item_when_workflow_pack_is_missing(tmp_path) 
         persisted_queue_item = state.storage.get_run_queue_item(queue_item.id)
         assert persisted_queue_item is not None
         assert persisted_queue_item.status == RunQueueItemStatus.FAILED
+
+
+def test_worker_terminal_update_preserves_legacy_web_snapshot_omission(tmp_path) -> None:
+    database_path = tmp_path / "harness.sqlite3"
+    app = create_app(database_path, tmp_path / "artifacts")
+    state = app.state.harness
+    task = state.storage.create_task(
+        Task(
+            id="legacy-missing-pack-task",
+            title="Legacy missing pack",
+            goal="Preserve the legacy snapshot marker while failing the run.",
+            workflow_pack="missing-pack",
+        )
+    )
+    raw_run = {
+        "id": "legacy-missing-pack-run",
+        "task_id": task.id,
+        "status": RunStatus.QUEUED.value,
+    }
+    with state.storage.transaction():
+        state.storage.conn.execute(
+            "INSERT INTO runs (id, task_id, status, data) VALUES (?, ?, ?, ?)",
+            (raw_run["id"], task.id, RunStatus.QUEUED.value, json.dumps(raw_run)),
+        )
+    queue_item = state.storage.create_run_queue_item(
+        RunQueueItem(
+            id="legacy-missing-pack-queue",
+            run_id=raw_run["id"],
+            action="background_start_run",
+            metadata={"background_worker_started": True},
+        )
+    )
+
+    with TestClient(app):
+        deadline = monotonic() + ASYNC_WORKER_TIMEOUT_SECONDS
+        while monotonic() < deadline:
+            failed = state.storage.get_run(raw_run["id"])
+            if failed is not None and failed.status == RunStatus.FAILED:
+                break
+            sleep(0.02)
+        else:
+            raise AssertionError("legacy missing-pack run did not reach failed state")
+        persisted_queue_item = state.storage.get_run_queue_item(queue_item.id)
+        assert persisted_queue_item is not None
+        assert persisted_queue_item.status == RunQueueItemStatus.FAILED
+
+    with SQLiteStorage(database_path) as restarted_storage:
+        restarted_storage.init_schema()
+        terminal_payload = json.loads(
+            restarted_storage.conn.execute(
+                "SELECT data FROM runs WHERE id = ?",
+                (raw_run["id"],),
+            ).fetchone()["data"]
+        )
+        assert "confirmed_real_web_tools" not in terminal_payload
+        assert "confirmed_real_web_tool_routes" not in terminal_payload
+        restarted = restarted_storage.get_run(raw_run["id"])
+        assert restarted is not None
+        assert restarted.status == RunStatus.FAILED
+        assert restarted.confirmed_real_web_tools is None
+        assert restarted.confirmed_real_web_tool_routes is None
 
 
 def test_worker_missing_pack_terminalizes_open_runtime_state(tmp_path) -> None:

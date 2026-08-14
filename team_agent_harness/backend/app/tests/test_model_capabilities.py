@@ -15,6 +15,9 @@ def test_builtin_registry_exposes_safe_capabilities() -> None:
 
     match = registry.resolve("deepseek", "deepseek-chat")
     mock_match = registry.resolve("mock", "mock-model")
+    gpt_proxy_match = registry.resolve("litellm_proxy", "gpt5.5")
+    deepseek_proxy_match = registry.resolve("litellm_proxy", "deepseek-v4-pro")
+    wildcard_proxy_match = registry.resolve("litellm_proxy", "unattested-alias")
 
     assert match.known is True
     assert match.capability is not None
@@ -25,6 +28,12 @@ def test_builtin_registry_exposes_safe_capabilities() -> None:
     assert mock_match.capability.supports_vision is False
     assert mock_match.capability.input_price == 0.0
     assert mock_match.capability.output_price == 0.0
+    assert gpt_proxy_match.capability is not None
+    assert gpt_proxy_match.capability.model_family == "gpt"
+    assert deepseek_proxy_match.capability is not None
+    assert deepseek_proxy_match.capability.model_family == "deepseek"
+    assert wildcard_proxy_match.capability is not None
+    assert wildcard_proxy_match.capability.model_family is None
     assert "api_key" not in json.dumps(match.public_dict()).lower()
 
 
@@ -49,6 +58,16 @@ def test_mock_capability_cannot_claim_vision_support() -> None:
             model_pattern="*",
             protocol="mock",
             supports_vision=True,
+        )
+
+
+def test_model_capability_rejects_unknown_model_family() -> None:
+    with pytest.raises(ValueError, match="model_family"):
+        ModelCapability(
+            provider="litellm_proxy",
+            model_pattern="custom-model",
+            protocol="chat_completions",
+            model_family="claude",
         )
 
 

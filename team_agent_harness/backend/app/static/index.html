@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>团队 Multi-Agent Harness</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/static/styles.css?v=20260702-run-console" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260810-team-selection" />
   </head>
   <body>
     <a class="skip-link" href="#mainWorkspace">跳到主工作区</a>
@@ -260,6 +260,30 @@
                   <span>验收标准</span>
                   <textarea id="taskCriteria" name="acceptance_criteria" rows="3">产出最终产物，并能查看追踪事件与产物。</textarea>
                 </label>
+
+                <section id="teamConfigurator" class="team-configurator field-wide" aria-labelledby="teamConfiguratorTitle">
+                  <div class="team-configurator-heading">
+                    <div>
+                      <p class="eyebrow">Run Team</p>
+                      <h3 id="teamConfiguratorTitle">本次运行团队</h3>
+                    </div>
+                    <div class="button-row compact team-configurator-actions">
+                      <label class="team-selection-toggle" for="useCustomTeam">
+                        <input id="useCustomTeam" type="checkbox" />
+                        <span>使用自定义团队</span>
+                      </label>
+                      <span id="teamConfigStatus" class="status-pill muted">等待工作流</span>
+                      <button id="resetTeamSelectionButton" type="button" disabled>恢复模板</button>
+                    </div>
+                  </div>
+                  <div id="teamConfigSummary" class="team-config-summary empty" role="status" aria-live="polite">
+                    选择明确工作流后加载固定岗位。
+                  </div>
+                  <div id="teamConfigurationWarnings" class="team-configuration-warnings hidden" role="alert"></div>
+                  <div id="teamAssignments" class="team-assignment-list empty">
+                    自动识别模式沿用识别出的 Pack 路由；选择明确工作流后才能配置团队。
+                  </div>
+                </section>
 
                 <div class="button-row form-actions">
                   <button id="createTaskButton" class="primary" type="submit">创建任务</button>
@@ -578,10 +602,10 @@
               <div id="failureSummary" class="failure-summary hidden"></div>
 
               <div class="detail-tabs" role="tablist" aria-label="详情类型">
-                <button id="chainTab" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="chainPanel" data-tab="chain">执行链路</button>
-                <button id="traceTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tracePanel" data-tab="trace">追踪事件<span class="sr-only">Trace</span></button>
-                <button id="artifactTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="artifactPanel" data-tab="artifacts">产物<span class="sr-only">Artifacts</span></button>
-                <button id="evalTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="evalPanel" data-tab="evals">评估结果<span class="sr-only">Eval Results</span></button>
+                <button id="chainTab" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="chainPanel" data-tab="chain" tabindex="0">执行链路</button>
+                <button id="traceTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="tracePanel" data-tab="trace" tabindex="-1">追踪事件<span class="sr-only">Trace</span></button>
+                <button id="artifactTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="artifactPanel" data-tab="artifacts" tabindex="-1">产物<span class="sr-only">Artifacts</span></button>
+                <button id="evalTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="evalPanel" data-tab="evals" tabindex="-1">评估结果<span class="sr-only">Eval Results</span></button>
               </div>
 
               <div id="chainPanel" class="detail-section" role="tabpanel" aria-labelledby="chainTab"></div>
@@ -596,7 +620,7 @@
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </div>
 
-    <script src="/static/runtime.js?v=20260727-reliability" defer></script>
-    <script src="/static/app.js?v=20260727-reliability" defer></script>
+    <script src="/static/runtime.js?v=20260810-consent-snapshot-v4" defer></script>
+    <script src="/static/app.js?v=20260810-consent-snapshot-v4" defer></script>
   </body>
 </html>

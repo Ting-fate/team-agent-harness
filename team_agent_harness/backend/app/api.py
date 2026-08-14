@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha256
+from math import isfinite
 import os
 import re
 from collections.abc import Callable
@@ -10,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from pydantic import Field
+from fastapi.responses import JSONResponse
+from pydantic import Field, field_validator
 
 from app.core.agent_loop import AgentLoopExecutor
 from app.core.artifacts import ArtifactStore, ArtifactStoreError
@@ -52,7 +54,7 @@ from app.core.model_runtime import (
     ROUTABLE_MODEL_PROVIDERS,
     reasoning_effort_trace_payload,
 )
-from app.core.model_capabilities import CapabilityError
+from app.core.model_capabilities import CapabilityError, CapabilityRegistry, ModelCapability
 from app.core.multimodal import (
     MAX_FILE_BYTES,
     MAX_IMAGE_BYTES,
@@ -69,6 +71,7 @@ from app.core.models import (
     AgentSessionStatus,
     Artifact,
     ArtifactType,
+    ConfirmedRealWebToolRoute,
     EvalResult,
     EvalStatus,
     HarnessModel,
@@ -81,6 +84,8 @@ from app.core.models import (
     Task,
     TraceEvent,
     TraceEventType,
+    normalize_confirmed_real_web_tool_routes,
+    normalize_confirmed_real_web_tools,
 )
 from app.core.registry import AgentRegistry
 from app.core.run_control import RunCoordinationConflict, RunCoordinator
@@ -113,8 +118,17 @@ from app.core.skill_library import (
     read_skill_bindings,
     upsert_skill_binding,
 )
-from app.core.storage import SQLiteStorage, StorageError
+from app.core.storage import RunRecordIntegrityError, SQLiteStorage, StorageError
 from app.core.task_intake import TaskIntakeRequest, analyze_task_intake
+from app.core.team_selection import (
+    ResolvedTeamSelection,
+    TeamModelRoute,
+    TeamSelection,
+    TeamSelectionError,
+    TeamSelectionReceipt,
+    resolve_team_selection,
+    team_selection_receipt_from_plan,
+)
 from app.core.trace import TraceLogger
 from app.core.tool_gateway import ToolContext, ToolGatewayError, create_mock_gateway
 from app.core.web_tools import (
@@ -163,6 +177,15 @@ _RESEARCH_FETCH_MAX_BYTES = 8 * 1024
 _RESEARCH_EVIDENCE_SAFETY_NOTICE = UNTRUSTED_EXTERNAL_DATA_SAFETY_NOTICE
 _VISION_PREPROCESS_MAX_TOKENS = 2_048
 _VISION_PREPROCESS_MAX_DESCRIPTION_CHARS = 20_000
+_TEAM_DEEPSEEK_DEFAULT_ROLES = {
+    "ContextReader",
+    "ReviewGate",
+    "ContextReviewer",
+    "FinalReviewer",
+    "Reader",
+    "Verifier",
+    "Reviewer",
+}
 
 
 class TaskCreateRequest(HarnessModel):
@@ -179,15 +202,35 @@ class RunCreateRequest(HarnessModel):
     task_id: str = Field(min_length=1)
     confirm_real_models: bool = False
     confirm_real_web: bool = False
+    confirmed_real_web_tools: list[str] | None = Field(default=None, max_length=4)
+    confirmed_real_web_tool_routes: list[ConfirmedRealWebToolRoute] | None = Field(
+        default=None,
+        max_length=4,
+    )
     approved_side_effect_tools: list[str] = Field(default_factory=list, max_length=32)
     execution_plan: ExecutionPlan | None = None
+    team_selection: TeamSelection | None = None
     background: bool = False
+
+    @field_validator("confirmed_real_web_tools")
+    @classmethod
+    def validate_confirmed_real_web_tools(cls, value: list[str] | None) -> list[str] | None:
+        return normalize_confirmed_real_web_tools(value)
+
+    @field_validator("confirmed_real_web_tool_routes")
+    @classmethod
+    def validate_confirmed_real_web_tool_routes(
+        cls,
+        value: list[ConfirmedRealWebToolRoute] | None,
+    ) -> list[ConfirmedRealWebToolRoute] | None:
+        return normalize_confirmed_real_web_tool_routes(value)
 
 
 class ExecutionPlanGenerateRequest(HarnessModel):
     task_id: str = Field(min_length=1)
     planner_role: str | None = Field(default=None, min_length=1, max_length=200)
     confirm_real_models: bool = False
+    team_selection: TeamSelection | None = None
 
 
 class RouteCandidateRequest(HarnessModel):
@@ -286,6 +329,13 @@ class RunDetailResponse(HarnessModel):
     runtime_jobs: list[RunRuntimeJobResponse]
     queue_state: list[RunQueueItemResponse]
     lock_state: list[RunLockResponse]
+
+
+class RunTeamResponse(HarnessModel):
+    run_id: str = Field(min_length=1)
+    team_selection: TeamSelectionReceipt | None
+    execution_plan_hash: str | None
+    immutable: bool
 
 
 class WritebackPreviewRequest(HarnessModel):
@@ -388,6 +438,7 @@ def create_harness_state(
 def create_api_router(state: HarnessAppState) -> APIRouter:
     router = APIRouter()
     _register_task_routes(router, state)
+    _register_team_selection_routes(router, state)
     _register_execution_plan_routes(router, state)
     _register_run_routes(router, state)
     _register_runtime_job_routes(router, state)
@@ -440,6 +491,86 @@ def _register_task_routes(router: APIRouter, state: HarnessAppState) -> None:
         return task.model_dump(mode="json")
 
 
+def _register_team_selection_routes(router: APIRouter, state: HarnessAppState) -> None:
+    @router.post("/team-selections/validate")
+    def validate_team_selection(request: TeamSelection) -> dict[str, Any]:
+        pack = _pack_or_404(state, request.pack_name)
+        try:
+            resolved = resolve_team_selection(
+                pack,
+                request,
+                project_root=state.config_root,
+                capability_registry=state.model_gateway.capability_registry,
+            )
+            frozen_plan = freeze_execution_plan(execution_plan_from_pack(resolved.pack), resolved.pack)
+        except (TeamSelectionError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "valid": True,
+            "team_selection": resolved.receipt.model_dump(mode="json"),
+            "public_execution_plan_hash": execution_plan_hash(
+                frozen_plan.model_copy(update={"agent_snapshots": []})
+            ),
+            "immutable_after_run_creation": True,
+            "requires_real_model_confirmation": _pack_has_any_real_model_route(resolved.pack),
+        }
+
+    @router.get("/workflow-packs/{pack_name}/team-template")
+    def get_team_template(pack_name: str) -> dict[str, Any]:
+        pack = _pack_or_404(state, pack_name)
+        try:
+            bindings = {binding.agent_id: binding for binding in read_agent_bindings(state.config_root)}
+            role_cards = list_role_cards(state.config_root, include_content=False)
+        except RoleCardError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        assignments: list[dict[str, Any]] = []
+        slots: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for agent in pack.agents:
+            binding = bindings.get(agent.id)
+            role_card_id = binding.role_card_id if binding is not None else None
+            try:
+                route, warning = _team_route_template(
+                    agent,
+                    state.model_gateway.capability_registry,
+                )
+                _reject_sensitive_public_team_payload(agent.runtime_limits)
+                public_runtime_limits = _public_team_runtime_limits(agent.runtime_limits)
+            except TeamSelectionError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            assignments.append(
+                {
+                    "slot": agent.role,
+                    "role_card_id": role_card_id,
+                    "route": route.model_dump(mode="json"),
+                }
+            )
+            slots.append(
+                {
+                    "slot": agent.role,
+                    "agent_id": agent.id,
+                    "tool_permissions": list(agent.tool_permissions),
+                    "runtime_limits": public_runtime_limits,
+                }
+            )
+            if warning is not None:
+                warnings.append(warning)
+
+        selection = TeamSelection(pack_name=pack.name, assignments=assignments)
+        payload = {
+            "team_selection": selection.model_dump(mode="json"),
+            "slots": slots,
+            "role_cards": [card.model_dump(mode="json") for card in role_cards],
+            "configuration_warnings": warnings,
+        }
+        try:
+            _reject_sensitive_public_team_payload(payload)
+        except TeamSelectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return payload
+
+
 def _register_execution_plan_routes(router: APIRouter, state: HarnessAppState) -> None:
     @router.post("/execution-plans/validate")
     def validate_execution_plan(request: ExecutionPlan) -> dict[str, Any]:
@@ -461,6 +592,14 @@ def _register_execution_plan_routes(router: APIRouter, state: HarnessAppState) -
         task = _task_or_404(state, request.task_id)
         pack = _pack_or_404(state, task.workflow_pack)
         try:
+            resolved_team = _resolve_requested_team(
+                pack=pack,
+                selection=request.team_selection,
+                project_root=state.config_root,
+                capability_registry=state.model_gateway.capability_registry,
+            )
+            if resolved_team is not None:
+                pack = resolved_team.pack
             if not pack.allow_dynamic_execution_plans:
                 raise ValueError(f"Workflow pack {pack.name} does not allow dynamic execution plans.")
             planner = select_planner_agent(pack, request.planner_role)
@@ -507,6 +646,11 @@ def _register_execution_plan_routes(router: APIRouter, state: HarnessAppState) -
             "usage_complete": accounting["usage_complete"],
             "estimated_cost_usd": accounting["estimated_cost_usd"],
             "included_in_run_benchmark": False,
+            "team_selection": (
+                resolved_team.receipt.model_dump(mode="json")
+                if resolved_team is not None
+                else None
+            ),
         }
 
 
@@ -517,8 +661,15 @@ def _register_run_routes(router: APIRouter, state: HarnessAppState) -> None:
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
         pack = _pack_or_404(state, task.workflow_pack)
-        _require_run_confirmations(state, pack, task, request)
         try:
+            resolved_team = _resolve_requested_team(
+                pack=pack,
+                selection=request.team_selection,
+                project_root=state.config_root,
+                capability_registry=state.model_gateway.capability_registry,
+            )
+            if resolved_team is not None:
+                pack = resolved_team.pack
             requested_plan = request.execution_plan or execution_plan_from_pack(pack)
             pack = _pack_with_frozen_task_skills(
                 pack=pack,
@@ -531,12 +682,22 @@ def _register_run_routes(router: APIRouter, state: HarnessAppState) -> None:
                 execution_plan,
                 request.approved_side_effect_tools,
             )
+            confirmed_real_web_tools, confirmed_real_web_tool_routes = _require_run_confirmations(
+                state,
+                pack,
+                execution_plan,
+                task,
+                request,
+                require_any_real_model_route=resolved_team is not None,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         run = Run(
             task_id=task.id,
             real_model_access_confirmed=request.confirm_real_models,
             real_web_access_confirmed=request.confirm_real_web,
+            confirmed_real_web_tools=confirmed_real_web_tools,
+            confirmed_real_web_tool_routes=confirmed_real_web_tool_routes,
             content_block_snapshot=_content_block_snapshot(task.inputs),
             content_block_snapshot_hash=_content_block_snapshot_hash(task.inputs),
             vision_preprocess_snapshot=_vision_preprocess_snapshot(task.inputs),
@@ -588,23 +749,62 @@ def _register_run_routes(router: APIRouter, state: HarnessAppState) -> None:
     def list_runs(
         limit: int = Query(default=500, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
-    ) -> list[dict[str, Any]]:
-        return [_safe_run(run) for run in state.storage.list_runs(limit=limit, offset=offset)]
+    ) -> JSONResponse:
+        try:
+            runs = state.storage.list_runs(limit=limit, offset=offset)
+        except RunRecordIntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="A persisted run record is invalid and the run list cannot be trusted.",
+            ) from exc
+        return JSONResponse(
+            content=[_safe_run(run) for run in runs]
+        )
 
     @router.get("/runs/{run_id}", response_model=Run)
-    def get_run(run_id: str) -> dict[str, Any]:
-        run = state.storage.get_run(run_id)
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        return _safe_run(run)
+    def get_run(run_id: str) -> JSONResponse:
+        run = _run_or_404(state, run_id)
+        return JSONResponse(content=_safe_run(run))
+
+    @router.get("/runs/{run_id}/team", response_model=RunTeamResponse)
+    def get_run_team(run_id: str) -> dict[str, Any]:
+        run = _run_or_404(state, run_id)
+        if (run.execution_plan is None) != (run.execution_plan_hash is None):
+            raise HTTPException(
+                status_code=409,
+                detail="Persisted execution plan and hash are incomplete; the run team cannot be trusted.",
+            )
+        if run.execution_plan is None:
+            return {
+                "run_id": run.id,
+                "team_selection": None,
+                "execution_plan_hash": None,
+                "immutable": False,
+            }
+        try:
+            plan = ExecutionPlan.model_validate(run.execution_plan)
+            if run.execution_plan_hash != execution_plan_hash(plan):
+                raise TeamSelectionError("Persisted execution plan hash does not match its content.")
+            receipt = team_selection_receipt_from_plan(plan)
+        except (TeamSelectionError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Persisted team selection is invalid; the run team cannot be trusted.",
+            ) from exc
+        return {
+            "run_id": run.id,
+            "team_selection": receipt.model_dump(mode="json") if receipt is not None else None,
+            "execution_plan_hash": run.execution_plan_hash,
+            "immutable": True,
+        }
 
     @router.get("/runs/{run_id}/detail", response_model=RunDetailResponse)
-    def get_run_detail(run_id: str) -> dict[str, Any]:
+    def get_run_detail(run_id: str) -> dict[str, Any] | JSONResponse:
         run = _run_or_404(state, run_id)
         task = state.storage.get_task(run.task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
-        return {
+        payload = {
             "run": _safe_run(run),
             "task": task.model_dump(mode="json"),
             "agent_runs": [
@@ -621,10 +821,18 @@ def _register_run_routes(router: APIRouter, state: HarnessAppState) -> None:
             "queue_state": _safe_queue_items(state, run_id),
             "lock_state": _safe_run_locks(state, run_id),
         }
+        if run.confirmed_real_web_tools is None:
+            return JSONResponse(content=payload)
+        return payload
 
     @router.get("/runs/{run_id}/quality")
     def get_run_quality(run_id: str) -> dict[str, Any]:
         run = _run_or_404(state, run_id)
+        if (run.execution_plan is None) != (run.execution_plan_hash is None):
+            raise HTTPException(
+                status_code=409,
+                detail="Persisted execution plan and hash are incomplete; run quality cannot be trusted.",
+            )
         if run.execution_plan is not None:
             try:
                 plan = ExecutionPlan.model_validate(run.execution_plan)
@@ -651,7 +859,9 @@ def _register_run_routes(router: APIRouter, state: HarnessAppState) -> None:
             run.id,
             quality_criteria_from_execution_plan(plan),
         )
-        return report.model_dump(mode="json")
+        return report.model_copy(
+            update={"execution_plan_hash": run.execution_plan_hash}
+        ).model_dump(mode="json")
 
     @router.get("/runs/{run_id}/trace")
     def list_trace(run_id: str) -> list[dict[str, Any]]:
@@ -1966,6 +2176,19 @@ class PackMappedExecutor:
             agent=agent,
             allowed_tools=frozenset(step.allowed_tools),
             real_web_access_confirmed=run.real_web_access_confirmed,
+            confirmed_real_web_tools=(
+                None
+                if run.confirmed_real_web_tools is None
+                else frozenset(run.confirmed_real_web_tools)
+            ),
+            confirmed_real_web_tool_routes=(
+                None
+                if run.confirmed_real_web_tool_routes is None
+                else frozenset(
+                    (route.name, route.provider)
+                    for route in run.confirmed_real_web_tool_routes
+                )
+            ),
         )
         artifact_type = _artifact_type_for_step(task.workflow_pack, step)
         search_result: dict[str, Any] | None = None
@@ -2049,20 +2272,39 @@ class PackMappedExecutor:
         browser_requested = _confirmed_real_browser_requested(
             self.browser_tool_provider,
             tool_context,
+            "browser_search",
         )
         browser_available = (
-            tool_context.real_web_access_confirmed
+            _real_web_tool_authorized(
+                tool_context,
+                "browser_search",
+                self.browser_tool_provider.provider_name,
+            )
             and browser_search_access_enabled(self.browser_tool_provider)
         )
         if browser_available:
             try:
                 return gateway.call_tool(tool_context, "browser_search", payload)
             except ToolGatewayError:
-                if not self.web_tool_provider.real_search_access_available():
+                if not (
+                    _real_web_tool_authorized(
+                        tool_context,
+                        "web_search",
+                        self.web_tool_provider.provider_name,
+                    )
+                    and self.web_tool_provider.real_search_access_available()
+                ):
                     raise
                 browser_failed = True
         elif browser_requested:
-            if not self.web_tool_provider.real_search_access_available():
+            if not (
+                _real_web_tool_authorized(
+                    tool_context,
+                    "web_search",
+                    self.web_tool_provider.provider_name,
+                )
+                and self.web_tool_provider.real_search_access_available()
+            ):
                 raise WorkflowRunnerError(
                     "Research browser_search fallback requires confirmed real Tavily access."
                 )
@@ -2082,20 +2324,39 @@ class PackMappedExecutor:
         browser_requested = _confirmed_real_browser_requested(
             self.browser_tool_provider,
             tool_context,
+            "browser_fetch",
         )
         browser_available = (
-            tool_context.real_web_access_confirmed
+            _real_web_tool_authorized(
+                tool_context,
+                "browser_fetch",
+                self.browser_tool_provider.provider_name,
+            )
             and browser_fetch_access_enabled(self.browser_tool_provider)
         )
         if browser_available:
             try:
                 return gateway.call_tool(tool_context, "browser_fetch", payload)
             except ToolGatewayError:
-                if not self.web_tool_provider.real_fetch_access_available():
+                if not (
+                    _real_web_tool_authorized(
+                        tool_context,
+                        "fetch_page",
+                        self.web_tool_provider.provider_name,
+                    )
+                    and self.web_tool_provider.real_fetch_access_available()
+                ):
                     raise
                 browser_failed = True
         elif browser_requested:
-            if not self.web_tool_provider.real_fetch_access_available():
+            if not (
+                _real_web_tool_authorized(
+                    tool_context,
+                    "fetch_page",
+                    self.web_tool_provider.provider_name,
+                )
+                and self.web_tool_provider.real_fetch_access_available()
+            ):
                 raise WorkflowRunnerError(
                     "Research browser_fetch fallback requires confirmed real Tavily access."
                 )
@@ -2144,6 +2405,232 @@ def _pack_or_404(state: HarnessAppState, pack_name: str) -> WorkflowPack:
     if pack is None:
         raise HTTPException(status_code=404, detail="Workflow pack not found")
     return pack
+
+
+def _resolve_requested_team(
+    *,
+    pack: WorkflowPack,
+    selection: TeamSelection | None,
+    project_root: Path,
+    capability_registry: CapabilityRegistry,
+) -> ResolvedTeamSelection | None:
+    if selection is None:
+        return None
+    try:
+        return resolve_team_selection(
+            pack,
+            selection,
+            project_root=project_root,
+            capability_registry=capability_registry,
+        )
+    except TeamSelectionError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _reject_sensitive_public_team_payload(value: object) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key)
+            if (
+                _is_sensitive_public_team_field(key_text)
+                and not _is_safe_public_team_counter(key_text, item)
+            ):
+                raise TeamSelectionError("Team template contains sensitive-looking metadata.")
+            _reject_sensitive_public_team_payload(key_text)
+            _reject_sensitive_public_team_payload(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_sensitive_public_team_payload(item)
+        return
+    if isinstance(value, str) and contains_secret_like_text(value):
+        raise TeamSelectionError("Team template contains sensitive-looking metadata.")
+
+
+_PUBLIC_TEAM_SENSITIVE_FIELD_MARKERS = (
+    "apikey",
+    "authorization",
+    "clientsecret",
+    "connectionstring",
+    "credential",
+    "databaseurl",
+    "dburl",
+    "dsn",
+    "password",
+    "passwd",
+    "privatekey",
+    "pwd",
+    "secret",
+    "token",
+)
+_PUBLIC_TEAM_SAFE_COUNTER_FIELDS = frozenset({"maxtokens", "maxtotaltokens"})
+_PUBLIC_TEAM_RUNTIME_LIMIT_FIELDS = (
+    "max_steps",
+    "max_tool_calls",
+    "max_total_tokens",
+    "timeout_seconds",
+    "max_repeated_tool_calls",
+    "max_observation_chars",
+    "max_cost_usd",
+)
+
+
+def _normalized_public_team_field(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _is_sensitive_public_team_field(value: str) -> bool:
+    normalized = _normalized_public_team_field(value)
+    return any(marker in normalized for marker in _PUBLIC_TEAM_SENSITIVE_FIELD_MARKERS)
+
+
+def _is_safe_public_team_counter(name: str, value: object) -> bool:
+    return (
+        _normalized_public_team_field(name) in _PUBLIC_TEAM_SAFE_COUNTER_FIELDS
+        and type(value) is int
+        and value >= 0
+    )
+
+
+def _public_team_runtime_limits(runtime_limits: dict[str, Any]) -> dict[str, int | float]:
+    public_limits: dict[str, int | float] = {}
+    for field_name in _PUBLIC_TEAM_RUNTIME_LIMIT_FIELDS:
+        if field_name not in runtime_limits:
+            continue
+        value = runtime_limits[field_name]
+        if (
+            type(value) not in {int, float}
+            or value < 0
+            or (type(value) is float and not isfinite(value))
+        ):
+            raise TeamSelectionError(
+                f"Team template runtime limit {field_name} is invalid."
+            )
+        public_limits[field_name] = value
+    return public_limits
+
+
+def _team_route_template(
+    agent: AgentDefinition,
+    capability_registry: CapabilityRegistry,
+) -> tuple[TeamModelRoute, str | None]:
+    settings = agent.model_settings
+    _reject_sensitive_public_team_payload(settings)
+    provider = str(settings.get("provider", "mock"))
+    model = str(settings.get("model", "mock-model"))
+    family = _team_model_family(provider, settings.get("model_family"))
+
+    warning: str | None = None
+    if provider in {"openai", "deepseek", "litellm_proxy"} and family is not None:
+        try:
+            fallbacks = []
+            for candidate in settings.get("fallbacks", []):
+                if not isinstance(candidate, dict):
+                    raise ValueError("fallback is not an object")
+                fallback_provider = str(candidate.get("provider", ""))
+                fallback_family = _team_model_family(
+                    fallback_provider,
+                    candidate.get("model_family"),
+                )
+                if fallback_family is None:
+                    raise ValueError("fallback is missing model_family")
+                fallbacks.append(
+                    {
+                        "family": fallback_family,
+                        "provider": fallback_provider,
+                        "model": candidate.get("model"),
+                    }
+                )
+            route = TeamModelRoute(
+                family=family,
+                provider=provider,
+                model=model,
+                reasoning_effort=settings.get("reasoning_effort") or "xhigh",
+                fallbacks=fallbacks,
+            )
+            if _team_route_is_registered(route, capability_registry):
+                return route, None
+            raise ValueError("route is not present in the active capability registry")
+        except (TypeError, ValueError):
+            warning = (
+                f"Agent slot {agent.role} has a route that cannot prove its GPT/DeepSeek family; "
+                "the template uses the reviewed default instead."
+            )
+    elif provider != "mock":
+        warning = (
+            f"Agent slot {agent.role} has a route that cannot prove its GPT/DeepSeek family; "
+            "the template uses the reviewed default instead."
+        )
+
+    preferred_family = "deepseek" if agent.role in _TEAM_DEEPSEEK_DEFAULT_ROLES else "gpt"
+    route = _exact_team_route_from_registry(capability_registry, preferred_family)
+    if route.family != preferred_family:
+        family_warning = (
+            f"Agent slot {agent.role} prefers {preferred_family.upper()}, but the active capability "
+            f"registry has no exact {preferred_family.upper()} model; the template uses the exact "
+            f"{route.family.upper()} capability instead."
+        )
+        warning = f"{warning} {family_warning}" if warning is not None else family_warning
+    return route, warning
+
+
+def _team_model_family(provider: str, declared_family: object) -> str | None:
+    if declared_family in {"gpt", "deepseek"}:
+        return str(declared_family)
+    if provider == "openai":
+        return "gpt"
+    if provider == "deepseek":
+        return "deepseek"
+    return None
+
+
+def _team_capability_family(capability: ModelCapability) -> str | None:
+    return _team_model_family(capability.provider, capability.model_family)
+
+
+def _team_route_is_registered(
+    route: TeamModelRoute,
+    capability_registry: CapabilityRegistry,
+) -> bool:
+    routes = [route, *route.fallbacks]
+    for candidate in routes:
+        match = capability_registry.resolve(candidate.provider, candidate.model)
+        capability = match.capability
+        if capability is None or _team_capability_family(capability) != candidate.family:
+            return False
+        if candidate.provider == "litellm_proxy" and capability.model_pattern != candidate.model:
+            return False
+    return True
+
+
+def _exact_team_route_from_registry(
+    capability_registry: CapabilityRegistry,
+    preferred_family: str,
+) -> TeamModelRoute:
+    fallback_family = "gpt" if preferred_family == "deepseek" else "deepseek"
+    for family in (preferred_family, fallback_family):
+        for capability in capability_registry.capabilities:
+            if (
+                capability.provider not in {"openai", "deepseek", "litellm_proxy"}
+                or _team_capability_family(capability) != family
+                or any(marker in capability.model_pattern for marker in ("*", "?", "["))
+            ):
+                continue
+            try:
+                route = TeamModelRoute(
+                    family=family,
+                    provider=capability.provider,
+                    model=capability.model_pattern,
+                    reasoning_effort="xhigh",
+                )
+            except ValueError:
+                continue
+            if _team_route_is_registered(route, capability_registry):
+                return route
+    raise TeamSelectionError(
+        "The active model capability registry does not provide an exact GPT or DeepSeek "
+        "capability for team templates."
+    )
 
 
 def _pack_with_frozen_task_skills(
@@ -2300,19 +2787,77 @@ def _looks_like_secret_value(value: str) -> bool:
 def _require_run_confirmations(
     state: HarnessAppState,
     pack: WorkflowPack,
+    execution_plan: ExecutionPlan,
     task: Task,
     request: RunCreateRequest,
-) -> None:
-    if (_pack_has_enabled_real_model_route(pack) or _task_has_enabled_real_vision_sidecar(task)) and not request.confirm_real_models:
+    *,
+    require_any_real_model_route: bool = False,
+) -> tuple[list[str], list[ConfirmedRealWebToolRoute]]:
+    requires_real_model_confirmation = (
+        require_any_real_model_route and _pack_has_any_real_model_route(pack)
+    ) or _pack_has_enabled_real_model_route(pack)
+    if (
+        requires_real_model_confirmation
+        or _task_has_enabled_real_vision_sidecar(task)
+    ) and not request.confirm_real_models:
         raise HTTPException(
             status_code=400,
-            detail="confirm_real_models=true is required because this workflow has enabled real model routes.",
+            detail=(
+                "confirm_real_models=true is required because this workflow has selected "
+                "or enabled real model routes."
+            ),
         )
-    if _pack_has_enabled_real_web_route(state, pack) and not request.confirm_real_web:
+    confirmed_real_web_tool_routes = _execution_plan_enabled_real_web_routes(
+        state,
+        execution_plan,
+    )
+    confirmed_real_web_tools = [route.name for route in confirmed_real_web_tool_routes]
+    names_supplied = "confirmed_real_web_tools" in request.model_fields_set
+    routes_supplied = "confirmed_real_web_tool_routes" in request.model_fields_set
+    if names_supplied != routes_supplied:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "confirmed_real_web_tools and confirmed_real_web_tool_routes must be "
+                "provided together."
+            ),
+        )
+    if names_supplied and (
+        request.confirmed_real_web_tools is None
+        or request.confirmed_real_web_tool_routes is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit null real-web snapshots are not allowed.",
+        )
+    if request.confirmed_real_web_tools and not request.confirm_real_web:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "confirmed_real_web_tools must be empty when confirm_real_web=false."
+            ),
+        )
+    if confirmed_real_web_tools and not request.confirm_real_web:
         raise HTTPException(
             status_code=400,
             detail="confirm_real_web=true is required because this workflow can call enabled real web/browser tools.",
         )
+    if (
+        names_supplied
+        and (
+            request.confirmed_real_web_tools != confirmed_real_web_tools
+            or request.confirmed_real_web_tool_routes != confirmed_real_web_tool_routes
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "confirmed_real_web_tools and confirmed_real_web_tool_routes do not match "
+                "the enabled real web/browser routes available to the frozen execution plan "
+                "at submission time."
+            ),
+        )
+    return confirmed_real_web_tools, confirmed_real_web_tool_routes
 
 
 def _pack_has_enabled_real_model_route(pack: WorkflowPack) -> bool:
@@ -2334,6 +2879,10 @@ def _pack_has_enabled_real_model_route(pack: WorkflowPack) -> bool:
         ):
             return True
     return False
+
+
+def _pack_has_any_real_model_route(pack: WorkflowPack) -> bool:
+    return any(_model_settings_has_real_model_route(agent.model_settings) for agent in pack.agents)
 
 
 def _model_settings_has_real_model_route(model_settings: dict[str, Any]) -> bool:
@@ -2465,19 +3014,48 @@ def _vision_preprocess_snapshot(inputs: dict[str, Any]) -> dict[str, Any] | None
     }
 
 
-def _pack_has_enabled_real_web_route(state: HarnessAppState, pack: WorkflowPack) -> bool:
-    enabled_real_tools = {
-        provider.name
-        for provider in web_tool_provider_catalog() + browser_tool_provider_catalog(state.browser_tool_provider)
-        if provider.enabled and provider.real_calls
+def _execution_plan_enabled_real_web_routes(
+    state: HarnessAppState,
+    execution_plan: ExecutionPlan,
+) -> list[ConfirmedRealWebToolRoute]:
+    enabled_routes_by_name: dict[str, ConfirmedRealWebToolRoute] = {}
+    for provider in (
+        web_tool_provider_catalog()
+        + browser_tool_provider_catalog(state.browser_tool_provider)
+    ):
+        if not (provider.enabled and provider.real_calls):
+            continue
+        route = ConfirmedRealWebToolRoute(name=provider.name, provider=provider.provider)
+        existing = enabled_routes_by_name.get(route.name)
+        if existing is not None and existing != route:
+            raise ValueError(
+                f"Multiple enabled real providers claim web tool {route.name}."
+            )
+        enabled_routes_by_name[route.name] = route
+
+    agent_tools_by_role = {
+        snapshot.role: set(snapshot.tool_permissions)
+        for snapshot in execution_plan.agent_snapshots
     }
-    if not enabled_real_tools:
-        return False
-    return any(
-        tool in enabled_real_tools
-        for step in pack.steps
-        for tool in step.allowed_tools
-        if tool in _WEB_TOOL_NAMES
+    planned_tools: set[str] = set()
+    for step in execution_plan.steps:
+        agent_tools = agent_tools_by_role.get(step.agent_role)
+        if agent_tools is None:
+            raise ValueError(
+                f"Frozen execution plan is missing agent snapshot for role {step.agent_role}."
+            )
+        planned_tools.update(
+            tool
+            for tool in set(step.tool_permissions) & agent_tools
+            if tool in _WEB_TOOL_NAMES
+        )
+    return sorted(
+        (
+            enabled_routes_by_name[tool]
+            for tool in planned_tools
+            if tool in enabled_routes_by_name
+        ),
+        key=lambda route: (route.name, route.provider),
     )
 
 
@@ -2490,9 +3068,20 @@ def _agent_or_404(state: HarnessAppState, agent_id: str) -> AgentDefinition:
 
 
 def _run_or_404(state: HarnessAppState, run_id: str) -> Run:
-    run = state.storage.get_run(run_id)
+    try:
+        run = state.storage.get_run(run_id)
+    except RunRecordIntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Persisted run record is invalid and cannot be trusted.",
+        ) from exc
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.id != run_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Persisted run identity does not match the requested run.",
+        )
     return run
 
 
@@ -2819,11 +3408,31 @@ def _require_real_tavily_fallback(result: Any, tool_name: str) -> None:
 def _confirmed_real_browser_requested(
     provider: BrowserToolProvider,
     context: ToolContext,
+    tool_name: str,
 ) -> bool:
     return (
-        context.real_web_access_confirmed
+        _real_web_tool_authorized(context, tool_name, provider.provider_name)
         and provider.provider_name != "mock"
         and provider.real_calls_enabled
+    )
+
+
+def _real_web_tool_authorized(
+    context: ToolContext,
+    tool_name: str,
+    provider: str,
+) -> bool:
+    confirmed_tools = getattr(context, "confirmed_real_web_tools", None)
+    confirmed_routes = getattr(context, "confirmed_real_web_tool_routes", None)
+    if not context.real_web_access_confirmed:
+        return False
+    if confirmed_tools is None and confirmed_routes is None:
+        return True
+    if confirmed_tools is None or confirmed_routes is None:
+        return False
+    return (
+        tool_name in confirmed_tools
+        and (tool_name, provider.strip().lower()) in confirmed_routes
     )
 
 

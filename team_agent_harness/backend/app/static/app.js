@@ -9,6 +9,9 @@ const state = {
   skills: [],
   skillBindings: [],
   skillAutoRoutes: [],
+  teamTemplatesByPack: new Map(),
+  teamTemplateRequests: new Map(),
+  teamTemplateErrors: new Map(),
   selectedSkillId: null,
   selectedRoleCardId: null,
   tasks: [],
@@ -44,6 +47,13 @@ const els = {
   taskInputs: document.querySelector("#taskInputs"),
   taskConstraints: document.querySelector("#taskConstraints"),
   taskCriteria: document.querySelector("#taskCriteria"),
+  teamConfigurator: document.querySelector("#teamConfigurator"),
+  teamConfigStatus: document.querySelector("#teamConfigStatus"),
+  teamConfigSummary: document.querySelector("#teamConfigSummary"),
+  teamConfigurationWarnings: document.querySelector("#teamConfigurationWarnings"),
+  teamAssignments: document.querySelector("#teamAssignments"),
+  useCustomTeam: document.querySelector("#useCustomTeam"),
+  resetTeamSelectionButton: document.querySelector("#resetTeamSelectionButton"),
   codeExampleButton: document.querySelector("#codeExampleButton"),
   researchExampleButton: document.querySelector("#researchExampleButton"),
   createTaskButton: document.querySelector("#createTaskButton"),
@@ -232,6 +242,10 @@ const providerDisplay = {
   deepseek: "DeepSeek",
   litellm_proxy: "LiteLLM 统一网关",
 };
+
+const MAX_TEAM_FALLBACKS = 4;
+const teamModelFamilies = new Set(["gpt", "deepseek"]);
+const teamModelProviders = new Set(["openai", "deepseek", "litellm_proxy"]);
 
 const routingPresets = {
   gptMainThread: {
@@ -647,11 +661,109 @@ function escapeHtml(value) {
     .replace(/'/g, "&#039;");
 }
 
+function captureRuntimeFocus() {
+  const target = document.activeElement;
+  const key = target?.dataset?.runtimeFocusKey;
+  if (!key) {
+    return null;
+  }
+  const snapshot = { key };
+  if (typeof target.selectionStart === "number" && typeof target.selectionEnd === "number") {
+    snapshot.selectionStart = target.selectionStart;
+    snapshot.selectionEnd = target.selectionEnd;
+    snapshot.selectionDirection = target.selectionDirection;
+  }
+  return snapshot;
+}
+
+function canRestoreRuntimeFocus(target) {
+  if (
+    !target?.isConnected ||
+    target.disabled ||
+    target.getAttribute("aria-disabled") === "true" ||
+    target.closest('[aria-hidden="true"], [hidden]')
+  ) {
+    return false;
+  }
+  if (typeof target.checkVisibility === "function") {
+    return target.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
+  }
+  const style = window.getComputedStyle(target);
+  return style.display !== "none" && style.visibility !== "hidden" && target.getClientRects().length > 0;
+}
+
+function restoreRuntimeFocus(snapshot) {
+  if (!snapshot) {
+    return;
+  }
+  const active = document.activeElement;
+  if (active?.isConnected && active !== document.body && active !== document.documentElement) {
+    return;
+  }
+  const target = [...document.querySelectorAll("[data-runtime-focus-key]")]
+    .find((candidate) => candidate.dataset.runtimeFocusKey === snapshot.key);
+  if (!canRestoreRuntimeFocus(target)) {
+    return;
+  }
+  target.focus({ preventScroll: true });
+  const selection = window.HarnessRuntime.normalizeRuntimeTextSelection(snapshot, target.value?.length);
+  if (selection && typeof target.setSelectionRange === "function") {
+    target.setSelectionRange(
+      selection.selectionStart,
+      selection.selectionEnd,
+      selection.selectionDirection,
+    );
+  }
+}
+
 function escapeSelector(value) {
   if (window.CSS && typeof window.CSS.escape === "function") {
     return window.CSS.escape(value);
   }
   return String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+}
+
+function syncListboxTabStop(container, selector) {
+  const options = [...container.querySelectorAll(selector)];
+  if (!options.length) {
+    return null;
+  }
+  const tabStop = options.find((option) => option.getAttribute("aria-selected") === "true") || options[0];
+  options.forEach((option) => {
+    option.tabIndex = option === tabStop ? 0 : -1;
+  });
+  const group = tabStop.closest("details.record-group");
+  if (group) {
+    group.open = true;
+  }
+  return tabStop;
+}
+
+function moveListboxFocus(event, container, selector) {
+  const options = [...container.querySelectorAll(selector)];
+  const current = event.target.closest(selector);
+  if (!current || !options.includes(current)) {
+    return false;
+  }
+  const targetIndex = window.HarnessRuntime.listboxNavigationIndex(
+    event.key,
+    options.indexOf(current),
+    options.length,
+  );
+  if (targetIndex === null) {
+    return false;
+  }
+  event.preventDefault();
+  const target = options[targetIndex];
+  options.forEach((option) => {
+    option.tabIndex = option === target ? 0 : -1;
+  });
+  const group = target.closest("details.record-group");
+  if (group) {
+    group.open = true;
+  }
+  target.focus();
+  return true;
 }
 
 function showToast(message, tone = "ok") {
@@ -667,12 +779,25 @@ function setBusy(isBusy) {
   state.isBusy = isBusy;
   els.createTaskButton.disabled = isBusy;
   els.refreshButton.disabled = isBusy;
+  els.workflowPack.disabled = isBusy;
+  els.codeExampleButton.disabled = isBusy;
+  els.researchExampleButton.disabled = isBusy;
   els.runTaskButton.disabled = isBusy || !els.workflowPack.value;
   els.workflowRunCurrentButton.disabled = isBusy || !state.selectedTaskId;
   els.workflowTraceCurrentButton.disabled = isBusy || !state.selectedRunId;
   els.runSelectedButton.disabled = isBusy || !state.selectedTaskId;
   els.globalRunTaskButton.disabled = isBusy || !state.selectedTaskId;
   els.globalTraceButton.disabled = isBusy || !state.selectedRunId;
+  els.useCustomTeam.disabled = isBusy || els.workflowPack.value === "auto";
+  els.resetTeamSelectionButton.disabled =
+    isBusy ||
+    !els.useCustomTeam.checked ||
+    els.workflowPack.value === "auto" ||
+    state.teamTemplateRequests.has(els.workflowPack.value);
+  els.teamAssignments.querySelectorAll("select, input, button[data-team-action]").forEach((control) => {
+    const limitReached = control.dataset.teamLimitReached === "true";
+    control.disabled = isBusy || !els.useCustomTeam.checked || limitReached;
+  });
 }
 
 function setActiveView(viewId) {
@@ -799,12 +924,499 @@ function modelConfigForAgent(agentId) {
   return agent ? formatModelConfig(agent) : "-";
 }
 
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function teamFamilyLabel(family) {
+  return family === "deepseek" ? "DeepSeek" : family === "gpt" ? "GPT" : family || "-";
+}
+
+function defaultTeamModel(family, provider) {
+  if (provider === "openai") {
+    return "gpt-5.5";
+  }
+  if (provider === "deepseek") {
+    return "deepseek-v4-pro";
+  }
+  return family === "deepseek" ? "deepseek-v4-pro" : "gpt5.5";
+}
+
+function teamRouteHasValidContract(route, options = {}) {
+  const model = typeof route?.model === "string" ? route.model.trim() : "";
+  if (
+    !teamModelFamilies.has(route?.family) ||
+    !teamModelProviders.has(route?.provider) ||
+    !model ||
+    model.length > 200 ||
+    (!options.allowReasoning && Object.prototype.hasOwnProperty.call(route || {}, "reasoning_effort"))
+  ) {
+    return false;
+  }
+  if (route.provider === "openai") {
+    return route.family === "gpt" && model.startsWith("gpt");
+  }
+  if (route.provider === "deepseek") {
+    return route.family === "deepseek" && model.startsWith("deepseek-");
+  }
+  return true;
+}
+
+function normalizeTeamRoute(route, label, options = {}) {
+  if (!route || typeof route !== "object") {
+    throw new Error(`${label} 不完整。`);
+  }
+  route.model = String(route.model || "").trim();
+  if (!teamRouteHasValidContract(route, { allowReasoning: Boolean(options.allowReasoning) })) {
+    throw new Error(`${label} 的模型家族、渠道或模型名称不匹配。`);
+  }
+  if (!options.allowReasoning) {
+    delete route.reasoning_effort;
+  }
+  return route;
+}
+
+function assertUniqueTeamRouteTargets(assignment) {
+  const targets = new Set();
+  teamRouteCandidates(assignment).forEach((route) => {
+    const target = `${route.provider}\u0000${route.model}`;
+    if (targets.has(target)) {
+      throw new Error(`${agentRoleLabel(assignment.slot)} 存在重复的模型渠道与模型组合。`);
+    }
+    targets.add(target);
+  });
+}
+
+function validateTeamTemplatePayload(payload, packName) {
+  const selection = payload?.team_selection;
+  const assignments = selection?.assignments;
+  const slots = payload?.slots;
+  if (
+    selection?.version !== "team-selection-v1" ||
+    selection?.pack_name !== packName ||
+    !Array.isArray(assignments) ||
+    !assignments.length ||
+    !Array.isArray(slots) ||
+    !Array.isArray(payload?.role_cards) ||
+    !Array.isArray(payload?.configuration_warnings)
+  ) {
+    throw new Error(`工作流 ${packName} 返回了不完整的团队模板。`);
+  }
+
+  const expectedSlots = slots.map((slot) => slot?.slot);
+  const assignmentSlots = assignments.map((assignment) => assignment?.slot);
+  if (
+    expectedSlots.some((slot) => typeof slot !== "string" || !slot) ||
+    new Set(expectedSlots).size !== expectedSlots.length ||
+    new Set(assignmentSlots).size !== assignmentSlots.length ||
+    expectedSlots.length !== assignmentSlots.length ||
+    expectedSlots.some((slot) => !assignmentSlots.includes(slot))
+  ) {
+    throw new Error(`工作流 ${packName} 的固定岗位与团队分配不一致。`);
+  }
+
+  assignments.forEach((assignment) => {
+    const route = assignment?.route;
+    if (
+      !expectedSlots.includes(assignment?.slot) ||
+      !teamRouteHasValidContract(route, { allowReasoning: true }) ||
+      !Array.isArray(route?.fallbacks) ||
+      route.fallbacks.length > MAX_TEAM_FALLBACKS ||
+      route.fallbacks.some((fallback) => !teamRouteHasValidContract(fallback))
+    ) {
+      throw new Error(`工作流 ${packName} 的团队模型路由不合法。`);
+    }
+  });
+}
+
+async function ensureTeamTemplate(packName, options = {}) {
+  if (!packName || packName === "auto") {
+    return null;
+  }
+  if (!options.force && state.teamTemplatesByPack.has(packName)) {
+    return state.teamTemplatesByPack.get(packName);
+  }
+  if (state.teamTemplateRequests.has(packName)) {
+    return state.teamTemplateRequests.get(packName);
+  }
+
+  if (options.force) {
+    state.teamTemplatesByPack.delete(packName);
+  }
+  state.teamTemplateErrors.delete(packName);
+
+  const request = api(`/workflow-packs/${encodeURIComponent(packName)}/team-template`, { timeoutMs: 10000 })
+    .then((payload) => {
+      validateTeamTemplatePayload(payload, packName);
+      const template = cloneJson(payload);
+      state.teamTemplatesByPack.set(packName, template);
+      state.teamTemplateErrors.delete(packName);
+      return template;
+    })
+    .catch((error) => {
+      state.teamTemplateErrors.set(packName, error.message);
+      throw error;
+    })
+    .finally(() => {
+      state.teamTemplateRequests.delete(packName);
+      if (els.workflowPack.value === packName) {
+        renderTeamConfigurator();
+        setBusy(state.isBusy);
+      }
+    });
+  state.teamTemplateRequests.set(packName, request);
+  if (els.workflowPack.value === packName) {
+    renderTeamConfigurator();
+  }
+  return request;
+}
+
+function invalidateTeamTemplates() {
+  state.teamTemplatesByPack.clear();
+  state.teamTemplateErrors.clear();
+}
+
+function currentTeamTemplate() {
+  const packName = els.workflowPack.value;
+  return packName && packName !== "auto" ? state.teamTemplatesByPack.get(packName) || null : null;
+}
+
+function teamAssignmentForSlot(selection, slot) {
+  return selection?.assignments?.find((assignment) => assignment.slot === slot) || null;
+}
+
+function formatTeamRuntimeLimits(limits) {
+  const entries = Object.entries(limits || {});
+  if (!entries.length) {
+    return "默认";
+  }
+  return entries
+    .map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`)
+    .join(" ｜ ");
+}
+
+function teamProviderState(providerName) {
+  const provider = providerByName(providerName);
+  if (provider?.enabled) {
+    return { className: "ok", label: "渠道已启用" };
+  }
+  if (provider?.real_calls_configured) {
+    return { className: "waiting", label: "待开启真实调用" };
+  }
+  return { className: "muted", label: "渠道未配置" };
+}
+
+function teamRoleCardOptions(roleCards, selectedId) {
+  const options = [`<option value="">Pack 默认角色</option>`];
+  roleCards.forEach((card) => {
+    const selected = card.id === selectedId ? " selected" : "";
+    options.push(
+      `<option value="${escapeHtml(card.id)}"${selected}>${escapeHtml(roleCardLabel(card))} ｜ ${escapeHtml(card.id)}</option>`
+    );
+  });
+  return options.join("");
+}
+
+function renderTeamFallbackRoutes(assignment, assignmentIndex) {
+  const fallbacks = assignment.route.fallbacks || [];
+  const limitReached = fallbacks.length >= MAX_TEAM_FALLBACKS;
+  const addButtonId = `team-add-fallback-${assignmentIndex}`;
+  const rows = fallbacks.map((fallback, fallbackIndex) => {
+    const familyId = `team-fallback-family-${assignmentIndex}-${fallbackIndex}`;
+    const providerId = `team-fallback-provider-${assignmentIndex}-${fallbackIndex}`;
+    const modelId = `team-fallback-model-${assignmentIndex}-${fallbackIndex}`;
+    const providerState = teamProviderState(fallback.provider);
+    return `
+      <div class="team-fallback-row" data-team-fallback-index="${fallbackIndex}">
+        <div class="team-fallback-row-heading">
+          <span>备用 ${fallbackIndex + 1}</span>
+          <div class="button-row compact">
+            <span class="status-pill ${providerState.className}">${providerState.label}</span>
+            <button
+              type="button"
+              data-team-action="remove-fallback"
+              data-team-slot="${escapeHtml(assignment.slot)}"
+              data-team-fallback-index="${fallbackIndex}"
+              aria-label="移除 ${escapeHtml(agentRoleLabel(assignment.slot))} 的备用路由 ${fallbackIndex + 1}"
+              title="移除备用路由"
+            >移除</button>
+          </div>
+        </div>
+        <div class="team-route-grid team-fallback-grid">
+          <label for="${familyId}">
+            <span>模型家族</span>
+            <select id="${familyId}" data-team-field="family" data-team-slot="${escapeHtml(assignment.slot)}" data-team-fallback-index="${fallbackIndex}" required>
+              <option value="gpt"${fallback.family === "gpt" ? " selected" : ""}>GPT</option>
+              <option value="deepseek"${fallback.family === "deepseek" ? " selected" : ""}>DeepSeek</option>
+            </select>
+          </label>
+          <label for="${providerId}">
+            <span>模型渠道</span>
+            <select id="${providerId}" data-team-field="provider" data-team-slot="${escapeHtml(assignment.slot)}" data-team-fallback-index="${fallbackIndex}" required>
+              <option value="litellm_proxy"${fallback.provider === "litellm_proxy" ? " selected" : ""}>LiteLLM</option>
+              <option value="openai"${fallback.provider === "openai" ? " selected" : ""}>OpenAI</option>
+              <option value="deepseek"${fallback.provider === "deepseek" ? " selected" : ""}>DeepSeek</option>
+            </select>
+          </label>
+          <label for="${modelId}">
+            <span>模型</span>
+            <input id="${modelId}" data-team-field="model" data-team-slot="${escapeHtml(assignment.slot)}" data-team-fallback-index="${fallbackIndex}" type="text" value="${escapeHtml(fallback.model)}" maxlength="200" autocomplete="off" spellcheck="false" required />
+          </label>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <section class="team-fallback-section" aria-label="${escapeHtml(agentRoleLabel(assignment.slot))} 的备用路由">
+      <div class="team-fallback-heading">
+        <div>
+          <span class="team-fallback-title">备用路由</span>
+          <span class="muted-text">${fallbacks.length}/${MAX_TEAM_FALLBACKS}</span>
+        </div>
+        <button
+          id="${addButtonId}"
+          type="button"
+          data-team-action="add-fallback"
+          data-team-slot="${escapeHtml(assignment.slot)}"
+          data-team-limit-reached="${limitReached}"
+          ${limitReached ? "disabled" : ""}
+        >添加备用</button>
+      </div>
+      <div class="team-fallback-list">
+        ${rows || '<p class="team-fallback-empty">未配置备用路由。</p>'}
+      </div>
+    </section>
+  `;
+}
+
+function renderTeamConfigurator(options = {}) {
+  const packName = els.workflowPack.value;
+  const supportsCustomTeam = Boolean(packName && packName !== "auto");
+  if (!supportsCustomTeam) {
+    els.useCustomTeam.checked = false;
+  }
+  els.useCustomTeam.disabled = state.isBusy || !supportsCustomTeam;
+  const customTeamEnabled = els.useCustomTeam.checked;
+  const previousScrollTop = els.teamAssignments.scrollTop;
+  els.teamConfigurator.removeAttribute("aria-busy");
+  els.teamConfigurationWarnings.className = "team-configuration-warnings hidden";
+  els.teamConfigurationWarnings.innerHTML = "";
+
+  if (!packName || packName === "auto") {
+    els.teamConfigStatus.className = "status-pill muted";
+    els.teamConfigStatus.textContent = "Pack 路由";
+    els.teamConfigSummary.className = "team-config-summary empty";
+    els.teamConfigSummary.textContent = "自动识别时沿用识别出的 Pack 路由；选择明确工作流后才能配置团队。";
+    els.teamAssignments.className = "team-assignment-list empty";
+    els.teamAssignments.textContent = "自定义团队未启用。";
+    els.resetTeamSelectionButton.disabled = true;
+    return;
+  }
+
+  const template = currentTeamTemplate();
+  const error = state.teamTemplateErrors.get(packName);
+  if (!template) {
+    const loading = state.teamTemplateRequests.has(packName);
+    els.teamConfigurator.toggleAttribute("aria-busy", loading);
+    els.teamConfigStatus.className = `status-pill ${error ? "danger" : "waiting"}`;
+    els.teamConfigStatus.textContent = error ? "加载失败" : "加载中";
+    els.teamConfigSummary.className = `team-config-summary ${error ? "" : "empty"}`;
+    els.teamConfigSummary.textContent = error || `正在加载 ${workflowPackLabel(packName)} 的团队模板。`;
+    els.teamAssignments.className = "team-assignment-list empty";
+    els.teamAssignments.textContent = error ? "恢复模板可重试。" : "岗位加载中。";
+    els.resetTeamSelectionButton.disabled = state.isBusy || !customTeamEnabled || loading;
+    return;
+  }
+
+  const selection = template.team_selection;
+  const slotsByName = new Map(template.slots.map((slot) => [slot.slot, slot]));
+  const gptCount = selection.assignments.filter((assignment) => assignment.route.family === "gpt").length;
+  const deepSeekCount = selection.assignments.length - gptCount;
+  const readyCount = selection.assignments.filter((assignment) =>
+    teamRouteCandidates(assignment).some((route) => providerByName(route.provider)?.enabled)
+  ).length;
+  els.teamConfigStatus.className = customTeamEnabled
+    ? `status-pill ${readyCount === selection.assignments.length ? "ok" : "waiting"}`
+    : "status-pill muted";
+  els.teamConfigStatus.textContent = customTeamEnabled ? `${selection.assignments.length} 个固定岗位` : "Pack 路由";
+  els.teamConfigSummary.className = "team-config-summary";
+  els.teamConfigSummary.textContent = customTeamEnabled
+    ? `GPT ${gptCount} ｜ DeepSeek ${deepSeekCount} ｜ 已启用路由 ${readyCount}/${selection.assignments.length} ｜ 仅影响下一次运行`
+    : "本次运行沿用 Pack 当前路由，不发送自定义团队。";
+  els.resetTeamSelectionButton.disabled = state.isBusy || !customTeamEnabled;
+
+  if (template.configuration_warnings.length) {
+    els.teamConfigurationWarnings.className = "team-configuration-warnings";
+    els.teamConfigurationWarnings.innerHTML = `<ul>${template.configuration_warnings
+      .map((warning) => `<li>${escapeHtml(warning)}</li>`)
+      .join("")}</ul>`;
+  }
+
+  els.teamAssignments.className = `team-assignment-list${customTeamEnabled ? "" : " inactive"}`;
+  els.teamAssignments.innerHTML = selection.assignments
+    .map((assignment, index) => {
+      const slot = slotsByName.get(assignment.slot) || {};
+      const route = assignment.route;
+      const providerState = teamProviderState(route.provider);
+      const roleCardId = `team-role-card-${index}`;
+      const familyId = `team-family-${index}`;
+      const providerId = `team-provider-${index}`;
+      const modelId = `team-model-${index}`;
+      const reasoningId = `team-reasoning-${index}`;
+      return `
+        <article class="team-assignment" data-team-slot="${escapeHtml(assignment.slot)}">
+          <div class="team-assignment-heading">
+            <div>
+              <h4>${escapeHtml(agentRoleLabel(assignment.slot))} <span class="muted-text">｜ ${escapeHtml(assignment.slot)}</span></h4>
+              <p class="team-assignment-meta">Agent：${escapeHtml(slot.agent_id || "-")} ｜ 工具上限：${escapeHtml((slot.tool_permissions || []).join(", ") || "无")} ｜ 运行预算：${escapeHtml(formatTeamRuntimeLimits(slot.runtime_limits))}</p>
+            </div>
+            <span class="status-pill ${providerState.className}">${providerState.label}</span>
+          </div>
+          <div class="team-route-grid">
+            <label for="${roleCardId}">
+              <span>角色卡</span>
+              <select id="${roleCardId}" data-team-field="role_card_id" data-team-slot="${escapeHtml(assignment.slot)}">
+                ${teamRoleCardOptions(template.role_cards, assignment.role_card_id)}
+              </select>
+            </label>
+            <label for="${familyId}">
+              <span>模型家族</span>
+              <select id="${familyId}" data-team-field="family" data-team-slot="${escapeHtml(assignment.slot)}" required>
+                <option value="gpt"${route.family === "gpt" ? " selected" : ""}>GPT</option>
+                <option value="deepseek"${route.family === "deepseek" ? " selected" : ""}>DeepSeek</option>
+              </select>
+            </label>
+            <label for="${providerId}">
+              <span>模型渠道</span>
+              <select id="${providerId}" data-team-field="provider" data-team-slot="${escapeHtml(assignment.slot)}" required>
+                <option value="litellm_proxy"${route.provider === "litellm_proxy" ? " selected" : ""}>LiteLLM</option>
+                <option value="openai"${route.provider === "openai" ? " selected" : ""}>OpenAI</option>
+                <option value="deepseek"${route.provider === "deepseek" ? " selected" : ""}>DeepSeek</option>
+              </select>
+            </label>
+            <label for="${modelId}">
+              <span>模型</span>
+              <input id="${modelId}" data-team-field="model" data-team-slot="${escapeHtml(assignment.slot)}" type="text" value="${escapeHtml(route.model)}" maxlength="200" autocomplete="off" spellcheck="false" required />
+            </label>
+            <label for="${reasoningId}">
+              <span>思考强度</span>
+              <select id="${reasoningId}" data-team-field="reasoning_effort" data-team-slot="${escapeHtml(assignment.slot)}">
+                <option value=""${route.reasoning_effort ? "" : " selected"}>渠道默认</option>
+                ${["minimal", "low", "medium", "high", "xhigh"]
+                  .map((effort) => `<option value="${effort}"${route.reasoning_effort === effort ? " selected" : ""}>${effort}</option>`)
+                  .join("")}
+              </select>
+            </label>
+          </div>
+          ${renderTeamFallbackRoutes(assignment, index)}
+        </article>
+      `;
+    })
+    .join("");
+  setBusy(state.isBusy);
+  if (options.focusId) {
+    els.teamAssignments.scrollTop = previousScrollTop;
+    document.getElementById(options.focusId)?.focus({ preventScroll: true });
+  }
+}
+
+function updateTeamAssignment(event, options = {}) {
+  const target = event.target.closest("[data-team-field][data-team-slot]");
+  const template = currentTeamTemplate();
+  if (!target || !template || target.disabled) {
+    return;
+  }
+  const assignment = teamAssignmentForSlot(template.team_selection, target.dataset.teamSlot);
+  if (!assignment) {
+    return;
+  }
+
+  const fallbackIndex = target.dataset.teamFallbackIndex;
+  const route = fallbackIndex === undefined
+    ? assignment.route
+    : assignment.route.fallbacks?.[Number(fallbackIndex)];
+  if (!route) {
+    return;
+  }
+
+  const field = target.dataset.teamField;
+  if (field === "role_card_id" && fallbackIndex === undefined) {
+    assignment.role_card_id = target.value || null;
+  } else if (field === "reasoning_effort" && fallbackIndex === undefined) {
+    assignment.route.reasoning_effort = target.value || null;
+  } else if (field === "model") {
+    route.model = options.trim ? target.value.trim() : target.value;
+  } else if (field === "family") {
+    route.family = target.value;
+    if (route.provider !== "litellm_proxy") {
+      route.provider = target.value === "deepseek" ? "deepseek" : "openai";
+    }
+    route.model = defaultTeamModel(route.family, route.provider);
+    renderTeamConfigurator({ focusId: target.id });
+  } else if (field === "provider") {
+    route.provider = target.value;
+    if (target.value === "openai") {
+      route.family = "gpt";
+    } else if (target.value === "deepseek") {
+      route.family = "deepseek";
+    }
+    route.model = defaultTeamModel(route.family, route.provider);
+    renderTeamConfigurator({ focusId: target.id });
+  }
+}
+
+function updateTeamFallbacks(event) {
+  const target = event.target.closest("button[data-team-action][data-team-slot]");
+  const template = currentTeamTemplate();
+  if (!target || !template || target.disabled) {
+    return;
+  }
+  const assignment = teamAssignmentForSlot(template.team_selection, target.dataset.teamSlot);
+  if (!assignment) {
+    return;
+  }
+  const assignmentIndex = template.team_selection.assignments.indexOf(assignment);
+  assignment.route.fallbacks = Array.isArray(assignment.route.fallbacks)
+    ? assignment.route.fallbacks
+    : [];
+
+  if (target.dataset.teamAction === "add-fallback") {
+    if (assignment.route.fallbacks.length >= MAX_TEAM_FALLBACKS) {
+      return;
+    }
+    assignment.route.fallbacks.push({
+      family: assignment.route.family,
+      provider: assignment.route.provider,
+      model: "",
+    });
+    const fallbackIndex = assignment.route.fallbacks.length - 1;
+    renderTeamConfigurator({ focusId: `team-fallback-model-${assignmentIndex}-${fallbackIndex}` });
+    return;
+  }
+
+  if (target.dataset.teamAction === "remove-fallback") {
+    const fallbackIndex = Number(target.dataset.teamFallbackIndex);
+    if (Number.isInteger(fallbackIndex) && fallbackIndex >= 0) {
+      assignment.route.fallbacks.splice(fallbackIndex, 1);
+      renderTeamConfigurator({ focusId: `team-add-fallback-${assignmentIndex}` });
+    }
+  }
+}
+
 async function loadSelectedPackDetail() {
   if (!els.workflowPack.value || els.workflowPack.value === "auto") {
     state.selectedPackDetail = null;
+    renderTeamConfigurator();
     return;
   }
-  state.selectedPackDetail = await api(`/workflow-packs/${encodeURIComponent(els.workflowPack.value)}`);
+  const packName = els.workflowPack.value;
+  const [packDetail] = await Promise.all([
+    api(`/workflow-packs/${encodeURIComponent(packName)}`),
+    ensureTeamTemplate(packName).catch(() => null),
+  ]);
+  state.selectedPackDetail = packDetail;
+  renderTeamConfigurator();
 }
 
 function renderPackOverview() {
@@ -1345,10 +1957,11 @@ function renderTaskCard(task) {
     <article
       class="item-card${active}"
       data-task-id="${escapeHtml(task.id)}"
+      data-runtime-focus-key="task:${escapeHtml(task.id)}"
       role="option"
       aria-selected="${isSelected}"
       aria-label="选择任务：${escapeHtml(task.title)}"
-      tabindex="0"
+      tabindex="-1"
     >
       <h4>${escapeHtml(task.title)}</h4>
       <p>工作流：${escapeHtml(workflowPackLabel(task.workflow_pack))}</p>
@@ -1420,7 +2033,7 @@ function renderNeedsAttention() {
     <strong>需要处理</strong>
     ${items
       .map(({ run, task }) => `
-        <button type="button" data-console-run-id="${escapeHtml(run.id)}">
+        <button type="button" data-console-run-id="${escapeHtml(run.id)}" data-runtime-focus-key="attention-run:${escapeHtml(run.id)}">
           ${escapeHtml(task?.title || run.task_id)} ｜ ${escapeHtml(statusLabel(run.status))}
         </button>
       `)
@@ -1432,7 +2045,7 @@ function renderRunConsoleCard(run) {
   const task = taskById(run.task_id);
   const active = run.id === state.selectedRunId ? " active" : "";
   return `
-    <article class="run-console-card${active}" data-console-run-id="${escapeHtml(run.id)}" tabindex="0">
+    <article class="run-console-card${active}" data-console-run-id="${escapeHtml(run.id)}" data-runtime-focus-key="console-run:${escapeHtml(run.id)}" tabindex="0">
       <header>
         <div>
           <h4>${escapeHtml(task?.title || run.task_id)}</h4>
@@ -1530,6 +2143,7 @@ function renderTasks() {
       selectedId: state.selectedTaskId,
     }),
   ].join("");
+  syncListboxTabStop(els.taskList, "[data-task-id]");
 }
 
 function renderRunCard(run) {
@@ -1542,10 +2156,11 @@ function renderRunCard(run) {
     <article
       class="item-card${active}${related ? " related" : ""}"
       data-run-id="${escapeHtml(run.id)}"
+      data-runtime-focus-key="run:${escapeHtml(run.id)}"
       role="option"
       aria-selected="${isSelected}"
       aria-label="选择运行记录：${escapeHtml(title)}，状态 ${escapeHtml(statusLabel(run.status))}"
-      tabindex="0"
+      tabindex="-1"
     >
       <h4>${escapeHtml(title)}</h4>
       <p><span class="status-pill ${escapeHtml(run.status)}">${statusLabel(run.status)}</span></p>
@@ -1596,6 +2211,7 @@ function renderRuns() {
       })
     )
     .join("");
+  syncListboxTabStop(els.runList, "[data-run-id]");
 }
 
 function renderWorkflowCurrent() {
@@ -1857,9 +2473,9 @@ function renderRuntimeJobActions(job) {
   return `
     <div class="runtime-actions" data-runtime-job-actions="${escapeHtml(job.id)}">
       <span>${escapeHtml(pendingLabel)}</span>
-      <button type="button" aria-label="批准意图" data-runtime-action="approve" data-run-id="${escapeHtml(job.run_id)}" data-job-id="${escapeHtml(job.id)}" ${disabled}>批准意图</button>
-      <button type="button" aria-label="拒绝意图" data-runtime-action="reject" data-run-id="${escapeHtml(job.run_id)}" data-job-id="${escapeHtml(job.id)}" ${disabled}>拒绝意图</button>
-      <button type="button" aria-label="取消任务" data-runtime-action="cancel" data-run-id="${escapeHtml(job.run_id)}" data-job-id="${escapeHtml(job.id)}" ${disabled}>取消任务</button>
+      <button type="button" aria-label="批准意图" data-runtime-action="approve" data-run-id="${escapeHtml(job.run_id)}" data-job-id="${escapeHtml(job.id)}" data-runtime-focus-key="job:${escapeHtml(job.id)}:approve" ${disabled}>批准意图</button>
+      <button type="button" aria-label="拒绝意图" data-runtime-action="reject" data-run-id="${escapeHtml(job.run_id)}" data-job-id="${escapeHtml(job.id)}" data-runtime-focus-key="job:${escapeHtml(job.id)}:reject" ${disabled}>拒绝意图</button>
+      <button type="button" aria-label="取消任务" data-runtime-action="cancel" data-run-id="${escapeHtml(job.run_id)}" data-job-id="${escapeHtml(job.id)}" data-runtime-focus-key="job:${escapeHtml(job.id)}:cancel" ${disabled}>取消任务</button>
     </div>
   `;
 }
@@ -1891,12 +2507,13 @@ function renderWritebackControls(artifact) {
   return `
     <div class="writeback-actions">
       <span>写回原仓库：必须先预览，再显式确认。普通本地批准不会写回。</span>
-      <button type="button" data-writeback-action="preview" data-artifact-id="${escapeHtml(artifact.id)}" ${previewPending || approvePending ? "disabled" : ""}>${previewPending ? "预览中..." : "预览写回"}</button>
+      <button type="button" data-writeback-action="preview" data-artifact-id="${escapeHtml(artifact.id)}" data-runtime-focus-key="artifact:${escapeHtml(artifact.id)}:preview" ${previewPending || approvePending ? "disabled" : ""}>${previewPending ? "预览中..." : "预览写回"}</button>
       <button
         type="button"
         class="danger-button"
         data-writeback-action="approve"
         data-artifact-id="${escapeHtml(artifact.id)}"
+        data-runtime-focus-key="artifact:${escapeHtml(artifact.id)}:approve"
         ${preview && repositoryPath && !previewPending && !approvePending ? "" : "disabled"}
       >${approvePending ? "写回中..." : "确认写回"}</button>
     </div>
@@ -2039,7 +2656,7 @@ async function renderRunDetails() {
           <article class="artifact-card">
             <header>
               <strong>${escapeHtml(artifact.type)}</strong>
-              <button type="button" data-artifact-id="${escapeHtml(artifact.id)}">查看内容</button>
+              <button type="button" data-artifact-id="${escapeHtml(artifact.id)}" data-runtime-focus-key="artifact:${escapeHtml(artifact.id)}:view">查看内容</button>
             </header>
             <p>产物 ID：${escapeHtml(artifact.id)}</p>
             <p>路径：${escapeHtml(artifact.path)}</p>
@@ -2053,6 +2670,7 @@ async function renderRunDetails() {
 
 function renderAll() {
   renderCatalog();
+  renderTeamConfigurator();
   renderRoleCards();
   renderGlobalRunBar();
   renderRunConsole();
@@ -2118,6 +2736,7 @@ const refreshData = window.HarnessRuntime.createRefreshCoordinator(refreshDataOn
 
 async function refreshDataOnce(options = {}) {
   const originalRefreshText = els.refreshButton.textContent;
+  let runtimeFocus = null;
   if (options.feedback) {
     els.refreshButton.textContent = "刷新中";
     els.refreshButton.classList.add("refreshing");
@@ -2186,6 +2805,8 @@ async function refreshDataOnce(options = {}) {
 
     syncSelectionAfterRefresh();
 
+    runtimeFocus = options.runtimeOnly ? captureRuntimeFocus() : null;
+
     if (!options.runtimeOnly) {
       renderCatalog();
       await loadSelectedPackDetail();
@@ -2219,6 +2840,7 @@ async function refreshDataOnce(options = {}) {
     }
     throw error;
   } finally {
+    restoreRuntimeFocus(runtimeFocus);
     if (options.feedback && els.refreshButton.getAttribute("aria-busy") === "true") {
       window.setTimeout(() => {
         els.refreshButton.textContent = originalRefreshText;
@@ -2262,62 +2884,311 @@ function providerByName(name) {
   return state.modelProviders.find((provider) => provider.name === name) || null;
 }
 
-function realEnabledRoutesForPack(pack) {
+async function refreshModelProvidersForRun() {
+  const modelProviders = await api("/model-providers", { timeoutMs: 10000 });
+  if (!Array.isArray(modelProviders) || !modelProviders.length) {
+    throw new Error("模型渠道状态返回异常，已停止运行。");
+  }
+  if (modelProviders.some((provider) => (
+    !provider ||
+    typeof provider.name !== "string" ||
+    !provider.name ||
+    typeof provider.enabled !== "boolean" ||
+    typeof provider.real_calls !== "boolean"
+  ))) {
+    throw new Error("模型渠道状态字段异常，已停止运行。");
+  }
+  if (new Set(modelProviders.map((provider) => provider.name)).size !== modelProviders.length) {
+    throw new Error("模型渠道状态包含重复名称，已停止运行。");
+  }
+  state.modelProviders = modelProviders;
+  return modelProviders;
+}
+
+async function refreshToolProvidersForRun() {
+  const toolProviders = await api("/tool-providers", { timeoutMs: 10000 });
+  if (!Array.isArray(toolProviders)) {
+    throw new Error("联网工具状态返回异常，已停止运行。");
+  }
+  if (toolProviders.some((provider) => (
+    !provider ||
+    typeof provider.name !== "string" ||
+    typeof provider.provider !== "string" ||
+    typeof provider.enabled !== "boolean" ||
+    typeof provider.real_calls !== "boolean"
+  ))) {
+    throw new Error("联网工具状态字段异常，已停止运行。");
+  }
+  state.toolProviders = toolProviders;
+  return toolProviders;
+}
+
+function validateWorkflowPackForRun(pack, packName) {
+  if (
+    !pack ||
+    typeof pack !== "object" ||
+    pack.name !== packName ||
+    !Array.isArray(pack.agents) ||
+    !pack.agents.length ||
+    !Array.isArray(pack.steps) ||
+    !pack.steps.length
+  ) {
+    throw new Error(`工作流 ${packName} 返回了不完整的运行定义。`);
+  }
+
+  const agentIds = new Set();
+  const agentRoles = new Set();
+  pack.agents.forEach((agent) => {
+    const config = agent?.model_config;
+    const fallbacks = config?.fallbacks === undefined ? [] : config.fallbacks;
+    if (
+      typeof agent?.id !== "string" ||
+      !agent.id ||
+      agent.pack_name !== packName ||
+      typeof agent?.role !== "string" ||
+      !agent.role ||
+      agentIds.has(agent.id) ||
+      agentRoles.has(agent.role) ||
+      !config ||
+      typeof config !== "object" ||
+      typeof config.provider !== "string" ||
+      !config.provider ||
+      typeof config.model !== "string" ||
+      !config.model ||
+      !Array.isArray(fallbacks) ||
+      fallbacks.some((fallback) => (
+        !fallback ||
+        typeof fallback.provider !== "string" ||
+        !fallback.provider ||
+        typeof fallback.model !== "string" ||
+        !fallback.model
+      ))
+    ) {
+      throw new Error(`工作流 ${packName} 的智能体或模型路由定义不合法。`);
+    }
+    agentIds.add(agent.id);
+    agentRoles.add(agent.role);
+  });
+
+  const stepNames = new Set();
+  pack.steps.forEach((step) => {
+    if (
+      typeof step?.name !== "string" ||
+      !step.name ||
+      stepNames.has(step.name) ||
+      typeof step.agent_role !== "string" ||
+      !agentRoles.has(step.agent_role) ||
+      !Array.isArray(step.depends_on) ||
+      new Set(step.depends_on).size !== step.depends_on.length ||
+      step.depends_on.some((dependency) => typeof dependency !== "string" || !dependency)
+    ) {
+      throw new Error(`工作流 ${packName} 的执行步骤定义不合法。`);
+    }
+    stepNames.add(step.name);
+  });
+  if (pack.steps.some((step) => (
+    step.depends_on.some((dependency) => dependency === step.name || !stepNames.has(dependency))
+  ))) {
+    throw new Error(`工作流 ${packName} 的执行步骤依赖不合法。`);
+  }
+  return pack;
+}
+
+async function refreshWorkflowPackForRun(packName) {
+  const freshPack = await api(`/workflow-packs/${encodeURIComponent(packName)}`, { timeoutMs: 10000 });
+  validateWorkflowPackForRun(freshPack, packName);
+  let replaced = false;
+  state.packs = state.packs.map((pack) => {
+    if (pack?.name !== packName) {
+      return pack;
+    }
+    replaced = true;
+    return freshPack;
+  });
+  if (!replaced) {
+    state.packs = [...state.packs, freshPack];
+  }
+  if (els.workflowPack.value === packName) {
+    state.selectedPackDetail = freshPack;
+  }
+  return freshPack;
+}
+
+function teamSelectionPayload(template) {
+  const selection = cloneJson(template?.team_selection);
+  if (!selection?.assignments?.length) {
+    throw new Error("团队模板尚未加载完整。");
+  }
+  selection.assignments.forEach((assignment) => {
+    assignment.role_card_id = assignment.role_card_id || null;
+    normalizeTeamRoute(assignment.route, `${agentRoleLabel(assignment.slot)} 的主路由`, {
+      allowReasoning: true,
+    });
+    assignment.route.reasoning_effort = assignment.route.reasoning_effort || null;
+    if (!Array.isArray(assignment.route.fallbacks) || assignment.route.fallbacks.length > MAX_TEAM_FALLBACKS) {
+      throw new Error(`${agentRoleLabel(assignment.slot)} 最多只能配置 ${MAX_TEAM_FALLBACKS} 个备用路由。`);
+    }
+    assignment.route.fallbacks.forEach((fallback, index) => {
+      normalizeTeamRoute(fallback, `${agentRoleLabel(assignment.slot)} 的备用路由 ${index + 1}`);
+    });
+    assertUniqueTeamRouteTargets(assignment);
+  });
+  return selection;
+}
+
+function teamRouteCandidates(assignment) {
+  return [assignment.route, ...(assignment.route.fallbacks || [])];
+}
+
+function assertPackProvidersReady(pack) {
+  const unavailableAgents = pack.agents
+    .filter((agent) => {
+      const config = agent.model_config;
+      const routes = [config, ...(config.fallbacks || [])];
+      return !routes.some((route) => providerByName(route.provider)?.enabled === true);
+    })
+    .map((agent) => agentRoleLabel(agent.role));
+  if (unavailableAgents.length) {
+    throw new Error(
+      `以下 Pack 岗位没有已启用的模型渠道：${unavailableAgents.join("、")}。请先完成模型渠道配置。`,
+    );
+  }
+}
+
+function assertTeamMatchesPack(teamSelection, pack) {
+  const expectedSlots = pack.agents.map((agent) => agent.role);
+  const selectedSlots = teamSelection?.assignments?.map((assignment) => assignment?.slot);
+  if (
+    teamSelection?.pack_name !== pack.name ||
+    !Array.isArray(selectedSlots) ||
+    selectedSlots.length !== expectedSlots.length ||
+    new Set(selectedSlots).size !== selectedSlots.length ||
+    expectedSlots.some((slot) => !selectedSlots.includes(slot))
+  ) {
+    throw new Error(`工作流 ${pack.name} 的团队岗位与最新 Pack 定义不一致，已停止运行。`);
+  }
+}
+
+function assertTeamProvidersReady(teamSelection) {
+  const unavailableSlots = teamSelection.assignments
+    .filter((assignment) => !teamRouteCandidates(assignment).some((route) => providerByName(route.provider)?.enabled))
+    .map((assignment) => agentRoleLabel(assignment.slot));
+  if (unavailableSlots.length) {
+    throw new Error(`以下岗位没有已启用的模型渠道：${unavailableSlots.join("、")}。请先完成 GPT / DeepSeek 渠道配置。`);
+  }
+}
+
+async function validatedTeamSelectionForPack(packName) {
+  const template = await ensureTeamTemplate(packName);
+  const teamSelection = teamSelectionPayload(template);
+  await api("/team-selections/validate", {
+    method: "POST",
+    body: JSON.stringify(teamSelection),
+    timeoutMs: 10000,
+  });
+  return teamSelection;
+}
+
+function routesForTeamSelection(teamSelection) {
+  if (!teamSelection?.assignments?.length) {
+    return [];
+  }
+  return teamSelection.assignments.flatMap((assignment) => [
+    {
+      slot: assignment.slot,
+      kind: "primary",
+      family: assignment.route.family,
+      provider: assignment.route.provider,
+      model: assignment.route.model,
+    },
+    ...(assignment.route.fallbacks || []).map((fallback) => ({
+      slot: assignment.slot,
+      kind: "fallback",
+      family: fallback.family,
+      provider: fallback.provider,
+      model: fallback.model,
+    })),
+  ]);
+}
+
+function groupedTeamRoutesForConfirmation(teamSelection) {
+  const groups = new Map();
+  routesForTeamSelection(teamSelection).forEach((route) => {
+    const provider = providerByName(route.provider);
+    if (provider?.real_calls !== true) {
+      return;
+    }
+    const key = [route.kind, route.family, route.provider, route.model].join("\u0000");
+    if (!groups.has(key)) {
+      groups.set(key, { ...route, slots: new Set() });
+    }
+    groups.get(key).slots.add(agentRoleLabel(route.slot));
+  });
+  return [...groups.values()].map((route) => ({
+    ...route,
+    slots: [...route.slots].sort(),
+  }));
+}
+
+function realRoutesForPack(packName) {
+  const pack = state.packs.find((item) => item.name === packName);
   if (!pack) {
     return [];
   }
-  return pack.agents
-    .map((agent) => {
-      const modelConfig = agent.model_config || {};
-      const providerName = modelConfig.provider || "mock";
-      const provider = providerByName(providerName);
-      if (providerName === "mock" || !provider?.real_calls || !provider?.enabled) {
-        return null;
-      }
-      return {
-        agentId: agent.id,
-        provider: providerName,
-        model: modelConfig.model || "-",
-      };
-    })
-    .filter(Boolean);
+  return window.HarnessRuntime.collectPackRealModelRoutes(pack, state.modelProviders)
+    .map((route) => ({
+      ...route,
+      slots: [...new Set(route.slots.map(agentRoleLabel))].sort(),
+    }));
 }
 
-function confirmRealProviderRunForPack(packName) {
-  const pack = state.packs.find((item) => item.name === packName);
-  const realRoutes = realEnabledRoutesForPack(pack);
+function realModelRoutesForRun(packName, teamSelection) {
+  return teamSelection
+    ? groupedTeamRoutesForConfirmation(teamSelection)
+    : realRoutesForPack(packName);
+}
+
+function confirmRealProviderRunForPack(
+  packName,
+  teamSelection = null,
+  realRoutes = realModelRoutesForRun(packName, teamSelection),
+) {
   if (realRoutes.length === 0) {
     return true;
   }
   const routeList = realRoutes
-    .map((route) => `- ${route.agentId}: ${route.provider}/${route.model}`)
+    .map((route) => {
+      const providerState = teamProviderState(route.provider);
+      if (route.kind === "pack" || route.kind === "pack_fallback") {
+        const routeKind = route.kind === "pack_fallback" ? "Pack 备用路由" : "Pack 主路由";
+        return `- ${routeKind} ${route.provider}/${route.model} · ${providerState.label}：${route.slots.join("、")}`;
+      }
+      if (route.kind === "vision_preprocess") {
+        return `- 图像预处理路由 ${route.provider}/${route.model} · ${providerState.label}`;
+      }
+      const routeKind = route.kind === "fallback" ? "备用" : "主路由";
+      return `- ${routeKind} ${teamFamilyLabel(route.family)} · ${route.provider}/${route.model} · ${providerState.label}：${route.slots.join("、")}`;
+    })
     .join("\n");
+  const routeTitle = teamSelection ? "本次团队路由" : "Pack 当前路由";
   return window.confirm(
-    `确认运行真实模型调用？\n\n工作流：${workflowPackLabel(packName)}\n${routeList}\n\n本次运行会调用外部模型渠道，可能产生费用并发送任务上下文。`
+    `确认运行真实模型调用？\n\n工作流：${workflowPackLabel(packName)}\n${routeTitle}：\n${routeList}\n\n本次运行会调用外部模型渠道，可能产生费用并发送任务上下文。`
   );
 }
 
-function confirmRealProviderRun(task) {
-  return confirmRealProviderRunForPack(task.workflow_pack);
+function confirmRealProviderRun(task, teamSelection, realRoutes) {
+  return confirmRealProviderRunForPack(task.workflow_pack, teamSelection, realRoutes);
 }
 
-function realWebSearchEnabled() {
-  return state.toolProviders.some((provider) => provider.real_calls && provider.enabled);
+function realWebToolsForPack(pack) {
+  return window.HarnessRuntime.collectPackRealWebTools(pack, state.toolProviders);
 }
 
-function packUsesWebSearch(packName) {
-  const pack = state.packs.find((item) => item.name === packName);
-  return Boolean(pack?.steps?.some((step) =>
-    (step.allowed_tools || []).some((tool) => ["web_search", "fetch_page", "browser_search", "browser_fetch"].includes(tool))
-  ));
-}
-
-function confirmRealWebSearchRunForPack(packName) {
-  if (!realWebSearchEnabled() || !packUsesWebSearch(packName)) {
+function confirmRealWebSearchRunForPack(packName, realTools) {
+  if (!realTools.length) {
     return true;
   }
-  const providers = state.toolProviders
-    .filter((provider) => provider.real_calls && provider.enabled)
+  const providers = realTools
     .map((provider) => `- ${provider.name}: ${provider.provider}`)
     .join("\n");
   return window.confirm(
@@ -2325,8 +3196,60 @@ function confirmRealWebSearchRunForPack(packName) {
   );
 }
 
-function confirmRealWebSearchRun(task) {
-  return confirmRealWebSearchRunForPack(task.workflow_pack);
+function confirmRealWebSearchRun(task, realTools) {
+  return confirmRealWebSearchRunForPack(task.workflow_pack, realTools);
+}
+
+function runAuthorizationScope(packName, teamSelection, visionPreprocessRoutes) {
+  return JSON.stringify({
+    pack_name: packName,
+    team_selection: teamSelection || null,
+    vision_preprocess_routes: visionPreprocessRoutes.map((route) => ({
+      kind: route.kind,
+      provider: route.provider,
+      model: route.model,
+    })),
+  });
+}
+
+async function authorizeRunForPack(packName, teamSelection, taskInputs, receipt = null) {
+  const [freshPack] = await Promise.all([
+    refreshWorkflowPackForRun(packName),
+    refreshModelProvidersForRun(),
+    refreshToolProvidersForRun(),
+  ]);
+  if (!teamSelection) {
+    assertPackProvidersReady(freshPack);
+  }
+  if (teamSelection) {
+    assertTeamMatchesPack(teamSelection, freshPack);
+    assertTeamProvidersReady(teamSelection);
+  }
+  const visionPreprocessRoutes = window.HarnessRuntime.collectVisionPreprocessRealModelRoutes(
+    taskInputs,
+    state.modelProviders,
+  );
+  const realModelRoutes = [
+    ...realModelRoutesForRun(packName, teamSelection),
+    ...visionPreprocessRoutes,
+  ];
+  const task = { workflow_pack: packName, inputs: taskInputs };
+  return window.HarnessRuntime.authorizeRunRoutes({
+    scope: runAuthorizationScope(packName, teamSelection, visionPreprocessRoutes),
+    receipt,
+    modelRoutes: realModelRoutes,
+    webTools: realWebToolsForPack(freshPack),
+    confirmModels: (routes) => confirmRealProviderRun(task, teamSelection, routes),
+    confirmWeb: (tools) => confirmRealWebSearchRun(task, tools),
+  });
+}
+
+function showRunAuthorizationCancelled(authorization) {
+  if (authorization?.cancelled === "web") {
+    showToast("已取消真实联网搜索。");
+    return;
+  }
+  showToast("已取消真实模型调用。");
 }
 
 function applyExample(packName) {
@@ -2348,52 +3271,87 @@ function applyExample(packName) {
   showToast(`${packName} 示例已填充。`);
 }
 
-async function createTask(payload = null, options = {}) {
-  const task = await api("/tasks", {
+async function persistTask(payload) {
+  return api("/tasks", {
     method: "POST",
-    body: JSON.stringify(payload || buildTaskPayload()),
+    body: JSON.stringify(payload),
   });
+}
+
+function rememberTask(task) {
+  state.tasks = [task, ...state.tasks.filter((item) => item.id !== task.id)];
+}
+
+function rememberRun(run) {
+  state.runs = [run, ...state.runs.filter((item) => item.id !== run.id)];
+}
+
+async function createTask(payload = null, options = {}) {
+  const task = await persistTask(payload || buildTaskPayload());
+  rememberTask(task);
   selectTask(task.id, { runId: null, followLatestActiveRun: false });
   showToast("任务已创建，可直接运行。");
-  await refreshData();
+  await refreshData({ silent: true });
   if (!options.stayOnCurrentView) {
     setActiveView("workflowView");
   }
   return task;
 }
 
-async function runTask(taskId, options = {}) {
-  const task = state.tasks.find((item) => item.id === taskId) || (await api(`/tasks/${encodeURIComponent(taskId)}`));
-  let confirmedRealModels = Boolean(options.confirmRealModels);
-  let confirmedRealWeb = Boolean(options.confirmRealWeb);
-  if (!options.skipConfirm) {
-    confirmedRealModels = confirmRealProviderRun(task);
-  }
-  if (!confirmedRealModels) {
-    showToast("已取消真实模型调用。");
-    return;
-  }
-  if (!options.skipWebConfirm) {
-    confirmedRealWeb = confirmRealWebSearchRun(task);
-  }
-  if (!confirmedRealWeb) {
-    showToast("已取消真实联网搜索。");
-    return;
+async function submitAuthorizedRun(task, teamSelection, authorization) {
+  rememberTask(task);
+  const runRequest = {
+    task_id: task.id,
+    confirm_real_models: authorization.confirmRealModels,
+    confirm_real_web: authorization.confirmRealWeb,
+    confirmed_real_web_tools: authorization.confirmedWebToolKeys,
+    confirmed_real_web_tool_routes: authorization.confirmedWebToolRoutes,
+    background: true,
+  };
+  if (teamSelection) {
+    runRequest.team_selection = teamSelection;
   }
   const run = await api("/runs", {
     method: "POST",
-    body: JSON.stringify({
-      task_id: taskId,
-      confirm_real_models: confirmedRealModels,
-      confirm_real_web: confirmedRealWeb,
-      background: true,
-    }),
+    body: JSON.stringify(runRequest),
   });
+  rememberRun(run);
   selectRun(run.id, { followLatestActiveRun: false });
   const toast = runToastMessage(run);
   showToast(toast.message, toast.tone);
   setActiveView("traceView");
-  await refreshData();
+  await refreshData({ silent: true });
+  return run;
+}
+
+function shouldUseVisibleCustomTeamForTask(task) {
+  return Boolean(
+    els.workflowPack.value !== "auto" &&
+    els.workflowPack.value === task.workflow_pack &&
+    els.useCustomTeam.checked
+  );
+}
+
+async function runTask(taskId, options = {}) {
+  const task = state.tasks.find((item) => item.id === taskId) || (await api(`/tasks/${encodeURIComponent(taskId)}`));
+  const hasExplicitTeamSelection = Object.prototype.hasOwnProperty.call(options, "teamSelection");
+  const useVisibleCustomTeam = !hasExplicitTeamSelection && shouldUseVisibleCustomTeamForTask(task);
+  const teamSelection = hasExplicitTeamSelection
+    ? options.teamSelection
+    : useVisibleCustomTeam
+      ? await validatedTeamSelectionForPack(task.workflow_pack)
+      : null;
+  const authorization = await authorizeRunForPack(
+    task.workflow_pack,
+    teamSelection,
+    task.inputs,
+    options.authorizationReceipt || null,
+  );
+  if (!authorization.authorized) {
+    showRunAuthorizationCancelled(authorization);
+    return;
+  }
+  return submitAuthorizedRun(task, teamSelection, authorization);
 }
 
 function isHostTestJob(job) {
@@ -2539,6 +3497,7 @@ async function saveRoleCard() {
   });
   state.selectedRoleCardId = card.id;
   showToast("角色卡已保存。保存后需要重启服务生效。");
+  invalidateTeamTemplates();
   await refreshData();
   await loadRoleCardIntoForm(card.id);
 }
@@ -2554,6 +3513,7 @@ async function deleteSelectedRoleCard() {
   await api(`/role-cards/${encodeURIComponent(roleCardId)}`, { method: "DELETE" });
   resetRoleCardForm();
   showToast("角色卡已删除，相关本地绑定已清除。");
+  invalidateTeamTemplates();
   await refreshData();
 }
 
@@ -2666,6 +3626,22 @@ els.workflowPack.addEventListener("change", () => {
   });
 });
 
+els.teamAssignments.addEventListener("input", (event) => updateTeamAssignment(event));
+els.teamAssignments.addEventListener("change", (event) => updateTeamAssignment(event, { trim: true }));
+els.teamAssignments.addEventListener("click", (event) => updateTeamFallbacks(event));
+els.useCustomTeam.addEventListener("change", () => renderTeamConfigurator());
+
+els.resetTeamSelectionButton.addEventListener("click", () => {
+  const packName = els.workflowPack.value;
+  if (!packName || packName === "auto") {
+    return;
+  }
+  runAction(async () => {
+    await ensureTeamTemplate(packName, { force: true });
+    showToast("已恢复当前工作流的团队模板。");
+  });
+});
+
 els.newRoleCardButton.addEventListener("click", resetRoleCardForm);
 
 els.roleCardList.addEventListener("click", (event) => {
@@ -2763,19 +3739,30 @@ els.taskForm.addEventListener("submit", (event) => {
 });
 
 els.runTaskButton.addEventListener("click", () => {
+  if (!els.taskForm.reportValidity()) {
+    return;
+  }
   runAction(async () => {
     const payload = buildTaskPayload();
+    const customTeamRequested = els.workflowPack.value !== "auto" && els.useCustomTeam.checked;
     const resolvedPack = await resolveWorkflowPackForPayload(payload);
-    if (!confirmRealProviderRunForPack(resolvedPack)) {
-      showToast("已取消真实模型调用。");
+    const teamSelection = customTeamRequested
+      ? await validatedTeamSelectionForPack(resolvedPack)
+      : null;
+    const authorization = await authorizeRunForPack(resolvedPack, teamSelection, payload.inputs);
+    if (!authorization.authorized) {
+      showRunAuthorizationCancelled(authorization);
       return;
     }
-    if (!confirmRealWebSearchRunForPack(resolvedPack)) {
-      showToast("已取消真实联网搜索。");
-      return;
-    }
-    const task = await createTask({ ...payload, workflow_pack: resolvedPack }, { stayOnCurrentView: true });
-    await runTask(task.id, { skipConfirm: true, skipWebConfirm: true, confirmRealModels: true, confirmRealWeb: true });
+    await window.HarnessRuntime.createTaskAfterRunAuthorization({
+      authorization,
+      createTask: () => persistTask({ ...payload, workflow_pack: resolvedPack }),
+      submitRun: (task, finalAuthorization) => submitAuthorizedRun(
+        task,
+        teamSelection,
+        finalAuthorization,
+      ),
+    });
   });
 });
 
@@ -2826,16 +3813,22 @@ els.taskList.addEventListener("click", (event) => {
   }
   selectTask(card.dataset.taskId, { followLatestActiveRun: false });
   renderRunSelectionViews();
+  syncListboxTabStop(els.taskList, "[data-task-id]")?.focus({ preventScroll: true });
 });
 
 els.taskList.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter" && event.key !== " ") {
+  if (moveListboxFocus(event, els.taskList, "[data-task-id]")) {
+    return;
+  }
+  if (!(event.key === "Enter" || event.key === " ")) {
     return;
   }
   const card = event.target.closest("[data-task-id]");
   if (card) {
+    event.preventDefault();
     selectTask(card.dataset.taskId, { followLatestActiveRun: false });
     renderRunSelectionViews();
+    syncListboxTabStop(els.taskList, "[data-task-id]")?.focus({ preventScroll: true });
   }
 });
 
@@ -2851,11 +3844,15 @@ els.runList.addEventListener("click", (event) => {
 });
 
 els.runList.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter" && event.key !== " ") {
+  if (moveListboxFocus(event, els.runList, "[data-run-id]")) {
+    return;
+  }
+  if (!(event.key === "Enter" || event.key === " ")) {
     return;
   }
   const card = event.target.closest("[data-run-id]");
   if (card) {
+    event.preventDefault();
     selectRun(card.dataset.runId, { followLatestActiveRun: false });
     renderRunSelectionViews();
     setActiveView("traceView");
@@ -2896,18 +3893,43 @@ els.runConsoleList.addEventListener("keydown", (event) => {
   }
 });
 
-document.querySelectorAll(".tab").forEach((tab) => {
-  tab.addEventListener("click", () => {
-    state.activeTab = tab.dataset.tab;
-    document.querySelectorAll(".tab").forEach((item) => {
-      const isActive = item === tab;
-      item.classList.toggle("active", isActive);
-      item.setAttribute("aria-selected", isActive ? "true" : "false");
-    });
-    els.chainPanel.classList.toggle("hidden", state.activeTab !== "chain");
-    els.tracePanel.classList.toggle("hidden", state.activeTab !== "trace");
-    els.artifactPanel.classList.toggle("hidden", state.activeTab !== "artifacts");
-    els.evalPanel.classList.toggle("hidden", state.activeTab !== "evals");
+const detailTabs = [...document.querySelectorAll('.detail-tabs [role="tab"]')];
+
+function activateDetailTab(tab, { focus = false } = {}) {
+  state.activeTab = tab.dataset.tab;
+  detailTabs.forEach((item) => {
+    const isActive = item === tab;
+    item.classList.toggle("active", isActive);
+    item.setAttribute("aria-selected", isActive ? "true" : "false");
+    item.tabIndex = isActive ? 0 : -1;
+  });
+  els.chainPanel.classList.toggle("hidden", state.activeTab !== "chain");
+  els.tracePanel.classList.toggle("hidden", state.activeTab !== "trace");
+  els.artifactPanel.classList.toggle("hidden", state.activeTab !== "artifacts");
+  els.evalPanel.classList.toggle("hidden", state.activeTab !== "evals");
+  if (focus) {
+    tab.focus();
+  }
+}
+
+detailTabs.forEach((tab, index) => {
+  tab.addEventListener("click", () => activateDetailTab(tab));
+  tab.addEventListener("keydown", (event) => {
+    let targetIndex = null;
+    if (event.key === "ArrowRight") {
+      targetIndex = (index + 1) % detailTabs.length;
+    } else if (event.key === "ArrowLeft") {
+      targetIndex = (index - 1 + detailTabs.length) % detailTabs.length;
+    } else if (event.key === "Home") {
+      targetIndex = 0;
+    } else if (event.key === "End") {
+      targetIndex = detailTabs.length - 1;
+    }
+    if (targetIndex === null) {
+      return;
+    }
+    event.preventDefault();
+    activateDetailTab(detailTabs[targetIndex], { focus: true });
   });
 });
 

@@ -10,6 +10,7 @@ from app.core.artifacts import ArtifactStore, ArtifactStoreError
 from app.core.execution_plan import ExecutionPlan
 from app.core.model_runtime import REAL_MODEL_PROVIDERS
 from app.core.models import (
+    AgentRun,
     AgentRunStatus,
     Artifact,
     ArtifactType,
@@ -28,8 +29,10 @@ MODEL_RESPONSE_TRACE_ACTIONS = frozenset({"model_response", "vision_preprocess_r
 
 class RunQualityCriteria(HarnessModel):
     required_artifact_types: list[ArtifactType] = Field(default_factory=list)
+    required_step_artifacts: dict[str, ArtifactType] = Field(default_factory=dict, max_length=32)
     required_eval_checks: list[str] = Field(default_factory=list)
     final_artifact_type: ArtifactType
+    pack_eval_step_name: str | None = Field(default=None, min_length=1, max_length=100)
     min_final_artifact_chars: int = Field(default=1, ge=0, le=1_000_000)
     require_completed_run: bool = True
     verify_artifact_hashes: bool = True
@@ -57,6 +60,8 @@ class RunQualityReport(HarnessModel):
     passed: bool
     checks: list[QualityCheck]
     metrics: RunQualityMetrics
+    criteria: RunQualityCriteria
+    execution_plan_hash: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 def quality_criteria_from_execution_plan(plan: ExecutionPlan) -> RunQualityCriteria:
@@ -79,8 +84,13 @@ def quality_criteria_from_execution_plan(plan: ExecutionPlan) -> RunQualityCrite
     )
     return RunQualityCriteria(
         required_artifact_types=artifact_types,
+        required_step_artifacts={
+            step.step_id: step.expected_artifacts[0]
+            for step in plan.steps
+        },
         required_eval_checks=list(dict.fromkeys(eval_checks)),
         final_artifact_type=plan.final_artifact_type,
+        pack_eval_step_name=_last_ordered_plan_step_name(plan),
     )
 
 
@@ -105,7 +115,12 @@ def evaluate_run_quality(
             )
         )
 
-    artifacts = _latest_completed_attempt_artifacts(storage, run_id)
+    latest_completed_by_step = _latest_completed_attempts(storage, run_id)
+    artifacts = _latest_completed_attempt_artifacts(
+        storage,
+        run_id,
+        latest_completed_by_step=latest_completed_by_step,
+    )
     artifact_types = {artifact.type for artifact in artifacts}
     for artifact_type in criteria.required_artifact_types:
         present = artifact_type in artifact_types
@@ -121,13 +136,64 @@ def evaluate_run_quality(
             )
         )
 
-    latest_evals = {
-        result.check_name: result
-        for result in storage.list_eval_results_for_run(run_id)
-    }
+    artifacts_by_attempt: dict[str, set[ArtifactType]] = {}
+    for artifact in artifacts:
+        artifacts_by_attempt.setdefault(artifact.agent_run_id, set()).add(artifact.type)
+    for step_name, artifact_type in criteria.required_step_artifacts.items():
+        attempt = latest_completed_by_step.get(step_name)
+        present = (
+            attempt is not None
+            and artifact_type in artifacts_by_attempt.get(attempt.id, set())
+        )
+        checks.append(
+            QualityCheck(
+                name=f"artifact:{step_name}:{artifact_type.value}",
+                status="pass" if present else "fail",
+                message=(
+                    f"Step {step_name}'s latest completed attempt owns {artifact_type.value}."
+                    if present
+                    else f"Step {step_name}'s latest completed attempt is missing {artifact_type.value}."
+                ),
+            )
+        )
+
+    final_artifact = storage.get_artifact(run.final_artifact_id) if run.final_artifact_id else None
+    final_attempt_id = (
+        final_artifact.agent_run_id
+        if final_artifact is not None
+        and any(
+            attempt.id == final_artifact.agent_run_id
+            for attempt in latest_completed_by_step.values()
+        )
+        else None
+    )
     for check_name in criteria.required_eval_checks:
-        result = latest_evals.get(check_name)
-        passed = result is not None and result.status == EvalStatus.PASS
+        step_name, separator, _criterion_name = check_name.partition(":acceptance:")
+        if separator:
+            attempt = latest_completed_by_step.get(step_name)
+            target_attempt_id = attempt.id if attempt is not None else None
+            expected_scope = "step_acceptance"
+        else:
+            pack_eval_attempt = (
+                latest_completed_by_step.get(criteria.pack_eval_step_name)
+                if criteria.pack_eval_step_name is not None
+                else None
+            )
+            target_attempt_id = (
+                pack_eval_attempt.id
+                if pack_eval_attempt is not None
+                else final_attempt_id
+                if criteria.pack_eval_step_name is None
+                else None
+            )
+            expected_scope = "pack"
+        passed = _has_unique_attempt_eval_pass(
+            storage,
+            run_id,
+            check_name,
+            target_attempt_id=target_attempt_id,
+            expected_scope=expected_scope,
+        )
         checks.append(
             QualityCheck(
                 name=f"eval:{check_name}",
@@ -154,7 +220,6 @@ def evaluate_run_quality(
             )
         )
 
-    final_artifact = storage.get_artifact(run.final_artifact_id) if run.final_artifact_id else None
     belongs_to_run = final_artifact is not None and final_artifact.run_id == run.id
     checks.append(
         QualityCheck(
@@ -222,21 +287,86 @@ def evaluate_run_quality(
         passed=all(check.status == "pass" for check in checks),
         checks=checks,
         metrics=_run_metrics(storage, run_id, run.started_at, run.finished_at),
+        criteria=criteria,
     )
 
 
-def _latest_completed_attempt_artifacts(storage: SQLiteStorage, run_id: str) -> list[Artifact]:
-    latest_completed_by_step = {
+def _latest_completed_attempts(storage: SQLiteStorage, run_id: str) -> dict[str, AgentRun]:
+    return {
         agent_run.step_name: agent_run
         for agent_run in storage.list_agent_runs_for_run(run_id)
         if agent_run.status == AgentRunStatus.COMPLETED
     }
-    accepted_agent_run_ids = {agent_run.id for agent_run in latest_completed_by_step.values()}
+
+
+def _last_ordered_plan_step_name(plan: ExecutionPlan) -> str:
+    completed: set[str] = set()
+    remaining = list(plan.steps)
+    ordered_step_names: list[str] = []
+    while remaining:
+        ready = [step for step in remaining if set(step.dependencies).issubset(completed)]
+        if not ready:
+            raise ValueError("Execution plan step dependencies cannot be resolved.")
+        for step in ready:
+            ordered_step_names.append(step.step_id)
+            completed.add(step.step_id)
+            remaining.remove(step)
+    return ordered_step_names[-1]
+
+
+def _latest_completed_attempt_artifacts(
+    storage: SQLiteStorage,
+    run_id: str,
+    *,
+    latest_completed_by_step: dict[str, AgentRun] | None = None,
+) -> list[Artifact]:
+    latest_attempts = latest_completed_by_step or _latest_completed_attempts(storage, run_id)
+    accepted_agent_run_ids = {agent_run.id for agent_run in latest_attempts.values()}
     return [
         artifact
         for artifact in storage.list_artifacts_for_run(run_id)
         if artifact.agent_run_id in accepted_agent_run_ids
     ]
+
+
+def _has_unique_attempt_eval_pass(
+    storage: SQLiteStorage,
+    run_id: str,
+    check_name: str,
+    *,
+    target_attempt_id: str | None,
+    expected_scope: str,
+) -> bool:
+    if target_attempt_id is None:
+        return False
+    results_by_id = {
+        result.id: result
+        for result in storage.list_eval_results_for_run(run_id)
+        if result.check_name == check_name
+    }
+    binding_events_by_result_id: dict[str, list[TraceEvent]] = {}
+    for event in storage.list_trace_events_for_run(run_id):
+        if event.event_type != TraceEventType.EVAL_RESULT:
+            continue
+        result_id = event.payload.get("eval_result_id")
+        if isinstance(result_id, str) and result_id in results_by_id:
+            binding_events_by_result_id.setdefault(result_id, []).append(event)
+
+    matching_results = []
+    for result_id, result in results_by_id.items():
+        binding_events = binding_events_by_result_id.get(result_id, [])
+        if len(binding_events) != 1:
+            continue
+        event = binding_events[0]
+        if (
+            event.agent_run_id != target_attempt_id
+            or event.payload.get("check_name") != result.check_name
+            or event.payload.get("status") != result.status.value
+            or event.payload.get("scope") != expected_scope
+        ):
+            continue
+        matching_results.append(result)
+    return len(matching_results) == 1 and matching_results[0].status == EvalStatus.PASS
 
 
 def _invalid_artifact_ids(artifact_store: ArtifactStore, artifacts: list[Artifact]) -> list[str]:

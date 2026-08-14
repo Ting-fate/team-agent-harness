@@ -87,8 +87,8 @@ def generate_execution_plan(
                 ),
             )
         ],
-        temperature=0.0,
-        max_tokens=max(4096, int(planner.model_settings.get("max_tokens", 4096))),
+        temperature=_trusted_planner_temperature(planner),
+        max_tokens=_trusted_planner_max_tokens(planner),
         reasoning_effort=(
             str(planner.model_settings["reasoning_effort"])
             if planner.model_settings.get("reasoning_effort") is not None
@@ -114,6 +114,24 @@ def generate_execution_plan(
         request=request,
         response=response,
     )
+
+
+def _trusted_planner_temperature(planner: AgentDefinition) -> float | None:
+    value = planner.model_settings.get("temperature")
+    if value is None:
+        return None
+    if type(value) not in {int, float} or not 0 <= value <= 2:
+        raise ValueError("Planner temperature must be a number between 0 and 2.")
+    return float(value)
+
+
+def _trusted_planner_max_tokens(planner: AgentDefinition) -> int | None:
+    value = planner.model_settings.get("max_tokens")
+    if value is None:
+        return None
+    if type(value) is not int or not 1 <= value <= 200_000:
+        raise ValueError("Planner max_tokens must be an integer between 1 and 200000.")
+    return value
 
 
 def select_planner_agent(pack: WorkflowPack, planner_role: str | None) -> AgentDefinition:

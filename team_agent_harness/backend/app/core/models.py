@@ -5,7 +5,36 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+
+
+CONFIRMABLE_REAL_WEB_TOOL_NAMES = frozenset(
+    {"web_search", "fetch_page", "browser_search", "browser_fetch"}
+)
+ALLOW_LEGACY_REAL_WEB_SNAPSHOT_CONTEXT = "allow_legacy_real_web_snapshot"
+
+
+def normalize_confirmed_real_web_tools(value: list[str] | None) -> list[str] | None:
+    if value is None:
+        return None
+    duplicates = sorted({name for name in value if value.count(name) > 1})
+    if duplicates:
+        raise ValueError(
+            "confirmed_real_web_tools contains duplicate tool names: "
+            f"{', '.join(duplicates)}"
+        )
+    unsupported = sorted(set(value) - CONFIRMABLE_REAL_WEB_TOOL_NAMES)
+    if unsupported:
+        raise ValueError(f"Unsupported real web tool names: {', '.join(unsupported)}")
+    return sorted(value)
 
 
 def new_id() -> str:
@@ -18,6 +47,43 @@ def utc_now() -> datetime:
 
 class HarnessModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class ConfirmedRealWebToolRoute(HarnessModel):
+    name: str = Field(min_length=1, max_length=100)
+    provider: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = normalize_confirmed_real_web_tools([value])
+        assert normalized is not None
+        return normalized[0]
+
+    @field_validator("provider")
+    @classmethod
+    def normalize_provider(cls, value: str) -> str:
+        return value.lower()
+
+
+def normalize_confirmed_real_web_tool_routes(
+    value: list[ConfirmedRealWebToolRoute] | None,
+) -> list[ConfirmedRealWebToolRoute] | None:
+    if value is None:
+        return None
+    identities = [(route.name, route.provider) for route in value]
+    duplicates = sorted({identity for identity in identities if identities.count(identity) > 1})
+    if duplicates:
+        formatted = ", ".join(f"{name}@{provider}" for name, provider in duplicates)
+        raise ValueError(
+            "confirmed_real_web_tool_routes contains duplicate routes: "
+            f"{formatted}"
+        )
+    return sorted(value, key=lambda route: (route.name, route.provider))
 
 
 class RunStatus(StrEnum):
@@ -119,10 +185,17 @@ class Task(HarnessModel):
 
 
 class Run(HarnessModel):
+    _legacy_real_web_snapshot_run_id: str | None = PrivateAttr(default=None)
+
     id: str = Field(default_factory=new_id, min_length=1)
     task_id: str = Field(min_length=1)
     real_model_access_confirmed: bool = False
     real_web_access_confirmed: bool = False
+    confirmed_real_web_tools: list[str] | None = Field(default_factory=list, max_length=4)
+    confirmed_real_web_tool_routes: list[ConfirmedRealWebToolRoute] | None = Field(
+        default_factory=list,
+        max_length=4,
+    )
     content_block_snapshot: list[dict[str, Any]] = Field(default_factory=list, max_length=16)
     content_block_snapshot_hash: str | None = Field(default=None, min_length=64, max_length=64)
     content_block_snapshot_files: dict[str, str] = Field(default_factory=dict, max_length=16)
@@ -137,6 +210,52 @@ class Run(HarnessModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     final_artifact_id: str | None = Field(default=None, min_length=1)
+
+    @field_validator("confirmed_real_web_tools")
+    @classmethod
+    def validate_confirmed_real_web_tools(cls, value: list[str] | None) -> list[str] | None:
+        return normalize_confirmed_real_web_tools(value)
+
+    @field_validator("confirmed_real_web_tool_routes")
+    @classmethod
+    def validate_confirmed_real_web_tool_routes(
+        cls,
+        value: list[ConfirmedRealWebToolRoute] | None,
+    ) -> list[ConfirmedRealWebToolRoute] | None:
+        return normalize_confirmed_real_web_tool_routes(value)
+
+    @model_validator(mode="after")
+    def validate_real_web_snapshot(self, info: ValidationInfo) -> Run:
+        names = self.confirmed_real_web_tools
+        routes = self.confirmed_real_web_tool_routes
+        if names is None or routes is None:
+            legacy_allowed = bool(
+                info.context
+                and info.context.get(ALLOW_LEGACY_REAL_WEB_SNAPSHOT_CONTEXT) is True
+            )
+            if names is None and routes is None and legacy_allowed:
+                return self
+            raise ValueError(
+                "None real-web snapshots are reserved for legacy persisted Run records."
+            )
+        route_names = [route.name for route in routes]
+        if names != route_names:
+            raise ValueError(
+                "confirmed_real_web_tools must exactly match confirmed_real_web_tool_routes."
+            )
+        if not self.real_web_access_confirmed and names:
+            raise ValueError(
+                "Non-empty real-web snapshots require real_web_access_confirmed=true."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_execution_plan_pair(self) -> Run:
+        if (self.execution_plan is None) != (self.execution_plan_hash is None):
+            raise ValueError(
+                "execution_plan and execution_plan_hash must either both be present or both be absent."
+            )
+        return self
 
 
 class AgentDefinition(HarnessModel):

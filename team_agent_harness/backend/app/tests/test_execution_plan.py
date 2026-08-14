@@ -246,6 +246,65 @@ def test_dynamic_plan_cannot_exceed_pack_or_agent_runtime_limits() -> None:
         )
 
 
+def test_dynamic_plan_cannot_omit_a_trusted_agent_cost_ceiling() -> None:
+    step = _single_agent_plan().steps[0].model_copy(
+        update={
+            "agent_role": "Coder",
+            "tool_permissions": ["write_artifact"],
+            "agent_loop": AgentLoopPolicy(
+                enabled=True,
+                max_steps=2,
+                max_tool_calls=1,
+                max_cost_usd=None,
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a max_cost_usd ceiling"):
+        validate_execution_plan_against_pack(
+            _single_agent_plan().model_copy(update={"steps": [step]}),
+            get_code_rd_pack(),
+        )
+
+
+def test_dynamic_plan_can_omit_cost_ceiling_when_trusted_agent_has_none() -> None:
+    pack = get_code_rd_pack()
+    agents = [
+        agent.model_copy(
+            update={
+                "runtime_limits": {
+                    name: value
+                    for name, value in agent.runtime_limits.items()
+                    if name != "max_cost_usd"
+                }
+            }
+        )
+        if agent.role == "Coder"
+        else agent
+        for agent in pack.agents
+    ]
+    pack = pack.model_copy(update={"agents": agents})
+    step = _single_agent_plan().steps[0].model_copy(
+        update={
+            "agent_role": "Coder",
+            "tool_permissions": ["write_artifact"],
+            "agent_loop": AgentLoopPolicy(
+                enabled=True,
+                max_steps=2,
+                max_tool_calls=1,
+                max_cost_usd=None,
+            ),
+        }
+    )
+
+    validated = validate_execution_plan_against_pack(
+        _single_agent_plan().model_copy(update={"steps": [step]}),
+        pack,
+    )
+
+    assert validated.steps[0].agent_loop.max_cost_usd is None
+
+
 def test_dynamic_plan_restores_relevant_pack_blocker_evals() -> None:
     validated = validate_execution_plan_against_pack(
         _single_agent_plan(),
@@ -540,7 +599,12 @@ def test_agent_loop_workspace_tools_require_explicit_repository_path(tmp_path: P
                     )
                 ],
                 tool_permissions=["read_file"],
-                agent_loop=AgentLoopPolicy(enabled=True, max_steps=2, max_tool_calls=1),
+                agent_loop=AgentLoopPolicy(
+                    enabled=True,
+                    max_steps=2,
+                    max_tool_calls=1,
+                    max_cost_usd=10,
+                ),
             )
         ],
     )
@@ -839,6 +903,32 @@ def test_plan_generation_accepts_plain_json_from_real_model() -> None:
     assert result.plan.model_copy(update={"agent_snapshots": []}) == expected
     assert result.plan.agent_snapshots
     assert result.response is not None and result.response.mocked is False
+
+
+def test_plan_generation_inherits_trusted_planner_request_limits() -> None:
+    pack = _pack_with_real_planner()
+    planner = next(agent for agent in pack.agents if agent.role == "Architect")
+    planner.model_settings = {
+        "provider": "litellm_proxy",
+        "model": "gpt5.5",
+        "temperature": 0.75,
+        "max_tokens": 1234,
+        "reasoning_effort": "high",
+    }
+    adapter = _PlanAdapter(_planner_response_plan().model_dump_json())
+
+    generate_execution_plan(
+        task=_task_for_plan_generation(),
+        pack=pack,
+        model_gateway=ModelGateway({"litellm_proxy": adapter}),
+        planner_role="Architect",
+    )
+
+    assert len(adapter.requests) == 1
+    request = adapter.requests[0]
+    assert request.temperature == 0.75
+    assert request.max_tokens == 1234
+    assert request.reasoning_effort == "high"
 
 
 @pytest.mark.parametrize(

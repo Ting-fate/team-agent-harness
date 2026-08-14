@@ -17,7 +17,7 @@ This directory includes the original MVP phases, the durable local worker and bo
 - Model runtime contract with a deterministic mocked adapter and `model_request` / `model_response` trace observability.
 - Typed model tool definitions and tool-call observations for both Chat Completions and Responses-compatible providers. Unknown tools, malformed arguments, duplicate call ids, undeclared tool calls, and oversized arguments fail closed.
 - Real-model responses fail closed: only `stop`/`completed` responses with non-empty string text are accepted; truncated, filtered, tool-call-only, failed, incomplete, missing, or non-text responses raise a sanitized runtime error without persisting the raw provider response.
-- Mocked multi-model profile assignment inside each workflow pack, so one run can show two or more model profiles cooperating through agent-level `model_config`.
+- Backward-compatible mocked model profiles inside each workflow Pack plus an optional run-scoped `team-selection-v1` contract. The operator may replace each fixed position's role card and choose only GPT or DeepSeek routes through `openai`, `deepseek`, or `litellm_proxy`; the selection cannot add positions, change the DAG, widen tools, raise runtime limits, or alter Skill bindings.
 - Provider catalog and explicit opt-in OpenAI-compatible adapters for OpenAI, DeepSeek, and an optional LiteLLM Proxy gateway; mock remains the default, while Anthropic and local providers are still skeleton-only.
 - Server-side model routing config that can assign selected agents to `mock`, `openai`, `deepseek`, or `litellm_proxy` without storing API keys in the app.
 - Single-process workflow runner with deterministic mocked agent execution, dependency-aware ready-set step scheduling, dependency-edge handoffs for DAG packs, explicit dependency lineage on completed DAG attempts, bounded context envelope construction, workflow-level intake/context/skill-route trace events, scoped structural/executor/pack evaluation, named step eval and artifact gate enforcement, ready-batch/ownership conflict checks, conservative opt-in parallel executor dispatch for safe DAG batches, failure trace recording, run/agent-run status updates, local runtime session/job metadata recording for `session` and `acp` steps, and local approval gates.
@@ -27,17 +27,17 @@ This directory includes the original MVP phases, the durable local worker and bo
 - Mocked Code R&D workflow pack with Clarifier, Architect, Coder, Tester, Reviewer, and Finalizer steps.
 - Mocked Institutional Code R&D workflow pack with GPT as the trusted main thread, DeepSeek V4 Pro long-context reading/review roles, GPT implementation/test executor branches that require local approval before their mocked/model step execution proceeds, DeepSeek final risk review, and GPT final approval.
 - Research workflow pack with Planner, Searcher, Reader, Verifier, Writer, and Reviewer steps. It defaults to mock web search/fetch and can use Tavily or local browser bridge search/fetch only after explicit server-side opt-in.
-- FastAPI endpoints for creating/listing tasks, starting workflows synchronously or in the local background worker, reading run metadata, trace events, artifacts, workflow pack catalogs, single workflow pack details, model provider skeletons, tool provider status, local Skill Library metadata, skill bindings, and pack agent catalogs; default routes remain mock unless server-side routing explicitly enables real providers for selected agents. `GET /tasks` and `GET /runs` are bounded to 500 newest records by default and accept validated `limit`/`offset` query parameters up to 1000 records.
+- FastAPI endpoints for creating/listing tasks, validating run-scoped teams, reading a Pack team template, starting workflows synchronously or in the local background worker, reading the immutable selected-team receipt, run metadata, trace events, artifacts, workflow pack catalogs, single workflow pack details, model provider skeletons, tool provider status, local Skill Library metadata, skill bindings, and pack agent catalogs; default routes remain mock unless server-side routing or an explicitly confirmed run-scoped team enables real providers. `GET /tasks` and `GET /runs` are bounded to 500 newest records by default and accept validated `limit`/`offset` query parameters up to 1000 records.
 - Conservative Skill Auto-Router that can automatically select relevant read-only local skills for agents from explicit workflow, role, tool-permission, document-file task signals, and high-confidence domain task signals such as security, performance, database, testing, architecture, UI/web, and AI/model work while preserving manual bindings as an override/extension path.
 - FastAPI endpoints for reading full run observability data: aggregated run detail, agent runs, handoffs, eval results, trace events, artifacts, runtime sessions, runtime jobs, and safe queue/lock summaries.
 - FastAPI execution-plan validation/generation and run-quality endpoints. Quality reports verify frozen-plan artifacts, every declared step acceptance result, blocker evals, final content, and artifact hashes instead of treating artifact presence alone as success.
 - Reproducible paired-replicate benchmark evaluation for Single-Agent, current Multi-Agent, role ablations, and model combinations, including quality, token usage, latency, estimated cost, manual rework, contradictions, and indispensable contributions.
 - FastAPI endpoints for local runtime job approval actions: approve, reject, and cancel. These mutate local job/session/run state only; they do not launch external ACP processes.
-- Safe Codex/operator CLI for creating tasks, starting runs, polling run state, reading run details, listing approval-required runtime jobs, and inspecting provider/pack catalogs without exposing approval, writeback, or arbitrary shell commands.
-- Same-origin Chinese thin UI for creating tasks, filling Code R&D / Institutional Code R&D / Research examples, running workflows, confirming enabled real-provider and real web-search routes before execution, inspecting selected pack details including step phase, dependencies, Main/Subagent coordination role, runtime, session policy, return contract, agent model assignment, provider/tool status, local Skill Library bindings, and reading execution chains, local session/job/approval/queue/lock status, eval results, trace events, failure summaries, artifacts, and artifact content through the aggregated run detail contract.
+- Safe Codex/operator CLI plus a restricted stdio MCP adapter for creating tasks, validating GPT/DeepSeek teams, starting background runs, polling run state, and reading redacted run/team/quality data. Neither surface exposes approval, writeback, arbitrary shell, Git, configuration, dependency installation, or credential tools.
+- Same-origin Chinese thin UI for creating tasks, filling Code R&D / Institutional Code R&D / Research examples, selecting each fixed position's role card, GPT/DeepSeek family, provider, model, and reasoning effort for the next run, confirming the actual selected real-provider/fallback routes and real web-search routes before execution, inspecting selected pack details including step phase, dependencies, Main/Subagent coordination role, runtime, session policy, return contract, provider/tool status, local Skill Library bindings, and reading execution chains, local session/job/approval/queue/lock status, eval results, trace events, failure summaries, artifacts, and artifact content through the aggregated run detail contract.
 - Unit tests for health check, OpenAPI availability, model validation, model runtime contract, model routing, JSON serialization, storage round trips, pack schema validation, registry behavior, trace logging, artifact writes, tool gateway behavior, runner success/failure paths, Code R&D pack happy/blocker/gating paths, Institutional Code R&D API path, Research pack happy/blocker/gating paths, API happy/error/isolation paths, and static UI serving.
 
-The default multi-model assignment is still mocked: current workflow packs use `provider="mock"` unless an agent is explicitly reconfigured through server-side routing. OpenAI, DeepSeek, and LiteLLM Proxy adapters can make real calls only when their provider key is set, `TEAM_AGENT_ALLOW_REAL_MODEL_CALLS=1` is set, and an agent explicitly opts into that provider. Tavily web search/fetch can make real network calls only when `TEAM_AGENT_ALLOW_REAL_WEB_SEARCH=1`, `TEAM_AGENT_WEB_SEARCH_PROVIDER=tavily`, and `TAVILY_API_KEY` are set. Browser search/fetch can make real browser calls only when `TEAM_AGENT_ALLOW_BROWSER_ACCESS=1`, `TEAM_AGENT_BROWSER_PROVIDER=edge|chrome|browser_cdp`, and a compatible local CDP proxy is available. API keys are read from server-side environment variables only; they are not entered in the browser task UI, obvious secret-like task content is rejected before SQLite storage, and keys are not written to trace/artifacts. The separate local desktop launcher can save keys to `.env.local`, which is ignored by Git. Anthropic and local model providers are still skeleton entries.
+The compatibility default remains mocked: current workflow Packs use `provider="mock"` when a caller omits `team_selection`. The browser team editor intentionally constructs real GPT/DeepSeek routes and therefore requires the chosen provider to be configured, the server gate `TEAM_AGENT_ALLOW_REAL_MODEL_CALLS=1`, and explicit confirmation for that run. OpenAI, DeepSeek, and LiteLLM Proxy adapters cannot make real calls merely because a model name was selected. Tavily web search/fetch can make real network calls only when `TEAM_AGENT_ALLOW_REAL_WEB_SEARCH=1`, `TEAM_AGENT_WEB_SEARCH_PROVIDER=tavily`, and `TAVILY_API_KEY` are set. Browser search/fetch can make real browser calls only when `TEAM_AGENT_ALLOW_BROWSER_ACCESS=1`, `TEAM_AGENT_BROWSER_PROVIDER=edge|chrome|browser_cdp`, and a compatible local CDP proxy is available. API keys are read from server-side environment variables only; they are not entered in the browser task UI, obvious secret-like task/team content is rejected before SQLite storage, and keys are not written to trace/artifacts. The separate local desktop launcher can save keys to `.env.local`, which is ignored by Git. Anthropic and local model providers are outside the run-scoped team contract.
 
 The runner can dispatch safe explicit-DAG batches in parallel only when the executor explicitly opts in and every ready step has non-conflicting ownership. Parallel work is submitted up to the frozen plan's `max_parallel_steps`; after a branch failure, queued branches are not started, running calls are allowed to settle, and commit/error handling stays in deterministic plan order. `ModelGateway` separately limits concurrent calls per provider through `TEAM_AGENT_PROVIDER_MAX_CONCURRENCY` (default `4`). The in-process `RunWorker` is a durable local execution mechanism, not a distributed queue or external engineering executor. Built-in runtime jobs still do not launch external ACP processes or maintain live background child sessions. Code R&D does not receive general web search by default; only Research uses the web tools.
 
@@ -56,6 +56,7 @@ The worker is intentionally local and single-process:
 - SQLite run/queue state is authoritative; the in-memory queue is only a wake-up signal.
 - Graceful shutdown stops accepting work, waits up to 30 seconds for only the active worker segment, and leaves the queued backlog persisted for the next start. If the bound is reached, SQLite stays open until process exit so the still-finishing daemon segment is not handed a closed connection.
 - Startup schedules persisted `queued` runs, releases orphaned locks for every run state, repairs the `queued` run / `running` queue-item crash window, and requeues orphaned `running` runs.
+- Persisted Run payload reads verify that the embedded id matches the SQLite row id. Startup validates every persisted Run and converts an otherwise-valid one-sided `execution_plan` / `execution_plan_hash` pair into the existing loadable failed sentinel; all other corrupt records are quarantined without blocking healthy Runs by atomically failing active queue state, releasing locks, cancelling open runtime state, and marking only the SQLite Run index failed. The original corrupt payload remains unchanged as evidence and typed Run endpoints return HTTP 409 for it.
 - A step becomes a completed `AgentRun` checkpoint only after its eval gate and every declared outgoing edge has exactly one valid handoff. For explicit DAG dependencies, the consuming `AgentRun.input_context` records the exact dependency attempt and handoff ids. Recovery rejects missing, duplicate, extra, mis-targeted, or cross-attempt handoffs; lineage keys must exactly equal `depends_on`, while dependency-free steps must not claim lineage. Every artifact file owned by the checkpoint is streamed through its durable content hash before reuse. An invalid latest checkpoint and its older completed fallbacks are cancelled so the step is rerun without deleting artifacts or records.
 - Only validated handoffs from the latest completed attempt of each declared dependency enter downstream context. Every referenced artifact must belong to that attempt and the handoff must include its declared produced artifact. Structural artifact checks, executor-supplied checks, and pack evals use separate trace scopes; a required named executor check must have exactly one `PASS` result.
 - A persisted `waiting` run with an `approved` runtime job is requeued automatically on startup. Retrying a background approval reuses its active queue segment, and retrying an already-completed approval returns the persisted result without advancing a newer job.
@@ -373,7 +374,9 @@ GitHub users do not need to deploy FastAPI or LiteLLM manually:
 4. Use the desktop launcher to enter the GPT relay key and `/v1` base URL plus
    the DeepSeek API key. The local LiteLLM key is a private value chosen by the
    user and must begin with `sk-`.
-5. Choose **Save Config**, **Start Services**, and **Open UI**.
+5. Choose **Save Config**, then **Start Services**. The launcher opens the UI
+   automatically only after the worker, HTML workspace marker, and required API
+   surface are ready. Use **Open UI** later when you only need to reopen it.
 
 Setup selects Python 3.13 first and Python 3.12 second because LiteLLM is not
 supported by this project on Python 3.14. When neither compatible version is
@@ -637,6 +640,8 @@ python -m venv .venv
 
 ### Current Verification Record
 
+- On 2026-08-14 the configurable-team, launcher, quality-lineage, and restricted Codex MCP release candidate passed the full local backend suite with `1314 passed, 5 skipped, 1 warning` in 471.51 seconds. The warning remains the existing Starlette `TestClient` deprecation. `python -m compileall -q app scripts`, `pip check` in both project environments, JavaScript syntax for both static scripts, all four tracked PowerShell AST parses, YAML/JSON parsing, `git diff --check`, and high-confidence credential and private-path scans passed. Quality evaluation binds each required artifact and acceptance result to the latest completed attempt, and Pack acceptance evidence must have one matching trace in the correct attempt/scope. The MCP adapter applies one monotonic wall-clock deadline across every HTTP request in a tool call, reads response bodies against the remaining budget, and bounds remembered Run receipts to a 128-entry LRU whose evictions are revalidated from Run/Team/hash lineage. Launcher saves preserve unrelated `.env.local` fields/comments and valid ACLs through same-directory atomic replacement; replacement failure restores the previous file, service rollback stops the new process before restoring a reconstructable prior Harness, unreconstructable enabled-provider state is reused fail-closed, and active-work inspection returns `unknown` at its 20-Run bound. Task and Run listboxes implement Arrow/Home/End/Enter/Space behavior with roving `tabindex`. A fresh temporary-data Uvicorn process completed a six-step mock Research run through the real stdio MCP process: the fixed 12-tool catalog was present, `harness_list_recent`, `harness_get_quality`, and `harness_get_final_artifact` all passed their Run/hash bindings, quality passed 28 checks, six AgentRun checkpoints and six artifacts were persisted, and no error trace remained. The normal Harness and LiteLLM processes then passed live health/readiness checks on ports `8014` and `4000`. A fresh post-fix isolated Chrome pass covered `1440`, `390`, and `320` pixel layouts, found no page-level horizontal overflow or failed application request, reported zero console warnings/errors, and exercised task selection with Arrow/Enter plus Run selection with End/Space. Narrow navigation and detail-tab rows remained reachable through explicit horizontal scrolling. No real or paid model call was made. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
+- On 2026-08-10 the configurable-team, desktop-launcher, and restricted Codex MCP increment passed the focused execution-plan, Team Selection, API, and MCP regression set with `220 passed, 1 warning` and the full local backend suite with `1027 passed, 5 skipped, 1 warning`. `python -m compileall -q app scripts`, `pip check`, JavaScript syntax, every tracked PowerShell AST parse, `git diff --check`, and high-confidence credential-exposure scans passed. Browser verification completed default-team and six-position custom GPT/DeepSeek mock runs, confirmed immutable team receipts and passing quality reports, exercised widths `320`, `390`, `768`, `1024`, and `1440` without horizontal overflow or control overlap, preserved focus across provider/model redraws, enforced disabled custom-team controls, and reported no console warning or error. No real or paid model call was made. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
 - On 2026-08-10 the async-worker CI stabilization at commit `d8ce98b` passed the affected-file suite with `69 passed, 1 warning` and the full local backend suite with `823 passed, 5 skipped, 1 warning`. Worker-facing tests now use one shared 60-second test-only observation bound for scheduling, recovery, and terminal-state paths; `background_run_completed` is observed after authoritative queue terminalization and lock release, while deterministic release, join, heartbeat, ordering, and cleanup probes retain narrow bounds. `python -m compileall -q app scripts`, `pip check`, all four tracked PowerShell parse checks, two YAML and three JSON configuration parses, a high-confidence intended-diff credential scan, and `git diff --check` passed. GitHub Actions run `31323576572` passed the Windows Python 3.12, 3.13, and 3.14 matrix with `827 passed, 1 skipped, 1 warning` per job. The test warning remains the existing Starlette `TestClient` deprecation. GitHub also emitted its existing Node.js 20 action deprecation annotation; no CI workflow change was included in this test-only fix. No real or paid model call was made.
 - On 2026-08-07 the final release review passed the full backend suite with `823 passed, 5 skipped, 1 warning`. Fourteen focused adversarial regressions proved pre-dispatch durable provider-attempt evidence, fail-closed trace persistence, partial-usage accounting, local serialization rejection, sensitive-identifier sanitization, the exact built-in adapter trust boundary, and recorder coverage for normal Pack, Agent Loop, vision-sidecar, and Institutional local-code paths. `python -m compileall -q app scripts`, `pip check`, all four tracked PowerShell parse checks, CI/config YAML parsing, and `git diff --check` passed. The warning remains the existing Starlette `TestClient` deprecation. A fresh temporary-data Uvicorn smoke completed all six mock steps with `quality_passed=true`, six AgentRun checkpoints, five handoffs, six artifacts, 18 eval results, and no error trace; the service stopped cleanly and the temporary data was removed. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
 - On 2026-08-06 the current worktree passed the full backend suite with `751 passed, 5 skipped, 1 warning`; the final focused cross-module regression set passed `203 passed, 1 skipped`, and the multimodal-only regression set passed `22 passed`. `python -m compileall -q app scripts`, `pip check`, `git diff --check`, and a high-confidence source/config secret scan also passed. The warning remains the existing Starlette `TestClient` deprecation. A fresh temporary-data Uvicorn smoke on port `8015` completed all six mock steps with `quality_passed=true`, six metered model calls, complete usage, six AgentRun checkpoints, five handoffs, six artifacts, 17 eval results, and no error trace; the service was then stopped and its temporary data removed. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
@@ -735,15 +740,62 @@ Safety boundary:
 - Codex may automate observation and task creation. Real model calls, runtime-job approval, external executor approval, writeback to the original repository, key changes, and global environment changes still require explicit user confirmation.
 - API keys stay in server-side environment variables or `.env.local`; never put keys in CLI arguments, task inputs, routing JSON, trace, artifacts, or UI fields.
 
+### Restricted Codex MCP Adapter
+
+`scripts/codex_harness_mcp.py` exposes the same narrow operator boundary over
+stdio MCP. It is intentionally not registered by setup because `codex mcp add`
+changes the user's Codex configuration. From this backend directory, register
+the current checkout explicitly:
+
+```powershell
+$backend = (Get-Location).Path
+codex mcp add team-agent-harness -- `
+  "$backend\.venv\Scripts\python.exe" `
+  "$backend\scripts\codex_harness_mcp.py"
+codex mcp get team-agent-harness
+```
+
+The adapter binds only to an explicit loopback `http` Harness origin, disables
+HTTP proxies and redirects, and communicates with Codex through strict UTF-8
+newline-delimited JSON-RPC. Its fixed allowlist contains exactly 12 tools:
+`harness_health`, `harness_list_catalog`, `harness_list_recent`,
+`harness_get_team_template`, `harness_create_task`, `harness_validate_team`,
+`harness_start_run`, `harness_get_run`, `harness_get_run_detail`,
+`harness_get_run_team`, `harness_get_quality`, and
+`harness_get_final_artifact`. Recent-list reads use fixed server-side bounds;
+final-artifact reads require a completed Run, matching Run/artifact/hash
+lineage, and return at most 100,000 characters marked as untrusted content. The
+adapter has no approval, writeback, shell, Git, configuration,
+dependency-installation, deletion, deployment, or secret tool.
+
+By default an MCP-launched run cannot assert real-model or real-web consent.
+Grant either capability only when registering the MCP process intentionally:
+
+```powershell
+codex mcp add `
+  --env TEAM_AGENT_CODEX_ALLOW_REAL_MODELS=1 `
+  --env TEAM_AGENT_CODEX_ALLOW_REAL_WEB=1 `
+  team-agent-harness -- `
+  "$backend\.venv\Scripts\python.exe" `
+  "$backend\scripts\codex_harness_mcp.py"
+```
+
+These flags do not contain provider keys and do not bypass the Harness's own
+provider gates. API keys remain only in the Harness process environment or its
+ignored `.env.local`.
+
 ## API Surface
 
 - `POST /tasks`
 - `POST /task-intake/analyze`
 - `GET /tasks`
 - `GET /tasks/{task_id}`
+- `POST /team-selections/validate`
+- `GET /workflow-packs/{pack_name}/team-template`
 - `POST /runs`
 - `GET /runs`
 - `GET /runs/{run_id}`
+- `GET /runs/{run_id}/team`
 - `GET /runs/{run_id}/detail`
 - `GET /runs/{run_id}/quality`
 - `GET /runs/{run_id}/trace`

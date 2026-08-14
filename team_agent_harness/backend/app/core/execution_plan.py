@@ -21,6 +21,9 @@ from app.packs.base import (
 
 
 EXECUTION_PLAN_SCHEMA_VERSION = "execution-plan-v1"
+_TEAM_SELECTION_VERSION_KEY = "team_selection_version"
+_TEAM_SELECTION_MANIFEST_KEY = "team_selection_manifest_hash"
+_TEAM_SELECTION_VERSION = "team-selection-v1"
 
 
 class ExecutionPlanAgent(HarnessModel):
@@ -274,7 +277,11 @@ def _agent_snapshots_for_plan(
     plan: ExecutionPlan,
     pack: WorkflowPack,
 ) -> list[ExecutionPlanAgent]:
-    required_roles = {step.agent_role for step in plan.steps}
+    required_roles = (
+        {agent.role for agent in pack.agents}
+        if _pack_has_complete_team_selection(pack)
+        else {step.agent_role for step in plan.steps}
+    )
     return [
         ExecutionPlanAgent(
             agent_id=agent.id,
@@ -288,6 +295,32 @@ def _agent_snapshots_for_plan(
         for agent in pack.agents
         if agent.role in required_roles
     ]
+
+
+def _pack_has_complete_team_selection(pack: WorkflowPack) -> bool:
+    marker_states: list[bool] = []
+    manifest_hashes: set[str] = set()
+    for agent in pack.agents:
+        version = agent.model_settings.get(_TEAM_SELECTION_VERSION_KEY)
+        manifest_hash = agent.model_settings.get(_TEAM_SELECTION_MANIFEST_KEY)
+        if version is None and manifest_hash is None:
+            marker_states.append(False)
+            continue
+        if (
+            version != _TEAM_SELECTION_VERSION
+            or not isinstance(manifest_hash, str)
+            or len(manifest_hash) != 64
+            or any(character not in "0123456789abcdef" for character in manifest_hash)
+        ):
+            raise ValueError("Workflow Pack contains invalid frozen team selection metadata.")
+        marker_states.append(True)
+        manifest_hashes.add(manifest_hash)
+
+    if any(marker_states) and not all(marker_states):
+        raise ValueError("Workflow Pack contains partial frozen team selection metadata.")
+    if len(manifest_hashes) > 1:
+        raise ValueError("Workflow Pack contains inconsistent frozen team selection metadata.")
+    return bool(marker_states) and all(marker_states)
 
 
 def _without_agent_snapshots(plan: ExecutionPlan) -> ExecutionPlan:
@@ -326,12 +359,18 @@ def _validate_agent_loop_runtime_limits(
     )
     for limit_name, requested in comparable_limits:
         allowed = agent.runtime_limits.get(limit_name)
-        if allowed is None or requested is None:
+        if allowed is None:
             continue
         if isinstance(allowed, bool) or not isinstance(allowed, (int, float)):
             raise ValueError(
                 f"Agent role {agent.role} has an invalid {limit_name} runtime limit."
             )
+        if requested is None:
+            if limit_name == "max_cost_usd":
+                raise ValueError(
+                    f"Execution plan step {step.step_id} requires a max_cost_usd ceiling."
+                )
+            continue
         if requested > allowed:
             raise ValueError(
                 f"Execution plan step {step.step_id} exceeds agent {limit_name} runtime limit."

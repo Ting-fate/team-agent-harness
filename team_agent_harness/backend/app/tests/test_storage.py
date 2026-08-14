@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 
@@ -25,7 +26,7 @@ from app.core.models import (
     TraceEvent,
     TraceEventType,
 )
-from app.core.storage import SQLiteStorage, StorageError
+from app.core.storage import RunRecordIntegrityError, SQLiteStorage, StorageError
 
 
 @pytest.fixture
@@ -67,6 +68,186 @@ def test_run_create_update_get_list(storage: SQLiteStorage) -> None:
 
     assert storage.get_run("run-1") == updated
     assert storage.list_runs() == [updated]
+
+
+def test_storage_injects_legacy_web_snapshot_only_when_both_raw_fields_are_missing(
+    storage: SQLiteStorage,
+) -> None:
+    task = storage.create_task(
+        Task(id="task-legacy-web", title="Task", goal="Goal", workflow_pack="research")
+    )
+    raw_run = {
+        "id": "run-legacy-web",
+        "task_id": task.id,
+        "real_web_access_confirmed": True,
+    }
+    with storage.transaction():
+        storage.conn.execute(
+            "INSERT INTO runs (id, task_id, status, data) VALUES (?, ?, ?, ?)",
+            (raw_run["id"], task.id, "queued", json.dumps(raw_run)),
+        )
+
+    restored = storage.get_run(raw_run["id"])
+
+    assert restored is not None
+    assert restored.confirmed_real_web_tools is None
+    assert restored.confirmed_real_web_tool_routes is None
+    assert storage.list_runs() == [restored]
+
+    updated = storage.update_run(
+        restored.model_copy(update={"status": RunStatus.RUNNING})
+    )
+    raw_updated = json.loads(
+        storage.conn.execute(
+            "SELECT data FROM runs WHERE id = ?",
+            (raw_run["id"],),
+        ).fetchone()["data"]
+    )
+    assert "confirmed_real_web_tools" not in raw_updated
+    assert "confirmed_real_web_tool_routes" not in raw_updated
+
+    reloaded = storage.get_run(raw_run["id"])
+    assert reloaded is not None
+    assert reloaded.status == updated.status
+    assert reloaded.confirmed_real_web_tools is None
+    assert reloaded.confirmed_real_web_tool_routes is None
+
+
+def test_storage_rejects_null_web_snapshots_without_complete_legacy_provenance(
+    storage: SQLiteStorage,
+) -> None:
+    task = storage.create_task(
+        Task(id="task-null-web", title="Task", goal="Goal", workflow_pack="research")
+    )
+    forged_legacy = Run(id="run-forged-legacy", task_id=task.id).model_copy(
+        update={
+            "confirmed_real_web_tools": None,
+            "confirmed_real_web_tool_routes": None,
+        }
+    )
+
+    with pytest.raises(RunRecordIntegrityError):
+        storage.create_run(forged_legacy)
+    assert storage.get_run(forged_legacy.id) is None
+
+    raw_run = {
+        "id": "run-partial-legacy",
+        "task_id": task.id,
+        "real_web_access_confirmed": True,
+    }
+    with storage.transaction():
+        storage.conn.execute(
+            "INSERT INTO runs (id, task_id, status, data) VALUES (?, ?, ?, ?)",
+            (raw_run["id"], task.id, "queued", json.dumps(raw_run)),
+        )
+    restored = storage.get_run(raw_run["id"])
+    assert restored is not None
+    cloned_legacy = restored.model_copy(update={"id": "run-cloned-legacy"})
+    with pytest.raises(RunRecordIntegrityError):
+        storage.create_run(cloned_legacy)
+    assert storage.get_run(cloned_legacy.id) is None
+
+    partial = restored.model_copy(update={"confirmed_real_web_tools": []})
+
+    with pytest.raises(RunRecordIntegrityError):
+        storage.update_run(partial)
+
+    reloaded = storage.get_run(raw_run["id"])
+    assert reloaded is not None
+    assert reloaded.confirmed_real_web_tools is None
+    assert reloaded.confirmed_real_web_tool_routes is None
+
+
+def test_storage_rejects_run_payload_identity_mismatch(storage: SQLiteStorage) -> None:
+    task = storage.create_task(
+        Task(id="task-run-identity", title="Task", goal="Goal", workflow_pack="research")
+    )
+    payload = {
+        "id": "payload-run-id",
+        "task_id": task.id,
+        "confirmed_real_web_tools": [],
+        "confirmed_real_web_tool_routes": [],
+    }
+    with storage.transaction():
+        storage.conn.execute(
+            "INSERT INTO runs (id, task_id, status, data) VALUES (?, ?, ?, ?)",
+            ("row-run-id", task.id, "queued", json.dumps(payload)),
+        )
+
+    with pytest.raises(RunRecordIntegrityError) as get_error:
+        storage.get_run("row-run-id")
+    with pytest.raises(RunRecordIntegrityError) as list_error:
+        storage.list_runs()
+    with pytest.raises(RunRecordIntegrityError) as status_list_error:
+        storage.list_runs_by_statuses({RunStatus.QUEUED})
+
+    assert get_error.value.run_id == "row-run-id"
+    assert list_error.value.run_id == "row-run-id"
+    assert status_list_error.value.run_id == "row-run-id"
+
+
+@pytest.mark.parametrize(
+    "snapshot_fields",
+    [
+        {"confirmed_real_web_tools": ["web_search"]},
+        {
+            "confirmed_real_web_tool_routes": [
+                {"name": "web_search", "provider": "tavily"},
+            ]
+        },
+        {
+            "confirmed_real_web_tools": None,
+            "confirmed_real_web_tool_routes": None,
+        },
+    ],
+)
+def test_storage_rejects_partial_or_explicit_null_persisted_web_snapshots(
+    storage: SQLiteStorage,
+    snapshot_fields: dict[str, object],
+) -> None:
+    task = storage.create_task(
+        Task(id="task-invalid-web", title="Task", goal="Goal", workflow_pack="research")
+    )
+    raw_run = {
+        "id": "run-invalid-web",
+        "task_id": task.id,
+        "real_web_access_confirmed": True,
+        **snapshot_fields,
+    }
+    with storage.transaction():
+        storage.conn.execute(
+            "INSERT INTO runs (id, task_id, status, data) VALUES (?, ?, ?, ?)",
+            (raw_run["id"], task.id, "queued", json.dumps(raw_run)),
+        )
+
+    with pytest.raises(RunRecordIntegrityError):
+        storage.get_run(raw_run["id"])
+
+
+def test_storage_does_not_classify_composite_corruption_as_incomplete_plan(
+    storage: SQLiteStorage,
+) -> None:
+    task = storage.create_task(
+        Task(id="task-composite-run-corruption", title="Task", goal="Goal", workflow_pack="research")
+    )
+    raw_run = {
+        "id": "run-composite-corruption",
+        "task_id": task.id,
+        "execution_plan": {},
+        "execution_plan_hash": None,
+        "confirmed_real_web_tools": None,
+        "confirmed_real_web_tool_routes": None,
+    }
+    with storage.transaction():
+        storage.conn.execute(
+            "INSERT INTO runs (id, task_id, status, data) VALUES (?, ?, ?, ?)",
+            (raw_run["id"], task.id, "queued", json.dumps(raw_run)),
+        )
+
+    with pytest.raises(RunRecordIntegrityError) as error:
+        storage.get_run(raw_run["id"])
+
+    assert error.value.reason == "invalid_payload"
 
 
 def test_outer_transaction_rolls_back_nested_model_writes(storage: SQLiteStorage) -> None:

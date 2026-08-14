@@ -8,11 +8,11 @@
   --surface-tint: #eefbf7;
   --ink: #1f2937;
   --ink-strong: #0f172a;
-  --muted: #7a8494;
+  --muted: #596779;
   --muted-strong: #526071;
   --line: #e3eaf0;
   --line-strong: #cbd6e2;
-  --primary: #0aa39a;
+  --primary: #087c78;
   --primary-strong: #087c78;
   --primary-soft: #e8faf6;
   --blue: #2f6df6;
@@ -25,7 +25,7 @@
   --danger-soft: #fff1f0;
   --warn: #a15c07;
   --warn-soft: #fff7e6;
-  --ok: #0b8f5a;
+  --ok: #087548;
   --ok-soft: #e8f8ef;
   --focus: rgba(10, 163, 154, 0.28);
   --shadow: 0 14px 34px rgba(15, 23, 42, 0.1);
@@ -1038,6 +1038,198 @@ a:focus-visible,
   padding-top: 14px;
 }
 
+.team-configurator {
+  min-width: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 14px;
+  background: var(--surface-soft);
+}
+
+.team-configurator-heading,
+.team-assignment-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.team-configurator-heading h3,
+.team-assignment-heading h4 {
+  margin: 0;
+  color: var(--ink-strong);
+  letter-spacing: 0;
+}
+
+.team-configurator-heading h3 {
+  font-size: 17px;
+}
+
+.team-configurator-actions {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.team-selection-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  color: var(--ink-strong);
+  background: var(--surface);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.team-selection-toggle input {
+  width: auto;
+  min-width: 18px;
+  margin: 0;
+}
+
+.team-config-summary {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  color: var(--muted-strong);
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.team-config-summary.empty {
+  color: var(--muted);
+}
+
+.team-configuration-warnings {
+  margin-top: 10px;
+  border: 1px solid rgba(161, 92, 7, 0.28);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  color: var(--warn);
+  background: var(--warn-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.team-configuration-warnings ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.team-assignment-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.team-assignment-list.empty {
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  padding: 18px 12px;
+  color: var(--muted);
+  background: var(--surface);
+  text-align: center;
+}
+
+.team-assignment-list.inactive {
+  opacity: 0.78;
+}
+
+.team-assignment {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--surface);
+}
+
+.team-assignment-heading {
+  margin-bottom: 10px;
+}
+
+.team-assignment-heading h4 {
+  font-size: 15px;
+  overflow-wrap: anywhere;
+}
+
+.team-assignment-meta {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.team-route-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 10px;
+}
+
+.team-route-grid > label {
+  min-width: 0;
+}
+
+.team-route-grid select,
+.team-route-grid input {
+  min-width: 0;
+}
+
+.team-fallback-section {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.team-fallback-heading,
+.team-fallback-row-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.team-fallback-title,
+.team-fallback-row-heading > span {
+  color: var(--ink-strong);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.team-fallback-list {
+  margin-top: 8px;
+}
+
+.team-fallback-row {
+  border-top: 1px solid var(--line);
+  padding: 10px 0;
+}
+
+.team-fallback-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.team-fallback-row:last-child {
+  padding-bottom: 0;
+}
+
+.team-fallback-grid {
+  margin-top: 8px;
+}
+
+.team-fallback-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .workflow-current {
   grid-column: 1 / -1;
 }
@@ -1813,6 +2005,10 @@ pre {
     align-items: flex-start;
     flex-direction: column;
   }
+
+  .team-route-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 820px) {
@@ -1896,6 +2092,18 @@ pre {
   .button-row {
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .team-configurator-heading,
+  .team-assignment-heading,
+  .team-configurator-actions,
+  .team-route-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .team-configurator-actions {
+    width: 100%;
   }
 
   .detail-tabs {

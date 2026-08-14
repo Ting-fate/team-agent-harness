@@ -75,13 +75,24 @@ def _completed_run(storage, logger, artifact_store, *, run_id: str, model: str =
         filename="final.md",
         content="# Final\n\nVerified delivery.",
     )
-    storage.create_eval_result(
+    eval_result = storage.create_eval_result(
         EvalResult(
             run_id=run.id,
             check_name="acceptance",
             status=EvalStatus.PASS,
             message="passed",
         )
+    )
+    logger.record(
+        run_id=run.id,
+        agent_run_id=agent_run.id,
+        event_type=TraceEventType.EVAL_RESULT,
+        payload={
+            "eval_result_id": eval_result.id,
+            "check_name": eval_result.check_name,
+            "status": eval_result.status.value,
+            "scope": "pack",
+        },
     )
     logger.record(
         run_id=run.id,
@@ -108,8 +119,19 @@ def _completed_run(storage, logger, artifact_store, *, run_id: str, model: str =
 def test_quality_report_uses_latest_completed_attempt_and_latest_eval(quality_env) -> None:
     storage, logger, artifact_store = quality_env
     run = _completed_run(storage, logger, artifact_store, run_id="run-quality")
-    storage.create_eval_result(
+    regressed = storage.create_eval_result(
         EvalResult(run_id=run.id, check_name="acceptance", status=EvalStatus.FAIL, message="regressed")
+    )
+    logger.record(
+        run_id=run.id,
+        agent_run_id="agent-run-quality",
+        event_type=TraceEventType.EVAL_RESULT,
+        payload={
+            "eval_result_id": regressed.id,
+            "check_name": regressed.check_name,
+            "status": regressed.status.value,
+            "scope": "pack",
+        },
     )
 
     report = evaluate_run_quality(
@@ -127,6 +149,375 @@ def test_quality_report_uses_latest_completed_attempt_and_latest_eval(quality_en
     assert {check.name: check.status for check in report.checks}["eval:acceptance"] == "fail"
     assert report.metrics.total_tokens == 120
     assert report.metrics.duration_seconds == 4
+
+
+def test_quality_rejects_old_attempt_pass_when_latest_completed_attempt_has_no_eval(
+    quality_env,
+) -> None:
+    storage, logger, artifact_store = quality_env
+    run = _completed_run(storage, logger, artifact_store, run_id="run-stale-step-eval")
+    agent = storage.get_agent_definition_by_pack_role("code_rd_institutional", "FinalApprover")
+    assert agent is not None
+    latest_attempt = storage.create_agent_run(
+        AgentRun(
+            id="agent-run-stale-step-eval-latest",
+            run_id=run.id,
+            agent_id=agent.id,
+            step_name="final_approval",
+            status=AgentRunStatus.COMPLETED,
+            started_at=utc_now(),
+            finished_at=utc_now(),
+            output_summary="latest",
+        )
+    )
+    latest_artifact = artifact_store.write_text(
+        run_id=run.id,
+        agent_run_id=latest_attempt.id,
+        artifact_type=ArtifactType.FINAL_REPORT,
+        filename="latest-final.md",
+        content="# Latest final\n\nNo acceptance eval was recorded.",
+    )
+    stale_step_eval = storage.create_eval_result(
+        EvalResult(
+            run_id=run.id,
+            check_name="final_approval:acceptance:nonempty-final",
+            status=EvalStatus.PASS,
+            message="old attempt passed",
+        )
+    )
+    logger.record(
+        run_id=run.id,
+        agent_run_id="agent-run-stale-step-eval",
+        event_type=TraceEventType.EVAL_RESULT,
+        payload={
+            "eval_result_id": stale_step_eval.id,
+            "check_name": stale_step_eval.check_name,
+            "status": stale_step_eval.status.value,
+            "scope": "step_acceptance",
+        },
+    )
+    storage.update_run(run.model_copy(update={"final_artifact_id": latest_artifact.id}))
+
+    report = evaluate_run_quality(
+        storage,
+        artifact_store,
+        run.id,
+        RunQualityCriteria(
+            required_artifact_types=[ArtifactType.FINAL_REPORT],
+            required_eval_checks=["final_approval:acceptance:nonempty-final"],
+            final_artifact_type=ArtifactType.FINAL_REPORT,
+        ),
+    )
+
+    assert report.passed is False
+    assert {
+        check.name: check.status for check in report.checks
+    }["eval:final_approval:acceptance:nonempty-final"] == "fail"
+
+
+def test_quality_binds_pack_eval_to_terminal_attempt_not_final_artifact_attempt(
+    quality_env,
+) -> None:
+    storage, logger, artifact_store = quality_env
+    task = storage.create_task(
+        Task(
+            id="task-terminal-pack-eval",
+            title="Research",
+            goal="Write and review a report.",
+            workflow_pack="research",
+        )
+    )
+    run = storage.create_run(
+        Run(
+            id="run-terminal-pack-eval",
+            task_id=task.id,
+            status=RunStatus.RUNNING,
+            started_at=utc_now(),
+        )
+    )
+    writer = storage.create_agent_definition(
+        AgentDefinition(
+            id="quality-writer",
+            pack_name="research",
+            role="Writer",
+            system_prompt="Write.",
+        )
+    )
+    reviewer = storage.create_agent_definition(
+        AgentDefinition(
+            id="quality-reviewer",
+            pack_name="research",
+            role="Reviewer",
+            system_prompt="Review.",
+        )
+    )
+    writer_attempt = storage.create_agent_run(
+        AgentRun(
+            id="quality-writer-attempt",
+            run_id=run.id,
+            agent_id=writer.id,
+            step_name="draft_report",
+            status=AgentRunStatus.COMPLETED,
+            started_at=utc_now(),
+            finished_at=utc_now(),
+        )
+    )
+    reviewer_attempt = storage.create_agent_run(
+        AgentRun(
+            id="quality-reviewer-attempt",
+            run_id=run.id,
+            agent_id=reviewer.id,
+            step_name="review_report",
+            status=AgentRunStatus.COMPLETED,
+            started_at=utc_now(),
+            finished_at=utc_now(),
+        )
+    )
+    final_artifact = artifact_store.write_text(
+        run_id=run.id,
+        agent_run_id=writer_attempt.id,
+        artifact_type=ArtifactType.FINAL_REPORT,
+        filename="research-final.md",
+        content="# Research report\n\nReviewed delivery.",
+    )
+    pack_eval = storage.create_eval_result(
+        EvalResult(
+            run_id=run.id,
+            check_name="final_report_present",
+            status=EvalStatus.PASS,
+            message="passed",
+        )
+    )
+    logger.record(
+        run_id=run.id,
+        agent_run_id=reviewer_attempt.id,
+        event_type=TraceEventType.EVAL_RESULT,
+        payload={
+            "eval_result_id": pack_eval.id,
+            "check_name": pack_eval.check_name,
+            "status": pack_eval.status.value,
+            "scope": "pack",
+        },
+    )
+    storage.update_run(
+        run.model_copy(
+            update={
+                "status": RunStatus.COMPLETED,
+                "finished_at": utc_now(),
+                "final_artifact_id": final_artifact.id,
+            }
+        )
+    )
+
+    report = evaluate_run_quality(
+        storage,
+        artifact_store,
+        run.id,
+        RunQualityCriteria(
+            required_artifact_types=[ArtifactType.FINAL_REPORT],
+            required_eval_checks=["final_report_present"],
+            final_artifact_type=ArtifactType.FINAL_REPORT,
+            pack_eval_step_name="review_report",
+        ),
+    )
+
+    assert report.passed is True
+
+
+def test_quality_rejects_stale_pack_eval_from_old_terminal_attempt(quality_env) -> None:
+    storage, logger, artifact_store = quality_env
+    run = _completed_run(storage, logger, artifact_store, run_id="run-stale-pack-eval")
+    agent = storage.get_agent_definition_by_pack_role("code_rd_institutional", "FinalApprover")
+    assert agent is not None
+    storage.create_agent_run(
+        AgentRun(
+            id="agent-run-stale-pack-eval-latest",
+            run_id=run.id,
+            agent_id=agent.id,
+            step_name="final_approval",
+            status=AgentRunStatus.COMPLETED,
+            started_at=utc_now(),
+            finished_at=utc_now(),
+            output_summary="latest attempt without a pack eval",
+        )
+    )
+
+    report = evaluate_run_quality(
+        storage,
+        artifact_store,
+        run.id,
+        RunQualityCriteria(
+            required_eval_checks=["acceptance"],
+            final_artifact_type=ArtifactType.FINAL_REPORT,
+            pack_eval_step_name="final_approval",
+        ),
+    )
+
+    assert report.passed is False
+    assert {check.name: check.status for check in report.checks}["eval:acceptance"] == "fail"
+
+
+def test_quality_rejects_eval_result_bound_to_multiple_attempts(quality_env) -> None:
+    storage, logger, artifact_store = quality_env
+    run = _completed_run(storage, logger, artifact_store, run_id="run-ambiguous-pack-eval")
+    stale_eval = storage.list_eval_results_for_run(run.id)[0]
+    agent = storage.get_agent_definition_by_pack_role("code_rd_institutional", "FinalApprover")
+    assert agent is not None
+    latest_attempt = storage.create_agent_run(
+        AgentRun(
+            id="agent-run-ambiguous-pack-eval-latest",
+            run_id=run.id,
+            agent_id=agent.id,
+            step_name="final_approval",
+            status=AgentRunStatus.COMPLETED,
+            started_at=utc_now(),
+            finished_at=utc_now(),
+            output_summary="latest",
+        )
+    )
+    latest_artifact = artifact_store.write_text(
+        run_id=run.id,
+        agent_run_id=latest_attempt.id,
+        artifact_type=ArtifactType.FINAL_REPORT,
+        filename="ambiguous-eval-final.md",
+        content="# Latest final\n",
+    )
+    logger.record(
+        run_id=run.id,
+        agent_run_id=latest_attempt.id,
+        event_type=TraceEventType.EVAL_RESULT,
+        payload={
+            "eval_result_id": stale_eval.id,
+            "check_name": stale_eval.check_name,
+            "status": stale_eval.status.value,
+            "scope": "pack",
+        },
+    )
+    storage.update_run(run.model_copy(update={"final_artifact_id": latest_artifact.id}))
+
+    report = evaluate_run_quality(
+        storage,
+        artifact_store,
+        run.id,
+        RunQualityCriteria(
+            required_eval_checks=["acceptance"],
+            final_artifact_type=ArtifactType.FINAL_REPORT,
+            pack_eval_step_name="final_approval",
+        ),
+    )
+
+    assert report.passed is False
+    assert {check.name: check.status for check in report.checks}["eval:acceptance"] == "fail"
+
+
+def test_quality_requires_each_step_to_own_its_expected_artifact(quality_env) -> None:
+    storage, logger, artifact_store = quality_env
+    run = _completed_run(storage, logger, artifact_store, run_id="run-step-artifact-owner")
+    agent = storage.get_agent_definition_by_pack_role("code_rd_institutional", "FinalApprover")
+    assert agent is not None
+    review_attempt = storage.create_agent_run(
+        AgentRun(
+            id="agent-run-step-artifact-owner-review",
+            run_id=run.id,
+            agent_id=agent.id,
+            step_name="review",
+            status=AgentRunStatus.COMPLETED,
+            started_at=utc_now(),
+            finished_at=utc_now(),
+            output_summary="reviewed",
+        )
+    )
+    deleted_artifact = artifact_store.write_text(
+        run_id=run.id,
+        agent_run_id=review_attempt.id,
+        artifact_type=ArtifactType.FINAL_REPORT,
+        filename="deleted-review-artifact.md",
+        content="# Review\n",
+    )
+    review_eval = storage.create_eval_result(
+        EvalResult(
+            run_id=run.id,
+            check_name="review:acceptance:executor-pass",
+            status=EvalStatus.PASS,
+            message="executor passed before artifact metadata was lost",
+        )
+    )
+    logger.record(
+        run_id=run.id,
+        agent_run_id=review_attempt.id,
+        event_type=TraceEventType.EVAL_RESULT,
+        payload={
+            "eval_result_id": review_eval.id,
+            "check_name": review_eval.check_name,
+            "status": review_eval.status.value,
+            "scope": "step_acceptance",
+        },
+    )
+    storage.delete_artifact(deleted_artifact.id)
+
+    report = evaluate_run_quality(
+        storage,
+        artifact_store,
+        run.id,
+        RunQualityCriteria(
+            required_artifact_types=[ArtifactType.FINAL_REPORT],
+            required_step_artifacts={
+                "review": ArtifactType.FINAL_REPORT,
+                "final_approval": ArtifactType.FINAL_REPORT,
+            },
+            required_eval_checks=["review:acceptance:executor-pass"],
+            final_artifact_type=ArtifactType.FINAL_REPORT,
+        ),
+    )
+
+    checks = {check.name: check.status for check in report.checks}
+    assert report.passed is False
+    assert checks["artifact:final_report"] == "pass"
+    assert checks["artifact:review:final_report"] == "fail"
+    assert checks["artifact:final_approval:final_report"] == "pass"
+
+
+@pytest.mark.parametrize("case", ["missing_trace", "duplicate_results"])
+def test_quality_requires_exactly_one_trace_bound_eval(quality_env, case: str) -> None:
+    storage, logger, artifact_store = quality_env
+    run = _completed_run(storage, logger, artifact_store, run_id=f"run-eval-{case}")
+    check_name = f"gate-{case}"
+    result_count = 1 if case == "missing_trace" else 2
+    for index in range(result_count):
+        result = storage.create_eval_result(
+            EvalResult(
+                run_id=run.id,
+                check_name=check_name,
+                status=EvalStatus.PASS,
+                message="passed",
+            )
+        )
+        if case == "duplicate_results":
+            logger.record(
+                run_id=run.id,
+                agent_run_id=f"agent-{run.id}",
+                event_type=TraceEventType.EVAL_RESULT,
+                payload={
+                    "eval_result_id": result.id,
+                    "check_name": result.check_name,
+                    "status": result.status.value,
+                    "scope": "pack",
+                    "index": index,
+                },
+            )
+
+    report = evaluate_run_quality(
+        storage,
+        artifact_store,
+        run.id,
+        RunQualityCriteria(
+            required_eval_checks=[check_name],
+            final_artifact_type=ArtifactType.FINAL_REPORT,
+        ),
+    )
+
+    assert report.passed is False
+    assert {check.name: check.status for check in report.checks}[f"eval:{check_name}"] == "fail"
 
 
 def test_quality_metrics_count_sidecar_calls_and_expose_incomplete_usage(quality_env) -> None:
@@ -1054,4 +1445,6 @@ def test_execution_plan_quality_criteria_require_real_step_and_pack_gates() -> N
     criteria = quality_criteria_from_execution_plan(plan)
 
     assert criteria.required_artifact_types == [ArtifactType.FINAL_REPORT]
+    assert criteria.required_step_artifacts == {"solve": ArtifactType.FINAL_REPORT}
     assert criteria.required_eval_checks == ["solve:acceptance:nonempty-final", "blocking"]
+    assert criteria.pack_eval_step_name == "solve"
