@@ -250,15 +250,15 @@ const teamModelProviders = new Set(["openai", "deepseek", "litellm_proxy"]);
 const routingPresets = {
   gptMainThread: {
     provider: "litellm_proxy",
-    model: "gpt5.5",
+    model: "gpt5.6-sol",
     reasoning_effort: "xhigh",
     temperature: 0.2,
     max_tokens: "",
     allow_real_calls: true,
   },
   deepSeekLongContext: {
-    provider: "litellm_proxy",
-    model: "deepseek-v4-pro",
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
     reasoning_effort: "xhigh",
     temperature: 0.2,
     max_tokens: 4096,
@@ -270,7 +270,6 @@ const institutionalDeepSeekRoles = new Set([
   "ContextReader",
   "ReviewGate",
   "ContextReviewer",
-  "FinalReviewer",
 ]);
 
 const api = window.HarnessRuntime.createApi();
@@ -934,12 +933,12 @@ function teamFamilyLabel(family) {
 
 function defaultTeamModel(family, provider) {
   if (provider === "openai") {
-    return "gpt-5.5";
+    return "gpt5.6-sol";
   }
   if (provider === "deepseek") {
-    return "deepseek-v4-pro";
+    return "deepseek-v4-flash";
   }
-  return family === "deepseek" ? "deepseek-v4-pro" : "gpt5.5";
+  return family === "deepseek" ? "deepseek-v4-flash" : "gpt5.6-sol";
 }
 
 function teamRouteHasValidContract(route, options = {}) {
@@ -1562,9 +1561,9 @@ function bindingForAgent(agentId) {
 function defaultModelForProvider(provider) {
   const defaults = {
     mock: "mock-model",
-    litellm_proxy: "gpt5.5",
-    openai: "gpt-5.5",
-    deepseek: "deepseek-v4-pro",
+    litellm_proxy: "gpt5.6-sol",
+    openai: "gpt5.6-sol",
+    deepseek: "deepseek-v4-flash",
   };
   return defaults[provider] || "";
 }
@@ -1583,10 +1582,10 @@ function preferredRouteForAgent(agent) {
   if (agent.pack_name === "code_rd_institutional" && institutionalDeepSeekRoles.has(agent.role)) {
     return routingPresets.deepSeekLongContext;
   }
-  if (agent.pack_name === "research" && ["Reader", "Verifier", "Reviewer"].includes(agent.role)) {
+  if (agent.pack_name === "research" && ["Searcher", "Reader", "Verifier"].includes(agent.role)) {
     return routingPresets.deepSeekLongContext;
   }
-  if (agent.role === "Reviewer" || agent.role === "ContextReviewer" || agent.role === "FinalReviewer") {
+  if (agent.role === "ContextReviewer") {
     return routingPresets.deepSeekLongContext;
   }
   return routingPresets.gptMainThread;

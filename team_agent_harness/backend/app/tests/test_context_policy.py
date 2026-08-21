@@ -83,9 +83,9 @@ def test_active_routes_use_bounded_output_budgets() -> None:
     local_config = json.loads(local_routing_path.read_text(encoding="utf-8"))
     local_expected = {
         "research-planner": 1000,
-        "research-searcher": 256,
+        "research-searcher": 4096,
         "research-reader": 4096,
-        "research-verifier": 256,
+        "research-verifier": 4096,
         "research-writer": 700,
         "research-reviewer": 400,
     }

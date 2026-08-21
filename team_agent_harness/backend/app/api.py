@@ -122,6 +122,7 @@ from app.core.storage import RunRecordIntegrityError, SQLiteStorage, StorageErro
 from app.core.task_intake import TaskIntakeRequest, analyze_task_intake
 from app.core.team_selection import (
     ResolvedTeamSelection,
+    TeamFallbackRoute,
     TeamModelRoute,
     TeamSelection,
     TeamSelectionError,
@@ -181,10 +182,9 @@ _TEAM_DEEPSEEK_DEFAULT_ROLES = {
     "ContextReader",
     "ReviewGate",
     "ContextReviewer",
-    "FinalReviewer",
+    "Searcher",
     "Reader",
     "Verifier",
-    "Reviewer",
 }
 
 
@@ -2562,7 +2562,7 @@ def _team_route_template(
             "the template uses the reviewed default instead."
         )
 
-    preferred_family = "deepseek" if agent.role in _TEAM_DEEPSEEK_DEFAULT_ROLES else "gpt"
+    preferred_family = _preferred_team_family(agent)
     route = _exact_team_route_from_registry(capability_registry, preferred_family)
     if route.family != preferred_family:
         family_warning = (
@@ -2572,6 +2572,14 @@ def _team_route_template(
         )
         warning = f"{warning} {family_warning}" if warning is not None else family_warning
     return route, warning
+
+
+def _preferred_team_family(agent: AgentDefinition) -> str:
+    if agent.pack_name == "research":
+        return "deepseek" if agent.role in {"Searcher", "Reader", "Verifier"} else "gpt"
+    if agent.pack_name == "code_rd" and agent.role == "Reviewer":
+        return "deepseek"
+    return "deepseek" if agent.role in _TEAM_DEEPSEEK_DEFAULT_ROLES else "gpt"
 
 
 def _team_model_family(provider: str, declared_family: object) -> str | None:
@@ -2606,9 +2614,13 @@ def _team_route_is_registered(
 def _exact_team_route_from_registry(
     capability_registry: CapabilityRegistry,
     preferred_family: str,
+    *,
+    include_default_fallback: bool = True,
+    allow_family_fallback: bool = True,
 ) -> TeamModelRoute:
     fallback_family = "gpt" if preferred_family == "deepseek" else "deepseek"
-    for family in (preferred_family, fallback_family):
+    families = (preferred_family, fallback_family) if allow_family_fallback else (preferred_family,)
+    for family in families:
         for capability in capability_registry.capabilities:
             if (
                 capability.provider not in {"openai", "deepseek", "litellm_proxy"}
@@ -2625,6 +2637,29 @@ def _exact_team_route_from_registry(
                 )
             except ValueError:
                 continue
+            if include_default_fallback and family == "gpt":
+                try:
+                    deepseek_route = _exact_team_route_from_registry(
+                        capability_registry,
+                        "deepseek",
+                        include_default_fallback=False,
+                        allow_family_fallback=False,
+                    )
+                    route = route.model_copy(
+                        update={
+                            "fallbacks": (
+                                TeamFallbackRoute(
+                                    family="deepseek",
+                                    provider=deepseek_route.provider,
+                                    model=deepseek_route.model,
+                                ),
+                            )
+                        }
+                    )
+                except TeamSelectionError:
+                    # A reviewed external registry may intentionally omit the
+                    # fallback provider; the exact primary route remains usable.
+                    pass
             if _team_route_is_registered(route, capability_registry):
                 return route
     raise TeamSelectionError(
@@ -3168,7 +3203,7 @@ def _default_smoke_model(provider: str) -> str:
         "mock": "mock-model",
         "openai": "gpt-4o-mini",
         "deepseek": "deepseek-chat",
-        "litellm_proxy": "gpt5.5",
+        "litellm_proxy": "gpt5.6-sol",
     }
     return defaults.get(provider, "health-check")
 

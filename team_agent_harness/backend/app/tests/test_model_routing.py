@@ -98,14 +98,15 @@ def test_model_routing_defaults_real_provider_reasoning_effort_to_xhigh(
     assert routed_agent.model_settings["reasoning_effort"] == "xhigh"
 
 
-def test_checked_in_litellm_routes_use_gpt55_except_long_context_review_roles() -> None:
+def test_checked_in_routes_use_current_defaults_and_xhigh_reasoning() -> None:
     expected_deepseek_agents = {
         "code_rd-architect",
         "code_rd_institutional-context_reader",
         "code_rd_institutional-context_reviewer",
-        "code_rd_institutional-final_reviewer",
         "code_rd_institutional-review_gate",
+        "research-searcher",
         "research-reader",
+        "research-verifier",
     }
     routing_paths = [PROJECT_ROOT / "config/model-routing.litellm.example.json"]
     local_routing_path = PROJECT_ROOT / "config/model-routing.local.json"
@@ -118,13 +119,16 @@ def test_checked_in_litellm_routes_use_gpt55_except_long_context_review_roles() 
         deepseek_agents = {
             agent_id
             for agent_id, route in agents.items()
-            if route["provider"] == "litellm_proxy" and route["model"] == "deepseek-v4-pro"
+            if route["provider"] == "deepseek" and route["model"] == "deepseek-v4-flash"
         }
         assert deepseek_agents <= expected_deepseek_agents
         for route in agents.values():
             if route["provider"] == "litellm_proxy":
                 assert route["reasoning_effort"] == "xhigh"
-                assert route["model"] in {"gpt5.5", "deepseek-v4-pro"}
+                assert route["model"] in {"gpt5.5", "gpt5.6-sol", "deepseek-v4-pro", "deepseek-v4-flash"}
+            elif route["provider"] == "deepseek":
+                assert route["model"] == "deepseek-v4-flash"
+                assert route["reasoning_effort"] == "xhigh"
 
 
 def test_model_routing_can_apply_role_file_without_leaking_it_to_model_config(tmp_path) -> None:

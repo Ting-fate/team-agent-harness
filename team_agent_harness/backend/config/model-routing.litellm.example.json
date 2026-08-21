@@ -1,50 +1,82 @@
 {
   "agents": {
     "code_rd_institutional-context_reader": {
-      "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
       "max_tokens": 4096,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
     "code_rd_institutional-planner": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
       "max_tokens": 700,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
     "code_rd_institutional-review_gate": {
-      "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
       "max_tokens": 4096,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
     "code_rd_institutional-dispatcher": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
       "max_tokens": 500,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
     "code_rd_institutional-implementation_executor": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
       "max_tokens": 1000,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
     "code_rd_institutional-test_executor": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
       "max_tokens": 800,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
     "code_rd_institutional-context_reviewer": {
-      "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
       "max_tokens": 4096,
       "role_file": "roles/code-reviewer.md",
       "allow_real_calls": true,
@@ -52,14 +84,30 @@
     },
     "code_rd_institutional-synthesizer": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
       "max_tokens": 700,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
     "code_rd_institutional-final_reviewer": {
       "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "model": "gpt5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
       "max_tokens": 4096,
       "role_file": "roles/code-reviewer.md",
       "allow_real_calls": true,
@@ -67,7 +115,15 @@
     },
     "code_rd_institutional-final_approver": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
       "max_tokens": 500,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"

@@ -6,7 +6,7 @@ operator-selected GPT plus DeepSeek teams through direct providers or an
 explicitly configured LiteLLM proxy.
 
 The runnable project lives in [`team_agent_harness/backend`](team_agent_harness/backend/README.md).
-Shared design records live in [`docs/superpowers/specs`](docs/superpowers/specs/).
+Shared design records live in [`docs/superpowers/specs`](docs/superpowers/specs/). The current model routing contract is documented in [`docs/model-routing.md`](docs/model-routing.md).
 
 ## Current Capabilities
 
@@ -96,6 +96,23 @@ unless the MCP process is separately granted
 command and tool boundary.
 
 ## Verification
+
+Latest local verification on 2026-08-21:
+
+- Default run-scoped routing is `gpt5.6-sol` through LiteLLM for Planner, Writer,
+  and Final Reviewer, with official `deepseek-v4-flash` for Searcher, Reader,
+  and Verifier.
+- GPT routes include official DeepSeek as an ordered fallback. All real routes
+  default to `reasoning_effort="xhigh"`; users can override model and reasoning
+  level after capability validation.
+- The live Harness and LiteLLM services passed `/health`, capability, provider
+  doctor, and route explanation checks without making a paid model call.
+- The full local backend suite passed `1321 passed, 5 skipped, 1 warning` after
+  the routing and context-budget updates. The warning is the existing Starlette
+  `TestClient` deprecation notice; no test or runtime failure remains.
+
+The older dated verification records below remain historical evidence and are
+not a claim about the current checkout or remote CI state.
 
 The 2026-08-14 release candidate passed the full local backend suite with
 `1321 passed, 5 skipped, 1 warning`, plus compile, dependency, JavaScript,

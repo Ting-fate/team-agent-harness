@@ -400,11 +400,11 @@
                 <label>
                   <span>模型渠道</span>
                   <select id="bindingProvider" required></select>
-                  <small class="field-help">推荐 GPT 与 DeepSeek 均经 LiteLLM，分别使用 gpt5.5 与 deepseek-v4-pro。</small>
+                  <small class="field-help">默认 GPT 使用 gpt5.6-sol 中转，DeepSeek 使用官方 deepseek-v4-flash；模型名必须与所选渠道配置一致。</small>
                 </label>
                 <label>
                   <span>模型</span>
-                  <input id="bindingModel" type="text" placeholder="gpt5.5 / deepseek-v4-pro" required />
+                  <input id="bindingModel" type="text" placeholder="gpt5.6-sol / deepseek-v4-flash" required />
                   <small class="field-help">填写对应模型渠道里可用的模型名。</small>
                 </label>
                 <label>

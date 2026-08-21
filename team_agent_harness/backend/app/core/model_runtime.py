@@ -1839,7 +1839,7 @@ def reasoning_effort_transport(request: ModelRequest) -> ReasoningEffortTranspor
 
 
 def _supports_temperature(request: ModelRequest) -> bool:
-    if request.provider == "litellm_proxy" and request.model.lower() == "gpt5.5":
+    if request.provider == "litellm_proxy" and _is_litellm_gpt_reasoning_model(request.model):
         return False
     return True
 
@@ -1863,7 +1863,7 @@ def reasoning_effort_trace_payload(request: ModelRequest) -> dict[str, Any]:
 def _supports_xhigh_reasoning_effort(request: ModelRequest) -> bool:
     if request.provider != "litellm_proxy":
         return False
-    if request.model.lower() != "gpt5.5":
+    if not _is_litellm_gpt_reasoning_model(request.model):
         return False
     return os.environ.get("TEAM_AGENT_LITELLM_XHIGH_REASONING_PASSTHROUGH") == "1"
 
@@ -1872,15 +1872,21 @@ def _supports_openai_reasoning_effort(request: ModelRequest) -> bool:
     if request.provider == "openai":
         return _is_known_openai_reasoning_model(request.model)
     if request.provider == "litellm_proxy":
-        return request.model.lower() == "gpt5.5"
+        return _is_litellm_gpt_reasoning_model(request.model)
     return False
+
+
+def _is_litellm_gpt_reasoning_model(model: str) -> bool:
+    return model.lower().strip() in {"gpt5.5", "gpt5.6-sol"}
 
 
 def _is_known_openai_reasoning_model(model: str) -> bool:
     normalized = model.lower().strip()
     return (
         normalized == "gpt5.5"
+        or normalized == "gpt5.6-sol"
         or normalized.startswith("gpt-5")
+        or normalized.startswith("gpt5")
         or normalized.startswith("o1")
         or normalized.startswith("o3")
         or normalized.startswith("o4")

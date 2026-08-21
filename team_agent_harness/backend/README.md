@@ -25,7 +25,7 @@ This directory includes the original MVP phases, the durable local worker and bo
 - Opt-in bounded Agent Loops with model/tool iteration, step/tool/token/time/conservative-estimated-cost/repetition budgets, untrusted-observation labeling, side-effect approval, and action/observation trace. Existing Pack steps retain one-call behavior unless `agent_loop.enabled=true`.
 - Durable local `RunWorker` plus run coordinator. UI and operator CLI submissions return after persistence, execute outside the initiating HTTP request, maintain a per-run lock heartbeat, and recover interrupted runs from completed step checkpoints on service restart.
 - Mocked Code R&D workflow pack with Clarifier, Architect, Coder, Tester, Reviewer, and Finalizer steps.
-- Mocked Institutional Code R&D workflow pack with GPT as the trusted main thread, DeepSeek V4 Pro long-context reading/review roles, GPT implementation/test executor branches that require local approval before their mocked/model step execution proceeds, DeepSeek final risk review, and GPT final approval.
+- Mocked Institutional Code R&D workflow pack with GPT as the trusted main thread, DeepSeek V4 Flash long-context reading/review roles, GPT implementation/test executor branches that require local approval before their mocked/model step execution proceeds, GPT final risk review, and GPT final approval.
 - Research workflow pack with Planner, Searcher, Reader, Verifier, Writer, and Reviewer steps. It defaults to mock web search/fetch and can use Tavily or local browser bridge search/fetch only after explicit server-side opt-in.
 - FastAPI endpoints for creating/listing tasks, validating run-scoped teams, reading a Pack team template, starting workflows synchronously or in the local background worker, reading the immutable selected-team receipt, run metadata, trace events, artifacts, workflow pack catalogs, single workflow pack details, model provider skeletons, tool provider status, local Skill Library metadata, skill bindings, and pack agent catalogs; default routes remain mock unless server-side routing or an explicitly confirmed run-scoped team enables real providers. `GET /tasks` and `GET /runs` are bounded to 500 newest records by default and accept validated `limit`/`offset` query parameters up to 1000 records.
 - Conservative Skill Auto-Router that can automatically select relevant read-only local skills for agents from explicit workflow, role, tool-permission, document-file task signals, and high-confidence domain task signals such as security, performance, database, testing, architecture, UI/web, and AI/model work while preserving manual bindings as an override/extension path.
@@ -72,7 +72,7 @@ Each `WorkflowStep` has a typed `context_policy`:
 - `max_artifacts`: maximum completed-attempt artifact refs/texts retained.
 - `max_upstream_handoffs`: maximum structured upstream handoffs retained; schema validation requires it to be at least the number of declared dependencies.
 
-Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step at 100K excerpt characters, 300K encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are streamed through a full hash verification while retaining only the bounded excerpt; tampered artifacts and artifacts or handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. The active local `research-planner` route uses `max_tokens=1000`; every `deepseek-v4-pro` route uses at least `max_tokens=4096` because a real Research reader still reached `finish_reason=length` at 2048 tokens. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
+Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step at 100K excerpt characters, 300K encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are streamed through a full hash verification while retaining only the bounded excerpt; tampered artifacts and artifacts or handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. The active local `research-planner` route uses `max_tokens=1000`; every `deepseek-v4-flash` route uses at least `max_tokens=4096` to avoid truncation in long-context search, reading, and verification. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
 
 ## Multimodal Input Contract
 
@@ -112,8 +112,10 @@ The benchmark does not claim Multi-Agent value by construction. Every case must 
 - Main/controller steps plan, dispatch, synthesize, or approve work.
 - Subagent steps execute bounded work packages and return a structured result: summary, artifacts, open questions, risks, and evals.
 - Handoffs connect controller steps to subagent steps and then back into synthesizer/review steps.
-- Each agent has an independent `model_config`. In the recommended GPT + DeepSeek setup, GPT is the trusted main thread for planning, code work, testing, synthesis, and final approval; DeepSeek V4 Pro is used for long-context reading, plan challenge, alignment review, and final risk review.
+- Each agent has an independent `model_config`. In the recommended GPT + DeepSeek setup, GPT (`gpt5.6-sol` through the relay) is the trusted main thread for planning, code work, testing, synthesis, and final review/approval; official DeepSeek (`deepseek-v4-flash`) is used for search, long-context reading, verification, and plan/alignment challenge. GPT routes include official DeepSeek fallback by default in generated run-scoped team templates.
 - Each step also declares a `runtime`: `model` for ordinary model calls, `session` for long-running resumable agent sessions, and `acp` for future external engineering executors. `session_policy` records whether the step is persistent, how it should resume, and whether approval is required.
+
+Default run-scoped team routing is `Planner/Writer/Final Reviewer -> litellm_proxy/gpt5.6-sol` and `Searcher/Reader/Verifier -> deepseek/deepseek-v4-flash`. GPT routes include `deepseek/deepseek-v4-flash` as the ordered failure fallback. Every real route defaults to `reasoning_effort="xhigh"`, while the UI and API allow a user-configured model and any supported reasoning level to override the defaults after capability validation.
 
 Direct Anthropic/Claude calls are still not implemented. To use Claude roles now, configure a LiteLLM Proxy route such as `provider="litellm_proxy"` with a Claude model name. Direct OpenAI and DeepSeek routes are available through their OpenAI-compatible adapters.
 
@@ -134,13 +136,13 @@ Provider route example:
   "agents": {
     "code_rd-coder": {
       "provider": "deepseek",
-      "model": "deepseek-v4-pro",
+      "model": "deepseek-v4-flash",
       "reasoning_effort": "xhigh",
       "allow_real_calls": true
     },
     "code_rd-reviewer": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
       "reasoning_effort": "xhigh",
       "allow_real_calls": true
     }
@@ -208,45 +210,45 @@ $env:TEAM_AGENT_ALLOW_REMOTE_LITELLM_PROXY="1"
   "agents": {
     "code_rd_institutional-planner": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
       "reasoning_effort": "xhigh",
       "allow_real_calls": true
     },
     "code_rd_institutional-context_reader": {
-      "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
       "reasoning_effort": "xhigh",
       "allow_real_calls": true
     },
     "code_rd_institutional-implementation_executor": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
       "reasoning_effort": "xhigh",
       "allow_real_calls": true
     },
     "code_rd_institutional-context_reviewer": {
-      "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
       "reasoning_effort": "xhigh",
       "role_file": "roles/code-reviewer.md",
       "allow_real_calls": true
     },
     "code_rd_institutional-synthesizer": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
       "reasoning_effort": "xhigh",
       "allow_real_calls": true
     },
     "code_rd_institutional-final_reviewer": {
       "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "model": "gpt5.6-sol",
       "reasoning_effort": "xhigh",
       "role_file": "roles/code-reviewer.md",
       "allow_real_calls": true
     },
     "code_rd_institutional-final_approver": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
       "reasoning_effort": "xhigh",
       "allow_real_calls": true
     }
@@ -348,8 +350,8 @@ Example:
 {
   "agents": {
     "code_rd_institutional-context_reviewer": {
-      "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
       "role_file": "roles/code-reviewer.md",
       "allow_real_calls": true
     }
@@ -452,7 +454,7 @@ actions revalidate the project venv command line, base Python executable,
 service entry point, and port before terminating a process; unrelated port
 owners are displayed but never stopped.
 
-The script starts LiteLLM on `http://127.0.0.1:4000` and the harness UI on `http://127.0.0.1:8014/`. The harness routes GPT-family agents through the single LiteLLM alias `gpt5.5`; do not use role-specific GPT aliases such as `gpt-planner`, `gpt-coder`, or `gpt-reviewer` in project routing unless you intentionally reintroduce them. GPT routes use `OPENAI_API_BASE`, so they can point at an OpenAI-compatible relay instead of the official OpenAI endpoint. DeepSeek routes stay on `deepseek-v4-pro` and are used for long-context reading and review, not code writing or final approval.
+The script starts LiteLLM on `http://127.0.0.1:4000` and the harness UI on `http://127.0.0.1:8014/`. The harness routes GPT-family agents through the single LiteLLM alias `gpt5.6-sol`; do not use role-specific GPT aliases such as `gpt-planner`, `gpt-coder`, or `gpt-reviewer` in project routing unless you intentionally reintroduce them. GPT routes use `OPENAI_API_BASE`, so they can point at an OpenAI-compatible relay. Official DeepSeek routes use provider `deepseek` and model `deepseek-v4-flash` for search, reading, and verification. GPT routes generated by the team template carry DeepSeek as an ordered fallback.
 
 The launcher also sets a bounded real-model failure budget unless you already provided one in the environment: `TEAM_AGENT_MODEL_TIMEOUT_SECONDS=180`, `REQUEST_TIMEOUT=180`, `TEAM_AGENT_LITELLM_PROXY_MAX_ATTEMPTS=1`, and `DEFAULT_MAX_RETRIES=0`. The previous 75-second boundary cut off a healthy GPT step; 180 seconds accommodates observed long responses while still preventing nested retries or an upstream outage from leaving a run indefinitely active. Each LiteLLM request also carries `x-litellm-timeout` so the proxy applies the same timeout per call. Override these values only when you intentionally want a different upstream wait.
 
@@ -460,19 +462,19 @@ The YAML/JSON files intentionally do not contain real keys. Edit model names in 
 
 ### LiteLLM Alias Rules
 
-When `provider` is `litellm_proxy`, each harness agent should use the LiteLLM model alias, not the upstream model id. This project standardizes GPT-family routing on `gpt5.5`. For example, `config/model-routing.local.json` should contain:
+When `provider` is `litellm_proxy`, each harness agent should use the LiteLLM model alias, not the upstream model id. This project standardizes GPT-family routing on `gpt5.6-sol`. For example, `config/model-routing.local.json` should contain:
 
 ```json
 {
   "agents": {
     "code_rd_institutional-planner": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
       "reasoning_effort": "xhigh"
     },
     "code_rd_institutional-context_reader": {
-      "provider": "litellm_proxy",
-      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
       "reasoning_effort": "xhigh"
     }
   }
@@ -483,21 +485,21 @@ The alias is resolved by LiteLLM in `config/litellm.config.example.yaml`:
 
 ```yaml
 model_list:
-  - model_name: gpt5.5
+  - model_name: gpt5.6-sol
     litellm_params:
-      model: openai/gpt-5.5
+      model: openai/gpt5.6-sol
       api_key: os.environ/OPENAI_API_KEY
       api_base: os.environ/OPENAI_API_BASE
 
-  - model_name: deepseek-v4-pro
+  - model_name: deepseek-v4-flash
     litellm_params:
-      model: deepseek/deepseek-v4-pro
+      model: deepseek/deepseek-v4-flash
       api_key: os.environ/DEEPSEEK_API_KEY
 ```
 
-So the harness asks LiteLLM for `gpt5.5`, and LiteLLM calls the real upstream `openai/gpt-5.5`. If your OpenAI key is from a relay, keep `OPENAI_API_BASE` in `.env.local`; LiteLLM sends GPT alias traffic to that OpenAI-compatible relay instead of the official OpenAI endpoint. Do not put the relay key or any provider key in routing JSON or the browser UI.
+So the harness asks LiteLLM for `gpt5.6-sol`, and LiteLLM calls the configured upstream `openai/gpt5.6-sol`. If your OpenAI key is from a relay, keep `OPENAI_API_BASE` in `.env.local`; LiteLLM sends GPT alias traffic to that OpenAI-compatible relay. Do not put the relay key or any provider key in routing JSON or the browser UI.
 
-Direct OpenAI-compatible provider routes are still supported for simple setups, but this project standardizes GPT-family routing on the LiteLLM alias `gpt5.5`. The recommended GPT + DeepSeek setup uses `litellm_proxy` with `model="gpt5.5"` so one harness config can switch or rename upstream providers centrally.
+Direct OpenAI-compatible provider routes are still supported for simple setups, but this project standardizes GPT-family routing on the LiteLLM alias `gpt5.6-sol`. The recommended GPT + DeepSeek setup uses `litellm_proxy` with `model="gpt5.6-sol"` for GPT and the official `deepseek/deepseek-v4-flash` route for DeepSeek.
 
 ### Reasoning / Thinking Level
 
@@ -505,7 +507,7 @@ Codex's own thinking level is separate from model calls made by `team_agent_harn
 
 - Codex thread reasoning, such as `reasoning_effort` or `thinking`, controls this Codex session while it edits and debugs the project.
 - Harness model calls are external API calls made by the backend. Their `model_config` supports `provider`, `model`, `temperature`, `max_tokens`, and `reasoning_effort`.
-- Project default: all real model routes store `reasoning_effort="xhigh"`. GPT-family routes use the `gpt5.5` LiteLLM alias; DeepSeek routes also keep `xhigh` as the configuration intent.
+- Project default: all real model routes store `reasoning_effort="xhigh"`. GPT-family routes use the `gpt5.6-sol` LiteLLM alias; official DeepSeek routes use `deepseek-v4-flash` and also keep `xhigh` as the configuration intent.
 - The backend sends or maps this option per provider capability. OpenAI-compatible standard routes map configured `xhigh` to the highest standard sent value (`high`) unless a provider-specific passthrough is enabled; providers or aliases not known to support the option are not sent the parameter.
 - Model trace events record `configured_reasoning_effort`, `sent_reasoning_effort`, `reasoning_effort_sent`, and, when applicable, `reasoning_effort_mapping` or `reasoning_effort_ignore_reason`.
 
@@ -516,14 +518,14 @@ Recommended implementation shape:
   "agents": {
     "code_rd_institutional-planner": {
       "provider": "litellm_proxy",
-      "model": "gpt5.5",
+      "model": "gpt5.6-sol",
       "reasoning_effort": "xhigh"
     }
   }
 }
 ```
 
-The backend validates accepted values (`minimal`, `low`, `medium`, `high`, and `xhigh`), passes them only to providers or aliases known to support them, and records configured versus sent or ignored values in model trace events. Choose `gpt5.5` for GPT planner/coder/approver roles, and use DeepSeek aliases for long-context reading, review, and research control.
+The backend validates accepted values (`minimal`, `low`, `medium`, `high`, and `xhigh`), passes them only to providers or aliases known to support them, and records configured versus sent or ignored values in model trace events. Choose `gpt5.6-sol` for GPT planner/coder/writer/final-review roles, and use official `deepseek-v4-flash` for search, reading, and verification.
 
 ### Real-Model Timeout Handling
 
@@ -640,6 +642,16 @@ python -m venv .venv
 
 ### Current Verification Record
 
+- On 2026-08-21 the current model-routing checkout passed the full local backend
+  suite with `1321 passed, 5 skipped, 1 warning` in 398.95 seconds when run
+  without a pseudo-terminal. `python -m compileall -q app scripts`, `pip check`,
+  `git diff --check`, and the high-confidence credential-value scan passed. The
+  warning remains the existing Starlette `TestClient` deprecation. The current
+  defaults are `gpt5.6-sol` through LiteLLM for Planner/Writer/Final Reviewer,
+  official `deepseek-v4-flash` for Searcher/Reader/Verifier, ordered DeepSeek
+  fallback for GPT routes, and `reasoning_effort="xhigh"`; users can override
+  configured routes after capability validation. No paid model call was made in
+  this verification.
 - On 2026-08-14 the CI-stabilized code snapshot at commit `5643b69` passed the full local backend suite with `1321 passed, 5 skipped, 1 warning` in 443.24 seconds. The runtime body-read abort target passed 100/100 repetitions, the worker shutdown/backlog target passed 20/20 repetitions, the strict setup ready-state target passed 100/100 repetitions, and the complete startup-script file passed 59 tests. GitHub Actions run `31795016194` then passed Windows Python 3.12, 3.13, and 3.14 with `1325 passed, 1 skipped, 1 warning` per job. These fixes change tests only: they use explicit body-read and worker-completion barriers, retain independent real hang watchdogs, and replace repeated environment-wide `pip check` calls in the setup state-machine test with a fail-closed exact-argv shim. Production worker shutdown, launcher readiness, model routing, and request timeout behavior are unchanged. Compile, both dependency environments, both JavaScript files, all four PowerShell scripts, YAML/JSON, whitespace, and intended-diff credential checks passed. Harness health and UI returned HTTP 200 with the worker running, and LiteLLM liveliness returned HTTP 200. GitHub's Node.js 20 action deprecation annotation remains a separate CI-maintenance item. No real or paid model call was made.
 - On 2026-08-14 the configurable-team, launcher, quality-lineage, and restricted Codex MCP release candidate passed the full local backend suite with `1321 passed, 5 skipped, 1 warning` in 445.21 seconds. The warning remains the existing Starlette `TestClient` deprecation. `python -m compileall -q app scripts`, `pip check` in both project environments, JavaScript syntax for both static scripts, all four tracked PowerShell AST parses, YAML/JSON parsing, `git diff --check`, and high-confidence credential and private-path scans passed. Quality evaluation binds each required artifact and acceptance result to the latest completed attempt, and Pack acceptance evidence must have one matching trace in the correct attempt/scope. The MCP adapter applies one monotonic wall-clock deadline across every HTTP request in a tool call, reads response bodies against the remaining budget, and bounds remembered Run receipts to a 128-entry LRU whose evictions are revalidated from Run/Team/hash lineage. Launcher startup now rejects an unrelated Harness listener before HTTP or support-service effects, fails before those effects when a free port has no interpreter file, and binds the later readiness probe to the initially verified PID and creation time. Harness interpreter overrides do not alter LiteLLM fallback or Chrome proxy runtimes. Launcher saves preserve unrelated `.env.local` fields/comments and protected ACL semantics through same-directory atomic replacement; post-replace ACL failure restores the original content and ACL, while incomplete rollback fails explicitly and retains the recoverable original backup. Service rollback stops the new process before restoring a reconstructable prior Harness, unreconstructable enabled-provider state is reused fail-closed, and active-work inspection returns `unknown` at its 20-Run bound. Task and Run listboxes implement Arrow/Home/End/Enter/Space behavior with roving `tabindex`. A fresh temporary-data Uvicorn process completed a six-step mock Research run through the real stdio MCP process: the fixed 12-tool catalog was present, `harness_list_recent`, `harness_get_quality`, and `harness_get_final_artifact` all passed their Run/hash bindings, quality passed 28 checks, six AgentRun checkpoints and six artifacts were persisted, and no error trace remained. The normal Harness and LiteLLM processes then passed live health/readiness checks on ports `8014` and `4000`. A fresh post-fix isolated Chrome pass covered `1440`, `390`, and `320` pixel layouts, found no page-level horizontal overflow or failed application request, reported zero console warnings/errors, and exercised task selection with Arrow/Enter plus Run selection with End/Space. Narrow navigation and detail-tab rows remained reachable through explicit horizontal scrolling. No real or paid model call was made. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
 - On 2026-08-10 the configurable-team, desktop-launcher, and restricted Codex MCP increment passed the focused execution-plan, Team Selection, API, and MCP regression set with `220 passed, 1 warning` and the full local backend suite with `1027 passed, 5 skipped, 1 warning`. `python -m compileall -q app scripts`, `pip check`, JavaScript syntax, every tracked PowerShell AST parse, `git diff --check`, and high-confidence credential-exposure scans passed. Browser verification completed default-team and six-position custom GPT/DeepSeek mock runs, confirmed immutable team receipts and passing quality reports, exercised widths `320`, `390`, `768`, `1024`, and `1440` without horizontal overflow or control overlap, preserved focus across provider/model redraws, enforced disabled custom-team controls, and reported no console warning or error. No real or paid model call was made. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
@@ -687,8 +699,8 @@ Before running a full real-model workflow, you can smoke test LiteLLM aliases wi
 ```powershell
 .\.venv\Scripts\python.exe scripts\harness_control.py model-smoke `
   --confirm-real-models `
-  --model gpt5.5 `
-  --model deepseek-v4-pro `
+  --model gpt5.6-sol `
+  --model deepseek-v4-flash `
   --max-tokens 8
 ```
 

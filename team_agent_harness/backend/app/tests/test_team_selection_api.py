@@ -53,8 +53,19 @@ def test_team_template_covers_fixed_slots_without_exposing_prompts(tmp_path: Pat
     assert selection["pack_name"] == "code_rd"
     assert {item["slot"] for item in assignments} == {agent["role"] for agent in pack["agents"]}
     assert {item["route"]["family"] for item in assignments} == {"gpt", "deepseek"}
-    assert {item["route"]["provider"] for item in assignments} == {"litellm_proxy"}
-    assert all(item["route"]["model"] in {"gpt5.5", "deepseek-v4-pro"} for item in assignments)
+    assert {item["route"]["provider"] for item in assignments} == {"litellm_proxy", "deepseek"}
+    assert all(item["route"]["model"] in {"gpt5.6-sol", "deepseek-v4-flash"} for item in assignments)
+    for item in assignments:
+        if item["route"]["family"] == "gpt":
+            assert item["route"]["fallbacks"] == [
+                {
+                    "family": "deepseek",
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-flash",
+                }
+            ]
+        else:
+            assert item["route"]["fallbacks"] == []
     assert {item["slot"] for item in template["slots"]} == {
         item["slot"] for item in assignments
     }
@@ -73,7 +84,9 @@ def test_validate_and_run_freeze_the_selected_team_and_role_card(tmp_path: Path)
         encoding="utf-8",
     )
     app = _app(tmp_path)
-    app.state.harness.model_gateway = ModelGateway({"litellm_proxy": MockModelAdapter()})
+    app.state.harness.model_gateway = ModelGateway(
+        {"litellm_proxy": MockModelAdapter(), "deepseek": MockModelAdapter()}
+    )
 
     with TestClient(app) as client:
         task = _task(client)
@@ -119,7 +132,9 @@ def test_validate_and_run_freeze_the_selected_team_and_role_card(tmp_path: Path)
 
 def test_run_team_receipt_uses_frozen_manifest_after_pack_changes(tmp_path: Path) -> None:
     app = _app(tmp_path)
-    app.state.harness.model_gateway = ModelGateway({"litellm_proxy": MockModelAdapter()})
+    app.state.harness.model_gateway = ModelGateway(
+        {"litellm_proxy": MockModelAdapter(), "deepseek": MockModelAdapter()}
+    )
 
     with TestClient(app) as client:
         task = _task(client)
@@ -331,7 +346,9 @@ def test_dynamic_subset_plan_preserves_complete_selected_team_receipt(
     tmp_path: Path,
 ) -> None:
     app = _app(tmp_path)
-    app.state.harness.model_gateway = ModelGateway({"litellm_proxy": MockModelAdapter()})
+    app.state.harness.model_gateway = ModelGateway(
+        {"litellm_proxy": MockModelAdapter(), "deepseek": MockModelAdapter()}
+    )
     execution_plan = {
         "schema_version": "execution-plan-v1",
         "workflow_pack": "code_rd",

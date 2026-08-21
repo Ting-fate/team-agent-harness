@@ -1252,7 +1252,8 @@ def test_checked_in_deepseek_routes_have_minimum_response_budget() -> None:
     for routing_path in routing_paths:
         config = json.loads(routing_path.read_text(encoding="utf-8"))
         deepseek_routes = [
-            route for route in config["agents"].values() if route.get("model") == "deepseek-v4-pro"
+            route for route in config["agents"].values()
+            if route.get("model") in {"deepseek-v4-pro", "deepseek-v4-flash"}
         ]
 
         assert deepseek_routes

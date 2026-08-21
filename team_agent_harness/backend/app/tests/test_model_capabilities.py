@@ -16,6 +16,8 @@ def test_builtin_registry_exposes_safe_capabilities() -> None:
     match = registry.resolve("deepseek", "deepseek-chat")
     mock_match = registry.resolve("mock", "mock-model")
     gpt_proxy_match = registry.resolve("litellm_proxy", "gpt5.5")
+    gpt56_proxy_match = registry.resolve("litellm_proxy", "gpt5.6-sol")
+    deepseek_flash_match = registry.resolve("deepseek", "deepseek-v4-flash")
     deepseek_proxy_match = registry.resolve("litellm_proxy", "deepseek-v4-pro")
     wildcard_proxy_match = registry.resolve("litellm_proxy", "unattested-alias")
 
@@ -30,6 +32,10 @@ def test_builtin_registry_exposes_safe_capabilities() -> None:
     assert mock_match.capability.output_price == 0.0
     assert gpt_proxy_match.capability is not None
     assert gpt_proxy_match.capability.model_family == "gpt"
+    assert gpt56_proxy_match.capability is not None
+    assert gpt56_proxy_match.capability.model_family == "gpt"
+    assert deepseek_flash_match.capability is not None
+    assert deepseek_flash_match.capability.model_family is None
     assert deepseek_proxy_match.capability is not None
     assert deepseek_proxy_match.capability.model_family == "deepseek"
     assert wildcard_proxy_match.capability is not None

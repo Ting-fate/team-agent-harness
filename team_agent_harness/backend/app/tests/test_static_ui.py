@@ -41,7 +41,7 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "角色卡列表" in index_response.text
     assert "绑定到智能体" in index_response.text
     assert "选择要配置的岗位" in index_response.text
-    assert "推荐 GPT 与 DeepSeek 均经 LiteLLM，分别使用 gpt5.5 与 deepseek-v4-pro" in index_response.text
+    assert "默认 GPT 使用 gpt5.6-sol 中转，DeepSeek 使用官方 deepseek-v4-flash" in index_response.text
     assert "思考强度" in index_response.text
     assert "推荐模型方案" in index_response.text
     assert "GPT 主线程" in index_response.text
@@ -388,12 +388,12 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert js_response.text.count("loadSelectedPackDetail") >= 4
     assert "Access-Control" not in js_response.text
     assert "routingPresets" in js_response.text
-    assert "gpt5.5" in js_response.text
+    assert "gpt5.6-sol" in js_response.text
     assert "reasoning_effort" in js_response.text
     assert "bindingReasoningEffort" in js_response.text
     assert "saveInstitutionalRecommendedRoutes" in js_response.text
     assert re.search(
-        r'deepSeekLongContext:\s*\{\s*provider: "litellm_proxy",\s*model: "deepseek-v4-pro"[\s\S]*?max_tokens: 4096',
+        r'deepSeekLongContext:\s*\{\s*provider: "deepseek",\s*model: "deepseek-v4-flash"[\s\S]*?max_tokens: 4096',
         js_response.text,
     )
     assert "applyGptPresetButton" in js_response.text
