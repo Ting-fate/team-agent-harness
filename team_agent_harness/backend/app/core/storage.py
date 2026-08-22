@@ -5,7 +5,7 @@ import sqlite3
 from threading import RLock
 from collections.abc import Iterable
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self
 
@@ -16,6 +16,7 @@ from app.core.models import (
     AgentDefinition,
     AgentRun,
     AgentSession,
+    AgentSessionStatus,
     Artifact,
     EvalResult,
     Handoff,
@@ -36,7 +37,11 @@ class StorageError(RuntimeError):
     pass
 
 
-class RunRecordIntegrityError(StorageError):
+class StorageIntegrityError(StorageError):
+    pass
+
+
+class RunRecordIntegrityError(StorageIntegrityError):
     def __init__(self, run_id: str, *, reason: str = "invalid_payload") -> None:
         super().__init__(f"Persisted run record is invalid: {run_id}")
         self.run_id = run_id
@@ -93,7 +98,12 @@ class SQLiteStorage:
             except sqlite3.Error as exc:
                 if outermost and self.conn.in_transaction:
                     self.conn.rollback()
-                raise StorageError(str(exc)) from exc
+                error_type = (
+                    StorageIntegrityError
+                    if isinstance(exc, sqlite3.IntegrityError)
+                    else StorageError
+                )
+                raise error_type(str(exc)) from exc
             finally:
                 if self._transaction_depth:
                     self._transaction_depth -= 1
@@ -297,6 +307,245 @@ class SQLiteStorage:
         order_by = "rowid DESC" if limit is not None else "id ASC"
         return self._list_models("runs", Run, order_by, limit=limit, offset=offset)
 
+    def list_run_summaries(self, *, limit: int, offset: int = 0) -> list[dict[str, Any]]:
+        if type(limit) is not int or limit <= 0 or type(offset) is not int or offset < 0:
+            raise StorageError("Run summary pagination must use a positive limit and non-negative offset.")
+        try:
+            with self._lock:
+                rows = self.conn.execute(
+                    """
+                    SELECT
+                        id,
+                        task_id,
+                        status,
+                        json_extract(data, '$.id') AS payload_id,
+                        json_extract(data, '$.task_id') AS payload_task_id,
+                        json_extract(data, '$.status') AS payload_status,
+                        json_extract(data, '$.current_step') AS current_step,
+                        started_at,
+                        finished_at,
+                        json_extract(data, '$.final_artifact_id') AS final_artifact_id
+                    FROM runs
+                    ORDER BY rowid DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError("Run summary rows could not be read.") from exc
+        summaries: list[dict[str, Any]] = []
+        for row in rows:
+            if (
+                row["payload_id"] != row["id"]
+                or row["payload_task_id"] != row["task_id"]
+                or row["payload_status"] != row["status"]
+            ):
+                raise StorageIntegrityError(
+                    "Run summary identity or status does not match its persisted payload."
+                )
+            summary = dict(row)
+            summary.pop("payload_id")
+            summary.pop("payload_task_id")
+            summary.pop("payload_status")
+            summaries.append(summary)
+        return summaries
+
+    def preview_terminal_run_records(self) -> dict[str, Any]:
+        """Return the exact terminal Run and artifact set eligible for deletion."""
+        with self.transaction():
+            run_ids = self._eligible_terminal_run_ids()
+            artifacts = self._artifact_purge_candidates(run_ids)
+        return {
+            "run_ids": run_ids,
+            "artifact_paths": [artifact["path"] for artifact in artifacts],
+            "artifacts": artifacts,
+            "runs_deleted": 0,
+        }
+
+    def purge_terminal_run_records(
+        self,
+        *,
+        expected_run_ids: list[str] | None = None,
+        expected_artifacts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Delete terminal run records while retaining task definitions."""
+        with self.transaction():
+            eligible_run_ids = self._eligible_terminal_run_ids()
+            if expected_run_ids is None:
+                run_ids = eligible_run_ids
+            else:
+                if (
+                    any(not isinstance(run_id, str) or not run_id for run_id in expected_run_ids)
+                    or len(expected_run_ids) != len(set(expected_run_ids))
+                ):
+                    raise StorageError("Expected terminal Run ids must be unique non-empty strings.")
+                missing = sorted(set(expected_run_ids) - set(eligible_run_ids))
+                if missing:
+                    raise StorageError("Terminal Run purge candidates changed before deletion.")
+                run_ids = list(expected_run_ids)
+            artifacts = self._artifact_purge_candidates(run_ids)
+            if expected_artifacts is not None and artifacts != expected_artifacts:
+                raise StorageError("Terminal Run artifact candidates changed before deletion.")
+            self._delete_run_records(run_ids)
+
+        return {
+            "run_ids": run_ids,
+            "artifact_paths": [artifact["path"] for artifact in artifacts],
+            "artifacts": artifacts,
+            "runs_deleted": len(run_ids),
+        }
+
+    def _eligible_terminal_run_ids(self) -> list[str]:
+        terminal_statuses = (
+            RunStatus.COMPLETED.value,
+            RunStatus.FAILED.value,
+            RunStatus.CANCELLED.value,
+        )
+        placeholders = ", ".join("?" for _ in terminal_statuses)
+        active_queue_statuses = (
+            RunQueueItemStatus.QUEUED.value,
+            RunQueueItemStatus.RUNNING.value,
+            RunQueueItemStatus.WAITING.value,
+        )
+        active_job_statuses = (
+            RuntimeJobStatus.RECORDED.value,
+            RuntimeJobStatus.APPROVAL_REQUIRED.value,
+            RuntimeJobStatus.APPROVED.value,
+        )
+        active_session_statuses = (
+            AgentSessionStatus.ACTIVE.value,
+            AgentSessionStatus.WAITING_APPROVAL.value,
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT id
+            FROM runs
+            WHERE status IN ({placeholders})
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_queue_items
+                  WHERE run_queue_items.run_id = runs.id
+                    AND run_queue_items.status IN ({', '.join('?' for _ in active_queue_statuses)})
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM run_locks
+                  WHERE run_locks.run_id = runs.id
+                    AND run_locks.status = ?
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM runtime_jobs
+                  WHERE runtime_jobs.run_id = runs.id
+                    AND runtime_jobs.status IN ({', '.join('?' for _ in active_job_statuses)})
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM agent_sessions
+                  WHERE agent_sessions.run_id = runs.id
+                    AND agent_sessions.status IN ({', '.join('?' for _ in active_session_statuses)})
+              )
+            ORDER BY id ASC
+            """,
+            (
+                *terminal_statuses,
+                *active_queue_statuses,
+                RunLockStatus.ACQUIRED.value,
+                *active_job_statuses,
+                *active_session_statuses,
+            ),
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def _artifact_purge_candidates(self, run_ids: list[str]) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        for batch in self._run_id_batches(run_ids):
+            run_placeholders = ", ".join("?" for _ in batch)
+            artifact_rows = self.conn.execute(
+                f"SELECT id, run_id, data FROM artifacts WHERE run_id IN ({run_placeholders}) ORDER BY id ASC",
+                batch,
+            ).fetchall()
+            for row in artifact_rows:
+                try:
+                    artifact = Artifact.model_validate_json(row["data"])
+                except (TypeError, ValueError, ValidationError) as exc:
+                    raise StorageIntegrityError(
+                        "Terminal Run artifact metadata is invalid."
+                    ) from exc
+                if artifact.id != row["id"] or artifact.run_id != row["run_id"]:
+                    raise StorageIntegrityError(
+                        "Terminal Run artifact identity does not match its database row."
+                    )
+                raw_path = Path(artifact.path)
+                if (
+                    raw_path.is_absolute()
+                    or len(raw_path.parts) != 2
+                    or raw_path.parts[0] != artifact.run_id
+                    or raw_path.name != raw_path.parts[1]
+                ):
+                    raise StorageIntegrityError(
+                        "Terminal Run artifact path does not match its Run identity."
+                    )
+                artifacts.append(
+                    {
+                        "id": artifact.id,
+                        "run_id": artifact.run_id,
+                        "path": artifact.path,
+                        "content_hash": artifact.content_hash,
+                    }
+                )
+        candidate_ids = {artifact["id"] for artifact in artifacts}
+        candidate_paths = {artifact["path"] for artifact in artifacts}
+        if candidate_paths:
+            rows = self.conn.execute(
+                "SELECT id, run_id, data FROM artifacts ORDER BY id ASC"
+            ).fetchall()
+            for row in rows:
+                if row["id"] in candidate_ids:
+                    continue
+                try:
+                    other = Artifact.model_validate_json(row["data"])
+                except (TypeError, ValueError, ValidationError) as exc:
+                    raise StorageIntegrityError(
+                        "Artifact metadata is invalid while checking purge ownership."
+                    ) from exc
+                if other.id != row["id"] or other.run_id != row["run_id"]:
+                    raise StorageIntegrityError(
+                        "Artifact identity is invalid while checking purge ownership."
+                    )
+                if other.path in candidate_paths:
+                    raise StorageIntegrityError(
+                        "Terminal Run artifact path is also owned by a retained artifact."
+                    )
+        return artifacts
+
+    def _delete_run_records(self, run_ids: list[str]) -> None:
+        for batch in self._run_id_batches(run_ids):
+            run_placeholders = ", ".join("?" for _ in batch)
+            # Delete in dependency order because the schema deliberately does
+            # not use cascading deletes for recovery safety.
+            for table in (
+                "eval_results",
+                "trace_events",
+                "handoffs",
+                "runtime_jobs",
+                "agent_sessions",
+                "run_queue_items",
+                "run_locks",
+                "artifacts",
+                "agent_runs",
+            ):
+                self.conn.execute(
+                    f"DELETE FROM {table} WHERE run_id IN ({run_placeholders})",
+                    batch,
+                )
+            self.conn.execute(
+                f"DELETE FROM runs WHERE id IN ({run_placeholders})",
+                batch,
+            )
+
+    def _run_id_batches(self, run_ids: list[str]) -> Iterable[list[str]]:
+        variable_limit = self.conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+        batch_size = max(1, min(500, variable_limit))
+        for batch_start in range(0, len(run_ids), batch_size):
+            yield run_ids[batch_start : batch_start + batch_size]
+
     def list_runs_by_statuses(self, statuses: Iterable[RunStatus]) -> list[Run]:
         status_values = sorted({status.value for status in statuses})
         if not status_values:
@@ -452,7 +701,9 @@ class SQLiteStorage:
     def create_agent_definition(self, agent: AgentDefinition) -> AgentDefinition:
         existing = self.get_agent_definition_by_pack_role(agent.pack_name, agent.role)
         if existing is not None and existing.id != agent.id:
-            raise StorageError(f"Agent role already exists for pack {agent.pack_name}: {agent.role}")
+            raise StorageIntegrityError(
+                f"Agent role already exists for pack {agent.pack_name}: {agent.role}"
+            )
         self._insert_model(
             "agent_definitions",
             agent,
@@ -466,13 +717,15 @@ class SQLiteStorage:
     def upsert_agent_definition(self, agent: AgentDefinition) -> AgentDefinition:
         existing = self.get_agent_definition_by_pack_role(agent.pack_name, agent.role)
         if existing is not None and existing.id != agent.id:
-            raise StorageError(f"Agent role already exists for pack {agent.pack_name}: {agent.role}")
+            raise StorageIntegrityError(
+                f"Agent role already exists for pack {agent.pack_name}: {agent.role}"
+            )
 
         existing_by_id = self.get_agent_definition(agent.id)
         if existing_by_id is None:
             return self.create_agent_definition(agent)
         if existing_by_id.pack_name != agent.pack_name or existing_by_id.role != agent.role:
-            raise StorageError(f"Agent id already exists for another pack/role: {agent.id}")
+            raise StorageIntegrityError(f"Agent id already exists for another pack/role: {agent.id}")
 
         self._update_model(
             "agent_definitions",
@@ -539,7 +792,7 @@ class SQLiteStorage:
         self._ensure_agent_run_belongs_to_run(session.agent_run_id, session.run_id)
         agent_run = self.get_agent_run(session.agent_run_id)
         if agent_run is not None and agent_run.agent_id != session.agent_id:
-            raise StorageError(
+            raise StorageIntegrityError(
                 f"agent_session agent {session.agent_id} does not match agent_run {agent_run.agent_id}"
             )
         self._insert_model(
@@ -672,10 +925,10 @@ class SQLiteStorage:
     def list_run_queue_items_for_run(self, run_id: str) -> list[RunQueueItem]:
         return self._list_models("run_queue_items", RunQueueItem, "created_at ASC, id ASC", where=("run_id", run_id))
 
-    def create_run_lock(self, lock: RunLock, *, stale_after_seconds: int | None = None) -> RunLock:
+    def create_run_lock(self, lock: RunLock) -> RunLock:
         with self._lock:
             self._ensure_run_exists(lock.run_id)
-            active_lock = self.get_active_run_lock(lock.run_id, stale_after_seconds=stale_after_seconds)
+            active_lock = self.get_active_run_lock(lock.run_id)
             if lock.status == RunLockStatus.ACQUIRED and active_lock is not None:
                 raise StorageError(f"Run already has an active lock: {lock.run_id}")
             self._insert_model(
@@ -717,7 +970,7 @@ class SQLiteStorage:
     def list_run_locks_for_run(self, run_id: str) -> list[RunLock]:
         return self._list_models("run_locks", RunLock, "acquired_at ASC, id ASC", where=("run_id", run_id))
 
-    def get_active_run_lock(self, run_id: str, *, stale_after_seconds: int | None = None) -> RunLock | None:
+    def get_active_run_lock(self, run_id: str) -> RunLock | None:
         with self._lock:
             row = self.conn.execute(
                 """
@@ -731,22 +984,7 @@ class SQLiteStorage:
             ).fetchone()
         if row is None:
             return None
-        lock = RunLock.model_validate_json(row["data"])
-        if stale_after_seconds is not None and _is_stale_lock(lock, stale_after_seconds):
-            recovered = lock.model_copy(
-                update={
-                    "status": RunLockStatus.RELEASED,
-                    "released_at": datetime.now(lock.acquired_at.tzinfo),
-                    "metadata": {
-                        **lock.metadata,
-                        "stale_recovered": True,
-                        "stale_after_seconds": stale_after_seconds,
-                    },
-                }
-            )
-            self.update_run_lock(recovered)
-            return None
-        return lock
+        return RunLock.model_validate_json(row["data"])
 
     def create_handoff(self, handoff: Handoff) -> Handoff:
         self._ensure_agent_run_belongs_to_run(handoff.from_agent_run_id, handoff.run_id)
@@ -848,15 +1086,15 @@ class SQLiteStorage:
         with self._lock:
             row = self.conn.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
         if row is None:
-            raise StorageError(f"run row not found: {run_id}")
+            raise StorageIntegrityError(f"run row not found: {run_id}")
 
     def _ensure_agent_run_belongs_to_run(self, agent_run_id: str, run_id: str) -> None:
         with self._lock:
             row = self.conn.execute("SELECT run_id FROM agent_runs WHERE id = ?", (agent_run_id,)).fetchone()
         if row is None:
-            raise StorageError(f"agent_run row not found: {agent_run_id}")
+            raise StorageIntegrityError(f"agent_run row not found: {agent_run_id}")
         if row["run_id"] != run_id:
-            raise StorageError(
+            raise StorageIntegrityError(
                 f"agent_run {agent_run_id} belongs to run {row['run_id']}, not run {run_id}"
             )
 
@@ -864,23 +1102,27 @@ class SQLiteStorage:
         with self._lock:
             row = self.conn.execute("SELECT run_id FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
         if row is None:
-            raise StorageError(f"artifact row not found: {artifact_id}")
+            raise StorageIntegrityError(f"artifact row not found: {artifact_id}")
         if row["run_id"] != run_id:
-            raise StorageError(f"artifact {artifact_id} belongs to run {row['run_id']}, not run {run_id}")
+            raise StorageIntegrityError(
+                f"artifact {artifact_id} belongs to run {row['run_id']}, not run {run_id}"
+            )
 
     def _ensure_agent_session_belongs_to_run(self, session_id: str, run_id: str) -> None:
         with self._lock:
             row = self.conn.execute("SELECT run_id FROM agent_sessions WHERE id = ?", (session_id,)).fetchone()
         if row is None:
-            raise StorageError(f"agent_session row not found: {session_id}")
+            raise StorageIntegrityError(f"agent_session row not found: {session_id}")
         if row["run_id"] != run_id:
-            raise StorageError(f"agent_session {session_id} belongs to run {row['run_id']}, not run {run_id}")
+            raise StorageIntegrityError(
+                f"agent_session {session_id} belongs to run {row['run_id']}, not run {run_id}"
+            )
 
     def _ensure_runtime_job_session_matches(self, job: RuntimeJob) -> None:
         with self._lock:
             row = self.conn.execute("SELECT data FROM agent_sessions WHERE id = ?", (job.agent_session_id,)).fetchone()
         if row is None:
-            raise StorageError(f"agent_session row not found: {job.agent_session_id}")
+            raise StorageIntegrityError(f"agent_session row not found: {job.agent_session_id}")
         session = AgentSession.model_validate_json(row["data"])
         mismatches: list[str] = []
         if session.run_id != job.run_id:
@@ -892,7 +1134,7 @@ class SQLiteStorage:
         if session.runtime != job.runtime:
             mismatches.append(f"runtime={session.runtime}")
         if mismatches:
-            raise StorageError(
+            raise StorageIntegrityError(
                 f"runtime_job session mismatch for {job.agent_session_id}: {', '.join(mismatches)}"
             )
 
@@ -917,7 +1159,7 @@ class SQLiteStorage:
                 [*values.values(), model.id],
             )
             if cursor.rowcount != 1:
-                raise StorageError(f"{table} row not found: {model.id}")
+                raise StorageIntegrityError(f"{table} row not found: {model.id}")
 
     def _get_model[T: BaseModel](self, table: str, model_id: str, model_type: type[T]) -> T | None:
         with self._lock:
@@ -1072,20 +1314,3 @@ def _dt(value: Any) -> str | None:
     if value is None:
         return None
     return value.isoformat()
-
-
-def _is_stale_lock(lock: RunLock, stale_after_seconds: int) -> bool:
-    if stale_after_seconds <= 0:
-        return False
-    reference_time = lock.acquired_at
-    heartbeat_value = lock.metadata.get("heartbeat_at")
-    if isinstance(heartbeat_value, str):
-        try:
-            heartbeat_at = datetime.fromisoformat(heartbeat_value)
-        except ValueError:
-            pass
-        else:
-            if heartbeat_at.tzinfo is not None and heartbeat_at.utcoffset() is not None:
-                reference_time = heartbeat_at
-    now = datetime.now(reference_time.tzinfo)
-    return now - reference_time > timedelta(seconds=stale_after_seconds)

@@ -761,11 +761,20 @@ def test_tavily_search_disables_environment_proxy_inheritance(
     calls: dict[str, object] = {}
 
     class FakeResponse:
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
         def raise_for_status(self) -> None:
             return None
 
-        def json(self) -> dict[str, object]:
-            return {"results": []}
+        def iter_raw(self, *, chunk_size: int):
+            assert chunk_size == web_tools_module.WEB_READ_CHUNK_BYTES
+            yield b'{"results":[]}'
 
     class FakeHttpxClient:
         def __init__(self, **kwargs) -> None:
@@ -777,13 +786,98 @@ def test_tavily_search_disables_environment_proxy_inheritance(
         def __exit__(self, *_args) -> None:
             return None
 
-        def post(self, url: str, *, json: dict[str, object]):
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            json: dict[str, object],
+            headers: dict[str, str],
+        ):
+            calls["method"] = method
             calls["url"] = url
             calls["json"] = json
+            calls["headers"] = headers
             return FakeResponse()
 
     monkeypatch.setenv("TAVILY_API_KEY", "test-key")
     monkeypatch.setattr("httpx.Client", FakeHttpxClient)
 
     assert TavilySearchClient().search(query="test", max_results=1) == {"results": []}
-    assert calls["client_kwargs"] == {"timeout": 20, "trust_env": False}
+    assert calls["client_kwargs"] == {
+        "timeout": 20.0,
+        "trust_env": False,
+        "follow_redirects": False,
+    }
+    assert calls["method"] == "POST"
+    assert calls["headers"] == {"Accept-Encoding": "identity"}
+
+
+@pytest.mark.parametrize(
+    ("chunks", "error"),
+    [
+        ([b"x" * (web_tools_module.MAX_TAVILY_RESPONSE_BYTES + 1)], "too large"),
+        ([b'{"results":' + b"[" * 20 + b"]" * 20 + b"}"], "nested too deeply"),
+    ],
+)
+def test_tavily_search_bounds_external_response(
+    chunks: list[bytes],
+    error: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_raw(self, *, chunk_size: int):
+            assert chunk_size == web_tools_module.WEB_READ_CHUNK_BYTES
+            yield from chunks
+
+    class FakeHttpxClient:
+        def __init__(self, **_kwargs) -> None:
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def stream(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+    monkeypatch.setattr("httpx.Client", FakeHttpxClient)
+
+    with pytest.raises(ToolValidationError, match=error):
+        TavilySearchClient().search(query="test", max_results=1)
+
+
+def test_simple_fetch_enforces_total_body_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        web_tools_module.socket,
+        "getaddrinfo",
+        lambda _host, port, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+        ],
+    )
+    sockets = install_fake_sockets(
+        monkeypatch,
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+    )
+    ticks = iter([0.0, 0.0, web_tools_module.WEB_REQUEST_TIMEOUT_SECONDS + 1])
+    monkeypatch.setattr(web_tools_module, "perf_counter", lambda: next(ticks))
+
+    with pytest.raises(ToolValidationError, match="total time budget"):
+        SimpleWebFetchClient().fetch("http://example.com/resource", max_bytes=64)
+
+    assert len(sockets) == 1
+    assert sockets[0].closed is True

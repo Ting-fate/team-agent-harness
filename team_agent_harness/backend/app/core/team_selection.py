@@ -20,7 +20,7 @@ from app.packs.base import WorkflowPack
 
 TEAM_SELECTION_VERSION = "team-selection-v1"
 ModelFamily = Literal["gpt", "deepseek"]
-TeamModelProvider = Literal["openai", "deepseek", "litellm_proxy"]
+TeamModelProvider = Literal["openai", "gpt_relay", "deepseek", "litellm_proxy"]
 _TEAM_SELECTION_MANIFEST_KEY = "team_selection_manifest_hash"
 
 _FROZEN_MODEL_CONFIG = ConfigDict(extra="forbid", str_strip_whitespace=True, frozen=True)
@@ -380,6 +380,11 @@ def _validate_family_provider_model(
             raise ValueError("Direct openai routes require family=gpt")
         if not model.startswith("gpt"):
             raise ValueError("Direct openai model names must start with gpt")
+    elif provider == "gpt_relay":
+        if family != "gpt":
+            raise ValueError("Direct gpt_relay routes require family=gpt")
+        if not model.startswith("gpt"):
+            raise ValueError("Direct gpt_relay model names must start with gpt")
     elif provider == "deepseek":
         if family != "deepseek":
             raise ValueError("Direct deepseek routes require family=deepseek")
@@ -494,7 +499,7 @@ def _require_litellm_family_attestation(
 ) -> None:
     if contains_secret_like_text(model):
         raise TeamSelectionError("Team selection contains sensitive-looking metadata.")
-    if provider != "litellm_proxy":
+    if provider not in {"gpt_relay", "litellm_proxy"}:
         return
     capability = capability_registry.resolve(provider, model).capability
     if (
@@ -504,8 +509,9 @@ def _require_litellm_family_attestation(
     ):
         return
     route_label = "fallback alias" if fallback else "alias"
+    provider_label = "GPT relay" if provider == "gpt_relay" else "LiteLLM"
     raise TeamSelectionError(
-        f"LiteLLM {route_label} for slot {slot} is not attested for family={family}; "
+        f"{provider_label} {route_label} for slot {slot} is not attested for family={family}; "
         "add an exact model capability entry with the matching model_family."
     )
 

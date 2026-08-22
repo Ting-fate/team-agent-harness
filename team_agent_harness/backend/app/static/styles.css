@@ -1511,6 +1511,86 @@ a:focus-visible,
   gap: 10px;
 }
 
+.route-table {
+  display: grid;
+  gap: 8px;
+}
+
+.route-row {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.1fr) minmax(150px, 1fr) minmax(150px, 1fr) minmax(180px, 1.2fr);
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--muted);
+  background: var(--surface-soft);
+  font-size: 13px;
+}
+
+.compact-route-table .route-row {
+  grid-template-columns: minmax(150px, 1fr) minmax(170px, 1fr) 90px;
+}
+
+.route-row strong {
+  color: var(--ink-strong);
+}
+
+.route-row small {
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.route-note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.route-health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.route-health-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--surface-soft);
+}
+
+.route-health-card.ok {
+  border-color: rgba(11, 143, 90, 0.35);
+  background: var(--ok-soft);
+}
+
+.route-health-card.danger {
+  border-color: rgba(180, 35, 24, 0.35);
+  background: var(--danger-soft);
+}
+
+.route-health-card header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.route-health-card strong {
+  color: var(--ink-strong);
+}
+
+.route-health-card p,
+.route-health-card small {
+  display: block;
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .provider-card {
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1895,6 +1975,12 @@ a:focus-visible,
   color: var(--danger);
 }
 
+#purgeHistoryButton::before {
+  content: "×";
+  font-size: 18px;
+  font-weight: 900;
+}
+
 .danger-button:hover:not(:disabled) {
   color: #fff;
   background: var(--danger);
@@ -2066,6 +2152,12 @@ pre {
   .current-run-grid,
   .chain-metadata,
   .breakdown-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .route-row,
+  .compact-route-table .route-row,
+  .route-health-grid {
     grid-template-columns: 1fr;
   }
 

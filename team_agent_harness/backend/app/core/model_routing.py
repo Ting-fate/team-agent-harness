@@ -13,6 +13,8 @@ from app.core.model_runtime import (
     REAL_MODEL_PROVIDER_API_KEY_ENVS,
     ROUTABLE_MODEL_PROVIDERS,
     default_reasoning_effort_for_model,
+    gpt_route_mode,
+    model_provider_credentials_configured,
 )
 from app.core.sensitive_text import contains_secret_like_text
 from app.packs.base import WorkflowPack
@@ -148,19 +150,46 @@ def apply_model_routing_config(
     if unknown_agents:
         raise ModelRoutingError(f"Model routing config references unknown agents: {', '.join(unknown_agents)}")
 
-    _validate_real_provider_opt_in(routing)
+    effective_routing = _routing_for_gpt_mode(routing)
+    _validate_real_provider_opt_in(effective_routing)
 
     return {
         pack_name: pack.model_copy(
             update={
                 "agents": [
-                    _apply_agent_route(agent, routing.agents.get(agent.id))
+                    _apply_agent_route(agent, effective_routing.agents.get(agent.id))
                     for agent in pack.agents
                 ]
             }
         )
         for pack_name, pack in packs.items()
     }
+
+
+def _routing_for_gpt_mode(routing: ModelRoutingConfig) -> ModelRoutingConfig:
+    if gpt_route_mode() != "direct":
+        return routing
+
+    def remap_fallback(fallback: ModelFallbackRoute) -> ModelFallbackRoute:
+        if fallback.provider == "litellm_proxy" and fallback.model in {"gpt5.5", "gpt5.6-sol"}:
+            return fallback.model_copy(
+                update={
+                    "provider": "gpt_relay",
+                    "model": "gpt-5.6-sol" if fallback.model == "gpt5.6-sol" else "gpt-5.5",
+                }
+            )
+        return fallback
+
+    remapped: dict[str, ModelRoute] = {}
+    for agent_id, route in routing.agents.items():
+        update: dict[str, Any] = {
+            "fallbacks": [remap_fallback(fallback) for fallback in route.fallbacks]
+        }
+        if route.provider == "litellm_proxy" and route.model in {"gpt5.5", "gpt5.6-sol"}:
+            update["provider"] = "gpt_relay"
+            update["model"] = "gpt-5.6-sol" if route.model == "gpt5.6-sol" else "gpt-5.5"
+        remapped[agent_id] = route.model_copy(update=update)
+    return ModelRoutingConfig(agents=remapped)
 
 
 def _apply_agent_route(agent: AgentDefinition, route: ModelRoute | None) -> AgentDefinition:
@@ -220,7 +249,7 @@ def _validate_real_provider_opt_in(routing: ModelRoutingConfig) -> None:
     missing = sorted(
         f"{route_id}:{provider}:{REAL_MODEL_PROVIDER_API_KEY_ENVS[provider]}"
         for route_id, provider, _ in real_routes
-        if not os.environ.get(REAL_MODEL_PROVIDER_API_KEY_ENVS[provider])
+        if not model_provider_credentials_configured(provider)
     )
     if missing:
         raise ModelRoutingError(f"Model routing config enables providers without credentials: {', '.join(missing)}")

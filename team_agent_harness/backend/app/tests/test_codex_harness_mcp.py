@@ -2214,6 +2214,7 @@ def test_initialize_ping_and_tool_catalog_match_stdio_mcp_contract() -> None:
         "harness_list_recent",
         "harness_get_team_template",
         "harness_create_task",
+        "harness_delegate_plan",
         "harness_validate_team",
         "harness_start_run",
         "harness_get_run",
@@ -2228,6 +2229,77 @@ def test_initialize_ping_and_tool_catalog_match_stdio_mcp_contract() -> None:
         for name in names
         for marker in ("approve", "writeback", "shell", "git", "config", "secret", "credential")
     )
+
+
+def test_delegate_plan_creates_codex_plan_snapshot_and_deepseek_only_selection() -> None:
+    module = load_script_module()
+    task_response = {
+        "id": "task-delegated",
+        "title": "Delegated plan",
+        "goal": "Run the delegated plan.",
+        "workflow_pack": "research",
+        "created_at": VALID_TIMESTAMP,
+    }
+    client = FakeClient(
+        {
+            ("POST", "/tasks"): task_response,
+            ("GET", "/workflow-packs/research/team-template"): sample_team_template_response(),
+            ("POST", "/team-selections/validate"): {
+                "valid": True,
+                "team_selection": {
+                    "version": "team-selection-v1",
+                    "pack_name": "research",
+                    "assignments": [
+                        {
+                            "slot": "Reader",
+                            "agent_id": "research-reader",
+                            "role_card_id": None,
+                            "model_family": "deepseek",
+                            "provider": "deepseek",
+                            "model": "deepseek-v4-flash",
+                            "reasoning_effort": "xhigh",
+                            "fallbacks": [],
+                        }
+                    ],
+                },
+                "public_execution_plan_hash": VALID_PLAN_HASH,
+                "immutable_after_run_creation": True,
+            },
+        }
+    )
+    server = initialize_server(module, client)
+
+    result = call_tool(
+        server,
+        2,
+        "harness_delegate_plan",
+        {
+            "title": "Delegated plan",
+            "goal": "Run the delegated plan.",
+            "workflow_pack": "research",
+            "plan": "1. Read the sources.\n2. Verify the claims.\n3. Return a concise report.",
+        },
+    )
+
+    assert result["isError"] is False
+    payload = tool_payload(result)
+    assert payload["delegation"] == "codex_to_deepseek"
+    assert payload["started"] is False
+    assert payload["route_policy"] == "deepseek_only_no_gpt_fallback"
+    selection_request = next(
+        payload for method, path, payload in client.calls if method == "POST" and path == "/team-selections/validate"
+    )
+    route = selection_request["assignments"][0]["route"]
+    assert route == {
+        "family": "deepseek",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "reasoning_effort": "xhigh",
+        "fallbacks": [],
+    }
+    task_request = next(payload for method, path, payload in client.calls if method == "POST" and path == "/tasks")
+    assert task_request["inputs"]["codex_plan_source"] == "codex_mcp"
+    assert task_request["inputs"]["codex_plan_hash"] == sha256(task_request["inputs"]["codex_plan"].encode()).hexdigest()
 
 
 def test_unknown_protocol_version_negotiates_latest_supported_version() -> None:
@@ -3513,9 +3585,8 @@ def test_unknown_tool_and_unsafe_path_input_fail_without_api_call() -> None:
     assert client.calls == []
 
 
-def test_tool_errors_are_redacted_and_api_bodies_are_not_reflected(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tool_errors_are_redacted_and_api_bodies_are_not_reflected() -> None:
     module = load_script_module()
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-real-secret")
     client = FakeClient(
         {
             ("GET", "/health"): module.HarnessApiError(
@@ -3523,7 +3594,7 @@ def test_tool_errors_are_redacted_and_api_bodies_are_not_reflected(monkeypatch: 
             )
         }
     )
-    server = initialize_server(module, client)
+    server = initialize_server(module, client, environ={"OPENAI_API_KEY": "sk-real-secret"})
 
     result = call_tool(server, 2, "harness_health", {})
     text = result["content"][0]["text"]
@@ -3533,6 +3604,39 @@ def test_tool_errors_are_redacted_and_api_bodies_are_not_reflected(monkeypatch: 
     assert "topsecret" not in text
     assert "abc123" not in text
     assert "[REDACTED]" in text
+
+
+@pytest.mark.parametrize("env_name", ["OPENAI_OFFICIAL_API_KEY", "TAVILY_API_KEY"])
+def test_tool_errors_redact_exact_configured_server_secrets(
+    env_name: str,
+) -> None:
+    module = load_script_module()
+    secret = f"{env_name.lower()}-unpatterned-987654"
+    client = FakeClient({("GET", "/health"): module.HarnessApiError(f"upstream: {secret}")})
+    server = initialize_server(module, client, environ={env_name: secret})
+
+    result = call_tool(server, 2, "harness_health", {})
+    text = result["content"][0]["text"]
+
+    assert result["isError"] is True
+    assert secret not in text
+    assert "[REDACTED]" in text
+
+
+@pytest.mark.parametrize("env_name", ["OPENAI_OFFICIAL_API_KEY", "TAVILY_API_KEY"])
+def test_successful_tool_result_blocks_exact_configured_server_secrets(
+    env_name: str,
+) -> None:
+    module = load_script_module()
+    secret = f"{env_name.lower()}-unpatterned-987654"
+    client = FakeClient({("GET", "/health"): {"message": f"upstream: {secret}"}})
+    server = initialize_server(module, client, environ={env_name: secret})
+
+    result = call_tool(server, 2, "harness_health", {})
+
+    assert result["isError"] is True
+    assert secret not in result["content"][0]["text"]
+    assert "blocked" in result["content"][0]["text"]
 
 
 @pytest.mark.parametrize(
@@ -3639,7 +3743,7 @@ def test_stdio_loop_handles_handshake_notification_invalid_json_and_tool_list() 
     responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert [response["id"] for response in responses] == [1, None, 2]
     assert responses[1]["error"]["code"] == module.JSONRPC_PARSE_ERROR
-    assert len(responses[2]["result"]["tools"]) == 12
+    assert len(responses[2]["result"]["tools"]) == 13
 
 
 def test_stdio_loop_rejects_oversized_line_and_recovers_at_next_message() -> None:

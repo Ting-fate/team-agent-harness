@@ -41,7 +41,7 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "角色卡列表" in index_response.text
     assert "绑定到智能体" in index_response.text
     assert "选择要配置的岗位" in index_response.text
-    assert "默认 GPT 使用 gpt5.6-sol 中转，DeepSeek 使用官方 deepseek-v4-flash" in index_response.text
+    assert "默认 GPT 直连中转站 gpt-5.6-sol，DeepSeek 使用官方 deepseek-v4-flash" in index_response.text
     assert "思考强度" in index_response.text
     assert "推荐模型方案" in index_response.text
     assert "GPT 主线程" in index_response.text
@@ -90,6 +90,8 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "任务归纳" in index_response.text
     assert "运行归纳" in index_response.text
     assert "完成或失败的历史运行会折叠归档" in index_response.text
+    assert 'id="purgeHistoryButton"' in index_response.text
+    assert "清理历史运行" in index_response.text
     assert "运行规则" in index_response.text
     assert "普通本地批准只记录审批意图" in index_response.text
     assert "模型配置" in index_response.text
@@ -146,6 +148,16 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert js_response.status_code == 200
     assert "javascript" in js_response.headers["content-type"]
     assert "renderPackOverview" in js_response.text
+    assert "runSummaryListsEqual" in js_response.text
+    assert "resolveMissingRunTasks" in js_response.text
+    assert js_response.text.count('api("/tasks?limit=500"') == 1
+    assert js_response.text.count('api("/runs/summaries?limit=500"') == 2
+    assert "missingTaskIds" in js_response.text
+    assert ".slice(0, 50)" in js_response.text
+    assert "服务器中全部已完成、失败或取消且不再活跃的历史运行" in js_response.text
+    assert "当前列表可能只显示部分历史" in js_response.text
+    assert "${purgeableCount}" not in js_response.text
+    assert 'result.status === "partial"' in js_response.text
     assert "renderTeamConfigurator" in js_response.text
     assert "teamTemplatesByPack" in js_response.text
     assert "teamTemplateRequests" in js_response.text
@@ -162,8 +174,8 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "运行预算" in js_response.text
     assert "data-team-field" in js_response.text
     assert "data-team-slot" in js_response.text
-    assert 'target.value === "deepseek" ? "deepseek" : "openai"' in js_response.text
-    assert 'route.provider !== "litellm_proxy"' in js_response.text
+    assert 'target.value === "deepseek" ? "deepseek" : "gpt_relay"' in js_response.text
+    assert '!["gpt_relay", "litellm_proxy"].includes(route.provider)' in js_response.text
     assert "selectedPackDetail" in js_response.text
     assert "formatModelConfig" in js_response.text
     assert "renderProviderOverview" in js_response.text
@@ -287,17 +299,13 @@ def test_static_ui_index_and_assets_are_served(tmp_path) -> None:
     assert "/jobs/start" not in js_response.text
     assert "模型配置" in js_response.text
     assert 'api("/model-providers", requestOptions)' in js_response.text
-    assert "真实调用能力" in js_response.text
-    assert "联网搜索" in js_response.text
-    assert "联网工具" in js_response.text
-    assert "Tavily" in js_response.text
-    assert "browser_search" in js_response.text
-    assert "browser_fetch" in js_response.text
-    assert "Google Chrome 桥接" in js_response.text
-    assert "仅 Research 的 browser_search/browser_fetch 使用" in js_response.text
-    assert "确认运行真实联网工具" in js_response.text
-    assert "本机浏览器桥接" in js_response.text
-    assert "凭据已配置" in js_response.text
+    assert 'api("/providers/doctor", requestOptions)' in js_response.text
+    assert "providerDoctor" in js_response.text
+    assert "默认岗位分工" in js_response.text
+    assert "当前可用性诊断" in js_response.text
+    assert "route-health-card" in js_response.text
+    assert "gpt5.6-sol" in js_response.text
+    assert "deepseek-v4-flash" in js_response.text
     assert "confirmRealProviderRun" in js_response.text
     assert "confirmRealProviderRunForPack" in js_response.text
     assert "routesForTeamSelection" in js_response.text

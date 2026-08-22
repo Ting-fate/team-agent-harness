@@ -5,6 +5,8 @@ param(
     [int]$ChromeDebugPort = 9223,
     [int]$ModelTimeoutSeconds = 180,
     [int]$LiteLlmMaxRetries = 0,
+    [ValidateSet("direct", "litellm")]
+    [string]$RouteMode = "",
     [string]$HarnessPython = "",
     [string]$LiteLlmPython = "",
     [string]$EnvFile = "",
@@ -71,8 +73,9 @@ $LocalEnvFile = if ($EnvFile) { $EnvFile } else { $DefaultEnvFile }
 $ConfigDir = Join-Path $Root "config"
 $LiteLlmConfig = Join-Path $ConfigDir "litellm.config.example.yaml"
 $LocalRoutingConfig = Join-Path $ConfigDir "model-routing.local.json"
+$DirectRoutingConfig = Join-Path $ConfigDir "model-routing.direct-relay.example.json"
 $ExampleRoutingConfig = Join-Path $ConfigDir "model-routing.litellm.example.json"
-$RoutingConfig = if (Test-Path $LocalRoutingConfig) { $LocalRoutingConfig } else { $ExampleRoutingConfig }
+$RoutingConfig = if (Test-Path $LocalRoutingConfig) { $LocalRoutingConfig } else { $DirectRoutingConfig }
 $DefaultHarnessPython = Join-Path $Root ".venv\Scripts\python.exe"
 $Python = if ($HarnessPython) { $HarnessPython } else { $DefaultHarnessPython }
 $DefaultLiteLlmPython = Join-Path $Root ".venv-litellm\Scripts\python.exe"
@@ -1102,6 +1105,25 @@ try {
     Add-SupportWarning "Local environment file could not be loaded: $($_.Exception.Message)"
 }
 
+$EffectiveRouteMode = if ($RouteMode) {
+    $RouteMode
+} elseif ($env:TEAM_AGENT_GPT_ROUTE_MODE -in @("direct", "litellm")) {
+    $env:TEAM_AGENT_GPT_ROUTE_MODE
+} else {
+    "direct"
+}
+$env:TEAM_AGENT_GPT_ROUTE_MODE = $EffectiveRouteMode
+if (-not $env:TEAM_AGENT_GPT_RELAY_PROTOCOL) {
+    $env:TEAM_AGENT_GPT_RELAY_PROTOCOL = "chat_completions"
+}
+if (-not (Test-Path $LocalRoutingConfig)) {
+    $RoutingConfig = if ($EffectiveRouteMode -eq "litellm") {
+        $ExampleRoutingConfig
+    } else {
+        $DirectRoutingConfig
+    }
+}
+
 $env:TEAM_AGENT_ALLOW_REAL_MODEL_CALLS = "1"
 $env:TEAM_AGENT_MODEL_ROUTING_CONFIG = $RoutingConfig
 Remove-Item Env:LITELLM_BASE_URL -ErrorAction SilentlyContinue
@@ -1134,7 +1156,10 @@ $ChromeProxyLog = Join-Path $OutputDir "chrome-cdp-proxy.log"
 $ChromeProxyErr = Join-Path $OutputDir "chrome-cdp-proxy.err.log"
 
 $CredentialProblems = @()
-if (-not $env:LITELLM_API_KEY -or -not $env:LITELLM_API_KEY.StartsWith("sk-")) {
+if (
+    $EffectiveRouteMode -eq "litellm" `
+    -and (-not $env:LITELLM_API_KEY -or -not $env:LITELLM_API_KEY.StartsWith("sk-"))
+) {
     $CredentialProblems += "LITELLM_API_KEY"
 }
 if (-not $env:OPENAI_API_KEY) {
@@ -1148,11 +1173,19 @@ if (-not $env:DEEPSEEK_API_KEY) {
 }
 if ($CredentialProblems.Count -gt 0) {
     Add-SupportWarning "Missing or invalid model credentials: $($CredentialProblems -join ', '). Harness remains available; real model routing may be unavailable."
+    Remove-Item Env:TEAM_AGENT_MODEL_ROUTING_CONFIG -ErrorAction SilentlyContinue
+    Add-SupportWarning "Real routing config is disabled for this startup; Harness will use mock Pack routes until credentials are complete."
 }
 
 $LiteLlmReady = $false
-$LiteLlmPid = Get-ListenerProcessId -Port $LiteLlmPort
-if ($LiteLlmPid) {
+$LiteLlmPid = if ($EffectiveRouteMode -eq "litellm") {
+    Get-ListenerProcessId -Port $LiteLlmPort
+} else {
+    $null
+}
+if ($EffectiveRouteMode -eq "direct") {
+    Write-Host "GPT route mode: direct relay (LiteLLM is not started)"
+} elseif ($LiteLlmPid) {
     if (-not (Test-LiteLlmProcess -ProcessId $LiteLlmPid -Port $LiteLlmPort)) {
         Add-SupportWarning "Port $LiteLlmPort is occupied by PID $LiteLlmPid, but it is not the expected LiteLLM service. Harness remains available."
     } elseif (Test-LiteLlmEndpoint -Port $LiteLlmPort) {
@@ -1240,7 +1273,7 @@ if ($LiteLlmPid) {
     }
 }
 
-if ($LiteLlmReady) {
+if ($EffectiveRouteMode -eq "litellm" -and $LiteLlmReady) {
     $env:LITELLM_BASE_URL = "http://127.0.0.1:$LiteLlmPort/v1"
 } else {
     Remove-Item Env:LITELLM_API_KEY -ErrorAction SilentlyContinue
@@ -1369,12 +1402,16 @@ if ($env:TEAM_AGENT_ALLOW_BROWSER_ACCESS -eq "1" -and $env:TEAM_AGENT_BROWSER_PR
     }
 }
 
-if ($LiteLlmReady) {
+if ($EffectiveRouteMode -eq "litellm" -and $LiteLlmReady) {
     Write-Host "LiteLLM Proxy: http://127.0.0.1:$LiteLlmPort"
+} elseif ($EffectiveRouteMode -eq "direct") {
+    Write-Host "LiteLLM Proxy: disabled by direct route mode"
 } else {
     Write-Host "LiteLLM Proxy: unavailable (Harness is still usable)"
 }
 Write-Host "Routing config: $RoutingConfig"
+Write-Host "GPT route mode: $EffectiveRouteMode"
+Write-Host "GPT relay protocol: $env:TEAM_AGENT_GPT_RELAY_PROTOCOL"
 Write-Host "Model timeout:  $env:TEAM_AGENT_MODEL_TIMEOUT_SECONDS seconds"
 Write-Host "LiteLLM retries: $env:DEFAULT_MAX_RETRIES"
 if ($BrowserProxyReady) {

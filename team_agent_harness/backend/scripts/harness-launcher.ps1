@@ -62,7 +62,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 $ProjectRootArgument = "--team-agent-project-root"
 $EnvFile = Join-Path $Root ".env.local"
 $EnvExampleFile = Join-Path $Root ".env.local.example"
-$StartScript = Join-Path $PSScriptRoot "start-litellm-harness.ps1"
+$StartScript = Join-Path $PSScriptRoot "start-harness.ps1"
 $HarnessPython = Join-Path $Root ".venv\Scripts\python.exe"
 $LiteLlmPython = Join-Path $Root ".venv-litellm\Scripts\python.exe"
 $LiteLlmRunner = Join-Path $PSScriptRoot "run_litellm_proxy.py"
@@ -267,6 +267,10 @@ $T = @{
     OpenAiKey = ZH 79,112,101,110,65,73,32,20013,36716,31449,32,75,101,121
     OpenAiBase = ZH 79,112,101,110,65,73,32,20013,36716,31449,22320,22336
     DeepSeekKey = ZH 68,101,101,112,83,101,101,107,32,75,101,121
+    RouteMode = ZH 71,80,84,32,36335,30001,27169,24335
+    RelayProtocol = ZH 20013,36716,21327,35758
+    DirectMode = ZH 30452,36830,20013,36716
+    LiteLlmMode = ZH 76,105,116,101,76,76,77,32,39640,32423,27169,24335
     ShowKeys = ZH 26174,31034,32,75,101,121
     SaveConfig = ZH 20445,23384,37197,32622
     StartServices = ZH 21551,21160,26381,21153
@@ -418,13 +422,19 @@ function Save-EnvFile {
         [string]$LiteLlmApiKey,
         [string]$OpenAiApiKey,
         [string]$OpenAiApiBase,
-        [string]$DeepSeekApiKey
+        [string]$DeepSeekApiKey,
+        [ValidateSet("direct", "litellm")]
+        [string]$RouteMode = "direct",
+        [ValidateSet("chat_completions", "responses")]
+        [string]$RelayProtocol = "chat_completions"
     )
     $managedValues = [ordered]@{
         LITELLM_API_KEY = $LiteLlmApiKey
         OPENAI_API_KEY = $OpenAiApiKey
         OPENAI_API_BASE = $OpenAiApiBase
         DEEPSEEK_API_KEY = $DeepSeekApiKey
+        TEAM_AGENT_GPT_ROUTE_MODE = $RouteMode
+        TEAM_AGENT_GPT_RELAY_PROTOCOL = $RelayProtocol
     }
     foreach ($value in $managedValues.Values) {
         if ([string]$value -match "[\x00\r\n]") {
@@ -1173,16 +1183,16 @@ function Ensure-EnvFile {
         Copy-Item -LiteralPath $EnvExampleFile -Destination $EnvFile
         return
     }
-    Save-EnvFile -LiteLlmApiKey "sk-dev-local-key" -OpenAiApiKey "" -OpenAiApiBase "" -DeepSeekApiKey ""
+    Save-EnvFile -LiteLlmApiKey "sk-dev-local-key" -OpenAiApiKey "" -OpenAiApiBase "" -DeepSeekApiKey "" -RouteMode "direct" -RelayProtocol "chat_completions"
 }
 
 $font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
 $form = New-Object System.Windows.Forms.Form
 $form.Text = $T.Title
-$form.Size = New-Object System.Drawing.Size -ArgumentList 760, 600
+$form.Size = New-Object System.Drawing.Size -ArgumentList 760, 700
 $form.StartPosition = "CenterScreen"
 $form.Font = $font
-$form.MinimumSize = New-Object System.Drawing.Size -ArgumentList 720, 540
+$form.MinimumSize = New-Object System.Drawing.Size -ArgumentList 720, 650
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Location = New-Object System.Drawing.Point -ArgumentList 18, 18
@@ -1215,9 +1225,40 @@ foreach ($entry in $labels) {
     $textBoxes[$entry[0]] = $box
 }
 
+$comboBoxes = @{}
+$comboDefinitions = @(
+    @("GPT Route Mode", $T.RouteMode, 262, @(
+        [PSCustomObject]@{ Label = $T.DirectMode; Value = "direct" },
+        [PSCustomObject]@{ Label = $T.LiteLlmMode; Value = "litellm" }
+    )),
+    @("GPT Relay Protocol", $T.RelayProtocol, 312, @(
+        [PSCustomObject]@{ Label = "Chat Completions"; Value = "chat_completions" },
+        [PSCustomObject]@{ Label = "Responses"; Value = "responses" }
+    ))
+)
+foreach ($definition in $comboDefinitions) {
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $definition[1]
+    $label.Location = New-Object System.Drawing.Point -ArgumentList 20, ([int]$definition[2])
+    $label.Size = New-Object System.Drawing.Size -ArgumentList 150, 24
+    $form.Controls.Add($label)
+
+    $combo = New-Object System.Windows.Forms.ComboBox
+    $combo.DropDownStyle = "DropDownList"
+    $combo.Location = New-Object System.Drawing.Point -ArgumentList 180, ([int]$definition[2] - 4)
+    $combo.Size = New-Object System.Drawing.Size -ArgumentList 260, 28
+    $combo.DisplayMember = "Label"
+    $combo.ValueMember = "Value"
+    foreach ($item in $definition[3]) {
+        [void]$combo.Items.Add($item)
+    }
+    $form.Controls.Add($combo)
+    $comboBoxes[$definition[0]] = $combo
+}
+
 $showKeys = New-Object System.Windows.Forms.CheckBox
 $showKeys.Text = $T.ShowKeys
-$showKeys.Location = New-Object System.Drawing.Point -ArgumentList 180, 250
+$showKeys.Location = New-Object System.Drawing.Point -ArgumentList 460, 260
 $showKeys.Size = New-Object System.Drawing.Size -ArgumentList 120, 24
 $showKeys.Add_CheckedChanged({
     $visible = -not $showKeys.Checked
@@ -1229,13 +1270,13 @@ $form.Controls.Add($showKeys)
 
 $hintLabel = New-Object System.Windows.Forms.Label
 $hintLabel.Text = $T.Hint
-$hintLabel.Location = New-Object System.Drawing.Point -ArgumentList 310, 250
-$hintLabel.Size = New-Object System.Drawing.Size -ArgumentList 390, 42
+$hintLabel.Location = New-Object System.Drawing.Point -ArgumentList 460, 300
+$hintLabel.Size = New-Object System.Drawing.Size -ArgumentList 240, 62
 $hintLabel.Anchor = "Top,Left,Right"
 $form.Controls.Add($hintLabel)
 
 $logBox = New-Object System.Windows.Forms.TextBox
-$logBox.Location = New-Object System.Drawing.Point -ArgumentList 20, 380
+$logBox.Location = New-Object System.Drawing.Point -ArgumentList 20, 480
 $logBox.Size = New-Object System.Drawing.Size -ArgumentList 700, 150
 $logBox.Anchor = "Left,Right,Top,Bottom"
 $logBox.Multiline = $true
@@ -1456,6 +1497,18 @@ function Load-Config {
     $textBoxes["OpenAI Relay Key"].Text = [string]$values["OPENAI_API_KEY"]
     $textBoxes["OpenAI Base URL"].Text = [string]$values["OPENAI_API_BASE"]
     $textBoxes["DeepSeek API Key"].Text = [string]$values["DEEPSEEK_API_KEY"]
+    $routeMode = if ($values["TEAM_AGENT_GPT_ROUTE_MODE"] -in @("direct", "litellm")) {
+        [string]$values["TEAM_AGENT_GPT_ROUTE_MODE"]
+    } else {
+        "direct"
+    }
+    $protocol = if ($values["TEAM_AGENT_GPT_RELAY_PROTOCOL"] -in @("chat_completions", "responses")) {
+        [string]$values["TEAM_AGENT_GPT_RELAY_PROTOCOL"]
+    } else {
+        "chat_completions"
+    }
+    $comboBoxes["GPT Route Mode"].SelectedIndex = if ($routeMode -eq "litellm") { 1 } else { 0 }
+    $comboBoxes["GPT Relay Protocol"].SelectedIndex = if ($protocol -eq "responses") { 1 } else { 0 }
     Append-Log "$($T.LoadedConfig): $EnvFile"
 }
 
@@ -1489,20 +1542,22 @@ $script:StartupTimer = New-Object System.Windows.Forms.Timer
 $script:StartupTimer.Interval = 500
 $script:StartupTimer.Add_Tick({ Update-StartupState })
 
-Button $T.SaveConfig 20 292 {
+Button $T.SaveConfig 20 392 {
     try {
         Save-EnvFile `
             -LiteLlmApiKey $textBoxes["LiteLLM API Key"].Text.Trim() `
             -OpenAiApiKey $textBoxes["OpenAI Relay Key"].Text.Trim() `
             -OpenAiApiBase $textBoxes["OpenAI Base URL"].Text.Trim() `
-            -DeepSeekApiKey $textBoxes["DeepSeek API Key"].Text.Trim()
+            -DeepSeekApiKey $textBoxes["DeepSeek API Key"].Text.Trim() `
+            -RouteMode ([string]$comboBoxes["GPT Route Mode"].SelectedValue) `
+            -RelayProtocol ([string]$comboBoxes["GPT Relay Protocol"].SelectedValue)
         Append-Log $T.SavedConfig
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, $T.SaveFailed, "OK", "Error") | Out-Null
     }
 } | Out-Null
 
-$script:StartButton = Button $T.StartServices 180 292 {
+$script:StartButton = Button $T.StartServices 180 392 {
     try {
         if ($script:StartupProcess) {
             $script:StartupProcess.Refresh()
@@ -1521,14 +1576,16 @@ $script:StartButton = Button $T.StartServices 180 292 {
             -LiteLlmApiKey $textBoxes["LiteLLM API Key"].Text.Trim() `
             -OpenAiApiKey $textBoxes["OpenAI Relay Key"].Text.Trim() `
             -OpenAiApiBase $textBoxes["OpenAI Base URL"].Text.Trim() `
-            -DeepSeekApiKey $textBoxes["DeepSeek API Key"].Text.Trim()
+            -DeepSeekApiKey $textBoxes["DeepSeek API Key"].Text.Trim() `
+            -RouteMode ([string]$comboBoxes["GPT Route Mode"].SelectedValue) `
+            -RelayProtocol ([string]$comboBoxes["GPT Relay Protocol"].SelectedValue)
 
         New-Item -ItemType Directory -Force $OutputDir | Out-Null
         $startupId = Get-Date -Format "yyyyMMdd-HHmmss-fff"
         $script:StartupLogPath = Join-Path $OutputDir "startup-supervisor-$startupId.log"
         $script:StartupErrorLogPath = Join-Path $OutputDir "startup-supervisor-$startupId.err.log"
-        $argumentLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -LiteLlmPython "{1}"' -f `
-            $StartScript, $LiteLlmPython
+        $argumentLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -LiteLlmPython "{1}" -RouteMode "{2}"' -f `
+            $StartScript, $LiteLlmPython, ([string]$comboBoxes["GPT Route Mode"].SelectedValue)
         $script:StartupProcess = Start-Process `
             -FilePath "powershell.exe" `
             -ArgumentList $argumentLine `
@@ -1561,7 +1618,7 @@ $script:StartButton = Button $T.StartServices 180 292 {
     }
 }
 
-Button $T.StopServices 340 292 {
+Button $T.StopServices 340 392 {
     Stop-StartupMonitoring
     $stopResults = @(
         Stop-ProjectService 8014 Harness
@@ -1577,12 +1634,12 @@ Button $T.StopServices 340 292 {
     Refresh-Status
 } | Out-Null
 
-Button $T.Refresh 500 292 {
+Button $T.Refresh 500 392 {
     Refresh-Status
     Append-Log $T.StatusRefreshed
 } | Out-Null
 
-$script:OpenUiButton = Button $T.OpenUi 20 336 {
+$script:OpenUiButton = Button $T.OpenUi 20 436 {
     if (-not (Open-HarnessUi)) {
         if ($script:LastOpenUiError) {
             Append-Log "$($T.OpenFailed): $script:LastOpenUiError"
@@ -1600,16 +1657,16 @@ $script:OpenUiButton = Button $T.OpenUi 20 336 {
 }
 $script:OpenUiButton.Enabled = $false
 
-Button $T.OpenProject 180 336 {
+Button $T.OpenProject 180 436 {
     Start-Process explorer.exe $Root
 } | Out-Null
 
-Button $T.OpenConfig 340 336 {
+Button $T.OpenConfig 340 436 {
     Ensure-EnvFile
     Start-Process notepad.exe $EnvFile
 } | Out-Null
 
-Button $T.OpenLogs 500 336 {
+Button $T.OpenLogs 500 436 {
     New-Item -ItemType Directory -Force $OutputDir | Out-Null
     Start-Process explorer.exe $OutputDir
 } | Out-Null

@@ -31,6 +31,7 @@ def test_model_routing_overrides_agent_model_config_with_real_call_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("TEAM_AGENT_GPT_ROUTE_MODE", "litellm")
     monkeypatch.setenv("LITELLM_API_KEY", "test-key")
     path = tmp_path / "model-routing.json"
     path.write_text(
@@ -68,6 +69,43 @@ def test_model_routing_overrides_agent_model_config_with_real_call_opt_in(
     assert "allow_real_calls" not in routed_agent.model_settings
 
 
+def test_direct_mode_remaps_only_reviewed_gpt_litellm_aliases_in_memory(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("TEAM_AGENT_GPT_ROUTE_MODE", "direct")
+    monkeypatch.setenv("OPENAI_API_KEY", "relay-key")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://relay.example.test/v1")
+    monkeypatch.setenv("LITELLM_API_KEY", "litellm-key")
+    path = tmp_path / "model-routing.json"
+    original = {
+        "agents": {
+            "code_rd_institutional-implementation_executor": {
+                "provider": "litellm_proxy",
+                "model": "gpt5.6-sol",
+                "allow_real_calls": True,
+            },
+            "code_rd_institutional-context_reader": {
+                "provider": "litellm_proxy",
+                "model": "custom-claude-alias",
+                "allow_real_calls": True,
+            },
+        }
+    }
+    path.write_text(json.dumps(original), encoding="utf-8")
+
+    pack = get_code_rd_institutional_pack()
+    routing = load_model_routing_config(path)
+    packs = apply_model_routing_config({pack.name: pack}, routing)
+    by_id = {agent.id: agent for agent in packs[pack.name].agents}
+
+    assert by_id["code_rd_institutional-implementation_executor"].model_settings["provider"] == "gpt_relay"
+    assert by_id["code_rd_institutional-implementation_executor"].model_settings["model"] == "gpt-5.6-sol"
+    assert by_id["code_rd_institutional-context_reader"].model_settings["provider"] == "litellm_proxy"
+    assert json.loads(path.read_text(encoding="utf-8")) == original
+
+
 def test_model_routing_defaults_real_provider_reasoning_effort_to_xhigh(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -101,6 +139,7 @@ def test_model_routing_defaults_real_provider_reasoning_effort_to_xhigh(
 def test_checked_in_routes_use_current_defaults_and_xhigh_reasoning() -> None:
     expected_deepseek_agents = {
         "code_rd-architect",
+        "code_rd-reviewer",
         "code_rd_institutional-context_reader",
         "code_rd_institutional-context_reviewer",
         "code_rd_institutional-review_gate",
@@ -108,7 +147,10 @@ def test_checked_in_routes_use_current_defaults_and_xhigh_reasoning() -> None:
         "research-reader",
         "research-verifier",
     }
-    routing_paths = [PROJECT_ROOT / "config/model-routing.litellm.example.json"]
+    routing_paths = [
+        PROJECT_ROOT / "config/model-routing.litellm.example.json",
+        PROJECT_ROOT / "config/model-routing.direct-relay.example.json",
+    ]
     local_routing_path = PROJECT_ROOT / "config/model-routing.local.json"
     if local_routing_path.is_file():
         routing_paths.append(local_routing_path)
@@ -126,6 +168,9 @@ def test_checked_in_routes_use_current_defaults_and_xhigh_reasoning() -> None:
             if route["provider"] == "litellm_proxy":
                 assert route["reasoning_effort"] == "xhigh"
                 assert route["model"] in {"gpt5.5", "gpt5.6-sol", "deepseek-v4-pro", "deepseek-v4-flash"}
+            elif route["provider"] == "gpt_relay":
+                assert route["reasoning_effort"] == "xhigh"
+                assert route["model"] in {"gpt-5.5", "gpt-5.6-sol"}
             elif route["provider"] == "deepseek":
                 assert route["model"] == "deepseek-v4-flash"
                 assert route["reasoning_effort"] == "xhigh"
@@ -324,6 +369,7 @@ def test_model_routing_rejects_real_provider_without_global_opt_in(tmp_path, mon
 def test_model_routing_rejects_real_provider_without_credentials(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_OFFICIAL_API_KEY", raising=False)
     path = tmp_path / "model-routing.json"
     path.write_text(
         json.dumps(
@@ -343,7 +389,7 @@ def test_model_routing_rejects_real_provider_without_credentials(tmp_path, monke
     routing = load_model_routing_config(path)
     pack = get_code_rd_pack()
 
-    with pytest.raises(ModelRoutingError, match="OPENAI_API_KEY"):
+    with pytest.raises(ModelRoutingError, match="OPENAI_OFFICIAL_API_KEY"):
         apply_model_routing_config({pack.name: pack}, routing)
 
 

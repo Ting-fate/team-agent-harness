@@ -1,0 +1,224 @@
+{
+  "agents": {
+    "code_rd-clarifier": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
+      "max_tokens": 600,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd-architect": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
+      "max_tokens": 900,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd-coder": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
+      "max_tokens": 1000,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd-tester": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
+      "max_tokens": 800,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd-reviewer": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd-finalizer": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
+      "max_tokens": 800,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "research-planner": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
+      "max_tokens": 1000,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "research-searcher": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "research-reader": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "research-verifier": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "research-writer": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
+      "max_tokens": 700,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "research-reviewer": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
+      "max_tokens": 400,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-context_reader": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-planner": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
+      "max_tokens": 700,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-review_gate": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-dispatcher": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
+      "max_tokens": 500,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-implementation_executor": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
+      "max_tokens": 1000,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-test_executor": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
+      "max_tokens": 800,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-context_reviewer": {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "max_tokens": 4096,
+      "role_file": "roles/code-reviewer.md",
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-synthesizer": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
+      "max_tokens": 700,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-final_reviewer": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
+      "max_tokens": 4096,
+      "role_file": "roles/code-reviewer.md",
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    },
+    "code_rd_institutional-final_approver": {
+      "provider": "gpt_relay",
+      "model": "gpt-5.6-sol",
+      "fallbacks": [
+        {
+          "provider": "deepseek",
+          "model": "deepseek-v4-flash",
+          "reason": "gpt_relay_fallback",
+          "allow_real_calls": true
+        }
+      ],
+      "max_tokens": 500,
+      "allow_real_calls": true,
+      "reasoning_effort": "xhigh"
+    }
+  }
+}

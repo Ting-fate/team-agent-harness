@@ -6,13 +6,15 @@ from math import isfinite
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from datetime import datetime
+from threading import Lock
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationError, field_validator
 
 from app.core.agent_loop import AgentLoopExecutor
 from app.core.artifacts import ArtifactStore, ArtifactStoreError
@@ -53,6 +55,8 @@ from app.core.model_runtime import (
     REAL_MODEL_PROVIDERS,
     ROUTABLE_MODEL_PROVIDERS,
     reasoning_effort_trace_payload,
+    gpt_relay_protocol,
+    gpt_route_mode,
 )
 from app.core.model_capabilities import CapabilityError, CapabilityRegistry, ModelCapability
 from app.core.multimodal import (
@@ -256,6 +260,7 @@ class ProviderSmokeRequest(HarnessModel):
     model: str = Field(default="", max_length=128)
     confirm_real_models: bool = False
     timeout_seconds: float = Field(default=30.0, gt=0, le=60)
+    max_tokens: int = Field(default=8, ge=1, le=128)
 
 
 class RunRuntimeSessionResponse(HarnessModel):
@@ -331,6 +336,16 @@ class RunDetailResponse(HarnessModel):
     lock_state: list[RunLockResponse]
 
 
+class RunSummaryResponse(HarnessModel):
+    id: str
+    task_id: str
+    status: RunStatus
+    current_step: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    final_artifact_id: str | None
+
+
 class RunTeamResponse(HarnessModel):
     run_id: str = Field(min_length=1)
     team_selection: TeamSelectionReceipt | None
@@ -367,8 +382,10 @@ class HarnessAppState:
     model_gateway: ModelGateway
     custom_executor_factory: bool = False
     run_worker: RunWorker | None = None
+    history_purge_lock: Lock = field(default_factory=Lock)
 
     def start(self) -> None:
+        self.artifact_store.recover_purge_quarantines()
         _writeback_service(self).recover_pending_transactions()
         if self.run_worker is not None:
             self.run_worker.start()
@@ -378,6 +395,7 @@ class HarnessAppState:
         if self.run_worker is not None:
             worker_stopped = self.run_worker.stop()
         if worker_stopped:
+            self.model_gateway.close()
             self.storage.close()
 
 
@@ -761,6 +779,29 @@ def _register_run_routes(router: APIRouter, state: HarnessAppState) -> None:
             content=[_safe_run(run) for run in runs]
         )
 
+    @router.get("/runs/summaries", response_model=list[RunSummaryResponse])
+    def list_run_summaries(
+        limit: int = Query(default=500, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+    ) -> list[RunSummaryResponse]:
+        try:
+            rows = state.storage.list_run_summaries(limit=limit, offset=offset)
+            return [RunSummaryResponse.model_validate(row) for row in rows]
+        except (StorageError, ValidationError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="A persisted run record is invalid and the run summary list cannot be trusted.",
+            ) from exc
+
+    @router.delete("/records/history")
+    def purge_history_records() -> dict[str, Any]:
+        if not state.history_purge_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="History cleanup is already running.")
+        try:
+            return _purge_history_records(state)
+        finally:
+            state.history_purge_lock.release()
+
     @router.get("/runs/{run_id}", response_model=Run)
     def get_run(run_id: str) -> JSONResponse:
         run = _run_or_404(state, run_id)
@@ -907,6 +948,45 @@ def _register_run_routes(router: APIRouter, state: HarnessAppState) -> None:
     def list_run_lock_state(run_id: str) -> list[dict[str, Any]]:
         _run_or_404(state, run_id)
         return _safe_run_locks(state, run_id)
+
+
+def _purge_history_records(state: HarnessAppState) -> dict[str, Any]:
+    preview = state.storage.preview_terminal_run_records()
+    try:
+        quarantine = state.artifact_store.quarantine_relative_files(
+            preview["artifact_paths"]
+        )
+    except ArtifactStoreError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="History cleanup could not safely isolate every artifact file.",
+        ) from exc
+    try:
+        summary = state.storage.purge_terminal_run_records(
+            expected_run_ids=preview["run_ids"],
+            expected_artifacts=preview["artifacts"],
+        )
+    except StorageError as exc:
+        try:
+            state.artifact_store.restore_quarantined_files(quarantine)
+        except ArtifactStoreError as rollback_exc:
+            raise HTTPException(
+                status_code=500,
+                detail="History cleanup failed and artifact rollback was incomplete.",
+            ) from rollback_exc
+        raise HTTPException(
+            status_code=409,
+            detail="History cleanup candidates changed before deletion.",
+        ) from exc
+    file_summary = state.artifact_store.discard_quarantined_files(quarantine)
+    return {
+        "status": "partial" if file_summary["rejected"] else "purged",
+        "runs_deleted": summary["runs_deleted"],
+        "artifact_files_deleted": file_summary["deleted"],
+        "artifact_files_missing": file_summary["missing"],
+        "artifact_files_rejected": file_summary["rejected"],
+        "run_ids": summary["run_ids"],
+    }
 
 
 def _workflow_runner(state: HarnessAppState) -> WorkflowRunner:
@@ -1112,6 +1192,7 @@ def _register_model_control_routes(router: APIRouter, state: HarnessAppState) ->
                     "configured": configured,
                     "ready": ready,
                     "adapter": info.adapter if info is not None else "custom",
+                    "protocol": info.protocol if info is not None else "unknown",
                     "enabled": info.enabled if info is not None else configured,
                     "real_calls": info.real_calls if info is not None else provider_name in REAL_MODEL_PROVIDERS,
                     "real_calls_configured": (
@@ -1131,6 +1212,8 @@ def _register_model_control_routes(router: APIRouter, state: HarnessAppState) ->
             },
             "providers": providers,
             "network_calls_performed": False,
+            "gpt_route_mode": gpt_route_mode(),
+            "gpt_relay_protocol": gpt_relay_protocol(),
         }
 
     @router.post("/routes/explain")
@@ -1202,9 +1285,10 @@ def _register_model_control_routes(router: APIRouter, state: HarnessAppState) ->
         smoke_request = ModelRequest(
             provider=provider,
             model=model,
-            system_prompt="Respond with a short health confirmation.",
-            messages=[ModelMessage(role="user", content="health check")],
+            system_prompt="Return exactly OK and nothing else.",
+            messages=[ModelMessage(role="user", content="OK")],
             timeout_seconds=request.timeout_seconds,
+            max_tokens=request.max_tokens,
             metadata={"smoke_test": True},
         )
         try:
@@ -2521,7 +2605,7 @@ def _team_route_template(
     family = _team_model_family(provider, settings.get("model_family"))
 
     warning: str | None = None
-    if provider in {"openai", "deepseek", "litellm_proxy"} and family is not None:
+    if provider in {"openai", "gpt_relay", "deepseek", "litellm_proxy"} and family is not None:
         try:
             fallbacks = []
             for candidate in settings.get("fallbacks", []):
@@ -2585,7 +2669,7 @@ def _preferred_team_family(agent: AgentDefinition) -> str:
 def _team_model_family(provider: str, declared_family: object) -> str | None:
     if declared_family in {"gpt", "deepseek"}:
         return str(declared_family)
-    if provider == "openai":
+    if provider in {"openai", "gpt_relay"}:
         return "gpt"
     if provider == "deepseek":
         return "deepseek"
@@ -2606,7 +2690,7 @@ def _team_route_is_registered(
         capability = match.capability
         if capability is None or _team_capability_family(capability) != candidate.family:
             return False
-        if candidate.provider == "litellm_proxy" and capability.model_pattern != candidate.model:
+        if candidate.provider in {"gpt_relay", "litellm_proxy"} and capability.model_pattern != candidate.model:
             return False
     return True
 
@@ -2623,7 +2707,7 @@ def _exact_team_route_from_registry(
     for family in families:
         for capability in capability_registry.capabilities:
             if (
-                capability.provider not in {"openai", "deepseek", "litellm_proxy"}
+                capability.provider not in {"openai", "gpt_relay", "deepseek", "litellm_proxy"}
                 or _team_capability_family(capability) != family
                 or any(marker in capability.model_pattern for marker in ("*", "?", "["))
             ):
@@ -3202,6 +3286,7 @@ def _default_smoke_model(provider: str) -> str:
     defaults = {
         "mock": "mock-model",
         "openai": "gpt-4o-mini",
+        "gpt_relay": "gpt-5.6-sol",
         "deepseek": "deepseek-chat",
         "litellm_proxy": "gpt5.6-sol",
     }

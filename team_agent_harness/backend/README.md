@@ -17,27 +17,27 @@ This directory includes the original MVP phases, the durable local worker and bo
 - Model runtime contract with a deterministic mocked adapter and `model_request` / `model_response` trace observability.
 - Typed model tool definitions and tool-call observations for both Chat Completions and Responses-compatible providers. Unknown tools, malformed arguments, duplicate call ids, undeclared tool calls, and oversized arguments fail closed.
 - Real-model responses fail closed: only `stop`/`completed` responses with non-empty string text are accepted; truncated, filtered, tool-call-only, failed, incomplete, missing, or non-text responses raise a sanitized runtime error without persisting the raw provider response.
-- Backward-compatible mocked model profiles inside each workflow Pack plus an optional run-scoped `team-selection-v1` contract. The operator may replace each fixed position's role card and choose only GPT or DeepSeek routes through `openai`, `deepseek`, or `litellm_proxy`; the selection cannot add positions, change the DAG, widen tools, raise runtime limits, or alter Skill bindings.
-- Provider catalog and explicit opt-in OpenAI-compatible adapters for OpenAI, DeepSeek, and an optional LiteLLM Proxy gateway; mock remains the default, while Anthropic and local providers are still skeleton-only.
-- Server-side model routing config that can assign selected agents to `mock`, `openai`, `deepseek`, or `litellm_proxy` without storing API keys in the app.
+- Backward-compatible mocked model profiles inside each workflow Pack plus an optional run-scoped `team-selection-v1` contract. The operator may replace each fixed position's role card and choose only GPT or DeepSeek routes through `openai`, `gpt_relay`, `deepseek`, or `litellm_proxy`; the selection cannot add positions, change the DAG, widen tools, raise runtime limits, or alter Skill bindings.
+- Provider catalog and explicit opt-in OpenAI-compatible adapters for official OpenAI, direct GPT relay, official DeepSeek, and an optional LiteLLM Proxy gateway; their shared HTTP client disables redirects and environment proxies, while mock remains the compatibility path and Anthropic/local providers remain skeleton-only.
+- Server-side model routing config that can assign selected agents to `mock`, `openai`, `gpt_relay`, `deepseek`, or `litellm_proxy` without storing API keys in the app.
 - Single-process workflow runner with deterministic mocked agent execution, dependency-aware ready-set step scheduling, dependency-edge handoffs for DAG packs, explicit dependency lineage on completed DAG attempts, bounded context envelope construction, workflow-level intake/context/skill-route trace events, scoped structural/executor/pack evaluation, named step eval and artifact gate enforcement, ready-batch/ownership conflict checks, conservative opt-in parallel executor dispatch for safe DAG batches, failure trace recording, run/agent-run status updates, local runtime session/job metadata recording for `session` and `acp` steps, and local approval gates.
 - Versioned immutable execution plans that freeze the effective Agent prompt, model route, tools, runtime limits, and Skill ids for an existing Pack or accept a validated Planner/operator DAG. Planner/operator plans may reuse existing roles and permission subsets only, may create `runtime=model` steps only, and require deterministic acceptance criteria for every step.
 - Opt-in bounded Agent Loops with model/tool iteration, step/tool/token/time/conservative-estimated-cost/repetition budgets, untrusted-observation labeling, side-effect approval, and action/observation trace. Existing Pack steps retain one-call behavior unless `agent_loop.enabled=true`.
-- Durable local `RunWorker` plus run coordinator. UI and operator CLI submissions return after persistence, execute outside the initiating HTTP request, maintain a per-run lock heartbeat, and recover interrupted runs from completed step checkpoints on service restart.
+- Durable local `RunWorker` plus run coordinator. UI and operator CLI submissions return after persistence, execute outside the initiating HTTP request, maintain a per-run lock heartbeat, recover interrupted runs from completed step checkpoints, reuse terminal Pack eval evidence idempotently, and retry transient storage failures without converting them into business failures.
 - Mocked Code R&D workflow pack with Clarifier, Architect, Coder, Tester, Reviewer, and Finalizer steps.
 - Mocked Institutional Code R&D workflow pack with GPT as the trusted main thread, DeepSeek V4 Flash long-context reading/review roles, GPT implementation/test executor branches that require local approval before their mocked/model step execution proceeds, GPT final risk review, and GPT final approval.
 - Research workflow pack with Planner, Searcher, Reader, Verifier, Writer, and Reviewer steps. It defaults to mock web search/fetch and can use Tavily or local browser bridge search/fetch only after explicit server-side opt-in.
-- FastAPI endpoints for creating/listing tasks, validating run-scoped teams, reading a Pack team template, starting workflows synchronously or in the local background worker, reading the immutable selected-team receipt, run metadata, trace events, artifacts, workflow pack catalogs, single workflow pack details, model provider skeletons, tool provider status, local Skill Library metadata, skill bindings, and pack agent catalogs; default routes remain mock unless server-side routing or an explicitly confirmed run-scoped team enables real providers. `GET /tasks` and `GET /runs` are bounded to 500 newest records by default and accept validated `limit`/`offset` query parameters up to 1000 records.
+- FastAPI endpoints for creating/listing tasks, validating run-scoped teams, reading a Pack team template, starting workflows synchronously or in the local background worker, reading the immutable selected-team receipt, run metadata, trace events, artifacts, workflow pack catalogs, single workflow pack details, model provider skeletons, tool provider status, local Skill Library metadata, skill bindings, and pack agent catalogs; default routes remain mock unless server-side routing or an explicitly confirmed run-scoped team enables real providers. `GET /tasks` and `GET /runs` are bounded to 500 newest records by default and accept validated `limit`/`offset` parameters up to 1000 records; `GET /runs/summaries` is the plan-free polling surface used by the UI.
 - Conservative Skill Auto-Router that can automatically select relevant read-only local skills for agents from explicit workflow, role, tool-permission, document-file task signals, and high-confidence domain task signals such as security, performance, database, testing, architecture, UI/web, and AI/model work while preserving manual bindings as an override/extension path.
 - FastAPI endpoints for reading full run observability data: aggregated run detail, agent runs, handoffs, eval results, trace events, artifacts, runtime sessions, runtime jobs, and safe queue/lock summaries.
 - FastAPI execution-plan validation/generation and run-quality endpoints. Quality reports verify frozen-plan artifacts, every declared step acceptance result, blocker evals, final content, and artifact hashes instead of treating artifact presence alone as success.
 - Reproducible paired-replicate benchmark evaluation for Single-Agent, current Multi-Agent, role ablations, and model combinations, including quality, token usage, latency, estimated cost, manual rework, contradictions, and indispensable contributions.
 - FastAPI endpoints for local runtime job approval actions: approve, reject, and cancel. These mutate local job/session/run state only; they do not launch external ACP processes.
-- Safe Codex/operator CLI plus a restricted stdio MCP adapter for creating tasks, validating GPT/DeepSeek teams, starting background runs, polling run state, and reading redacted run/team/quality data. Neither surface exposes approval, writeback, arbitrary shell, Git, configuration, dependency installation, or credential tools.
+- Safe Codex/operator CLI plus a restricted stdio MCP adapter for creating tasks, delegating a Codex-authored plan to an all-DeepSeek team, validating GPT/DeepSeek teams, starting background runs, polling run state, and reading redacted run/team/quality data. Neither surface exposes approval, writeback, arbitrary shell, Git, configuration, dependency installation, or credential tools.
 - Same-origin Chinese thin UI for creating tasks, filling Code R&D / Institutional Code R&D / Research examples, selecting each fixed position's role card, GPT/DeepSeek family, provider, model, and reasoning effort for the next run, confirming the actual selected real-provider/fallback routes and real web-search routes before execution, inspecting selected pack details including step phase, dependencies, Main/Subagent coordination role, runtime, session policy, return contract, provider/tool status, local Skill Library bindings, and reading execution chains, local session/job/approval/queue/lock status, eval results, trace events, failure summaries, artifacts, and artifact content through the aggregated run detail contract.
 - Unit tests for health check, OpenAPI availability, model validation, model runtime contract, model routing, JSON serialization, storage round trips, pack schema validation, registry behavior, trace logging, artifact writes, tool gateway behavior, runner success/failure paths, Code R&D pack happy/blocker/gating paths, Institutional Code R&D API path, Research pack happy/blocker/gating paths, API happy/error/isolation paths, and static UI serving.
 
-The compatibility default remains mocked: current workflow Packs use `provider="mock"` when a caller omits `team_selection`. The browser team editor intentionally constructs real GPT/DeepSeek routes and therefore requires the chosen provider to be configured, the server gate `TEAM_AGENT_ALLOW_REAL_MODEL_CALLS=1`, and explicit confirmation for that run. OpenAI, DeepSeek, and LiteLLM Proxy adapters cannot make real calls merely because a model name was selected. Tavily web search/fetch can make real network calls only when `TEAM_AGENT_ALLOW_REAL_WEB_SEARCH=1`, `TEAM_AGENT_WEB_SEARCH_PROVIDER=tavily`, and `TAVILY_API_KEY` are set. Browser search/fetch can make real browser calls only when `TEAM_AGENT_ALLOW_BROWSER_ACCESS=1`, `TEAM_AGENT_BROWSER_PROVIDER=edge|chrome|browser_cdp`, and a compatible local CDP proxy is available. API keys are read from server-side environment variables only; they are not entered in the browser task UI, obvious secret-like task/team content is rejected before SQLite storage, and keys are not written to trace/artifacts. The separate local desktop launcher can save keys to `.env.local`, which is ignored by Git. Anthropic and local model providers are outside the run-scoped team contract.
+The compatibility Pack definitions remain mocked when no routing config or `team_selection` is supplied. Normal desktop startup loads the direct-relay routing config, so GPT positions use `gpt_relay/gpt-5.6-sol` and selected GPT failures can fall back to official `deepseek/deepseek-v4-flash`; `TEAM_AGENT_GPT_ROUTE_MODE=litellm` restores the advanced local proxy path. Every real route still requires a configured provider, `TEAM_AGENT_ALLOW_REAL_MODEL_CALLS=1`, and explicit per-run confirmation. Tavily/browser and credential boundaries are unchanged; keys remain server-side in the ignored `.env.local` and never enter task/team payloads, SQLite, trace, or artifacts.
 
 The runner can dispatch safe explicit-DAG batches in parallel only when the executor explicitly opts in and every ready step has non-conflicting ownership. Parallel work is submitted up to the frozen plan's `max_parallel_steps`; after a branch failure, queued branches are not started, running calls are allowed to settle, and commit/error handling stays in deterministic plan order. `ModelGateway` separately limits concurrent calls per provider through `TEAM_AGENT_PROVIDER_MAX_CONCURRENCY` (default `4`). The in-process `RunWorker` is a durable local execution mechanism, not a distributed queue or external engineering executor. Built-in runtime jobs still do not launch external ACP processes or maintain live background child sessions. Code R&D does not receive general web search by default; only Research uses the web tools.
 
@@ -61,10 +61,10 @@ The worker is intentionally local and single-process:
 - Only validated handoffs from the latest completed attempt of each declared dependency enter downstream context. Every referenced artifact must belong to that attempt and the handoff must include its declared produced artifact. Structural artifact checks, executor-supplied checks, and pack evals use separate trace scopes; a required named executor check must have exactly one `PASS` result.
 - A persisted `waiting` run with an `approved` runtime job is requeued automatically on startup. Retrying a background approval reuses its active queue segment, and retrying an already-completed approval returns the persisted result without advancing a newer job.
 - Retry artifact filenames gain an `attempt-N` suffix, so existing artifact files and records are never overwritten or deleted.
-- A transient storage failure after a run becomes `running` is recovered through the normal interrupted-run checkpoint path; the run and active queue segment return to `queued` together before retry. Missing task/pack configuration atomically terminalizes open runtime state, run state, and queue state.
-- A hard crash during an external model request can repeat that interrupted request after restart. Exactly-once external execution is not guaranteed.
+- A transient storage failure anywhere in the runner persistence/finalization path is recovered through the normal interrupted-run checkpoint path; permanent relationship/constraint failures use a separate integrity error and remain business failures. The run and active queue segment return to `queued` together before retry. Missing task/pack configuration atomically terminalizes open runtime state, run state, and queue state.
+- A hard crash during an external model request can repeat that interrupted request after restart. Exactly-once external execution is not guaranteed, and the current Run schema does not impose a cross-restart redispatch count; repeated process crashes require the operator to stop or reconfigure the service to bound further uncertain calls.
 
-Run locks store a heartbeat every five seconds. Stale-lock recovery prefers the latest valid timezone-aware heartbeat over the original acquisition time, so long-running work is not falsely reclaimed. Transient queue reads, queue-status writes, and terminal lock-release writes are retried; a retried terminal wake-up also releases any orphaned acquired lock before it returns. Unresolved wake-ups stay persisted and terminal run state repairs a stale non-terminal queue item on restart. Background trace failures remain isolated from worker execution.
+Run locks store a heartbeat every five seconds, but elapsed wall time never releases a lock while the process is live. Orphaned locks are released only during startup recovery before new work is accepted, so a delayed heartbeat cannot open a second critical section. Transient queue reads, queue-status writes, and terminal lock-release writes are retried; a retried terminal wake-up also releases any orphaned acquired lock before it returns. Unresolved wake-ups stay persisted and terminal run state repairs a stale non-terminal queue item on restart. Background trace failures remain isolated from worker execution.
 
 Each `WorkflowStep` has a typed `context_policy`:
 
@@ -72,7 +72,7 @@ Each `WorkflowStep` has a typed `context_policy`:
 - `max_artifacts`: maximum completed-attempt artifact refs/texts retained.
 - `max_upstream_handoffs`: maximum structured upstream handoffs retained; schema validation requires it to be at least the number of declared dependencies.
 
-Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step at 100K excerpt characters, 300K encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are streamed through a full hash verification while retaining only the bounded excerpt; tampered artifacts and artifacts or handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. The active local `research-planner` route uses `max_tokens=1000`; every `deepseek-v4-flash` route uses at least `max_tokens=4096` to avoid truncation in long-context search, reading, and verification. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
+Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step at 100K excerpt characters, 300K encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are streamed through a full hash verification while retaining only the bounded excerpt; tampered artifacts and artifacts or handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. The active local `research-planner` route uses `max_tokens=1000`; normal non-smoke `deepseek-v4-flash` requests receive at least 8,000 output tokens to avoid reasoning-heavy truncation. Agent Loop requests keep their computed remaining token/cost cap, and smoke requests keep their explicit tiny bound. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
 
 ## Multimodal Input Contract
 
@@ -272,7 +272,7 @@ $env:TAVILY_API_KEY="..."
 
 When enabled, `Searcher` can call `web_search`, while `Reader` and `Verifier` can call `fetch_page`. `Writer` and `Reviewer` do not directly access the web. Code R&D packs do not receive general web search.
 
-Trace events record only safe summaries such as provider, query hash/length, a validated result limit or fixed invalid marker, public URL origins, result counts, latency, and content length. They do not record raw queries, input URL components, Tavily keys, request headers, full search snippets, or full fetched page bodies. `fetch_page` accepts public `http(s)` URLs only, canonicalizes IDNA hostnames before validation, and rejects localhost, loopback, private, link-local, CGNAT, reserved, transition/embedded non-public addresses, credentialed URLs, and fragments.
+Trace events record only safe summaries such as provider, query hash/length, a validated result limit or fixed invalid marker, public URL origins, result counts, latency, and content length. They do not record raw queries, input URL components, Tavily keys, request headers, full search snippets, or full fetched page bodies. Tavily responses disable redirects/compression and are bounded by bytes, JSON depth/items, and a monotonic body-read budget. `fetch_page` accepts public `http(s)` URLs only, canonicalizes IDNA hostnames before validation, rejects localhost, loopback, private, link-local, CGNAT, reserved, transition/embedded non-public addresses, credentialed URLs, and fragments, and applies its byte bound while reading against one body deadline. DNS and response-header timing still depend on the operating-system/provider transport returning control.
 
 The UI shows `联网工具` provider status and asks for confirmation before running a workflow that has real web tools enabled. That confirmation is durable run authorization, not a one-time availability check: every real `web_search`, `fetch_page`, `browser_search`, and `browser_fetch` call is denied unless the run persisted the confirmation when it was created.
 
@@ -280,7 +280,7 @@ The UI shows `联网工具` provider status and asks for confirmation before run
 
 If you do not want a Tavily key, Research Pack can also use a local browser bridge. This is still explicit opt-in and only affects Research `Searcher`, `Reader`, and `Verifier`.
 
-Chrome mode is the recommended local browser path on Windows. `scripts/start-litellm-harness.ps1` starts the bundled local Chrome CDP proxy when `TEAM_AGENT_BROWSER_PROVIDER=chrome`:
+Chrome mode is the recommended local browser path on Windows. `scripts/start-harness.ps1` starts the bundled local Chrome CDP proxy when `TEAM_AGENT_BROWSER_PROVIDER=chrome`:
 
 ```powershell
 $env:TEAM_AGENT_ALLOW_BROWSER_ACCESS="1"
@@ -405,7 +405,8 @@ This repo includes safe, no-key templates:
 - `config/litellm.config.example.yaml`
 - `config/model-routing.litellm.example.json`
 - `config/roles/code-reviewer.md`
-- `scripts/start-litellm-harness.ps1`
+- `scripts/start-harness.ps1` (canonical entry)
+- `scripts/start-litellm-harness.ps1` (compatibility implementation and advanced-mode entry)
 - `scripts/harness-launcher.ps1`
 - `scripts/create-desktop-shortcut.ps1`
 - `.env.local.example`
@@ -417,7 +418,7 @@ Copy-Item .env.local.example .env.local
 notepad .env.local
 ```
 
-`.env.local` is ignored by Git and is loaded automatically by `scripts/start-litellm-harness.ps1`. Keep real keys only in `.env.local` or process environment variables.
+`.env.local` is ignored by Git and is loaded automatically by `scripts/start-harness.ps1`. Keep real keys only in `.env.local` or process environment variables.
 
 You can also set keys in the current PowerShell session only:
 
@@ -431,7 +432,7 @@ $env:DEEPSEEK_API_KEY="..."
 Then start LiteLLM Proxy and the harness:
 
 ```powershell
-.\scripts\start-litellm-harness.ps1
+.\scripts\start-harness.ps1
 ```
 
 The start script automatically prefers `.venv-litellm\Scripts\python.exe` for LiteLLM and falls back to the main `.venv` only when that dedicated environment is absent. Harness, LiteLLM, and Chrome proxy interpreter selection remain independent. Before creating logs or probing support services, startup verifies any existing Harness listener by process identity; it later requires the same PID and creation time before sending Harness HTTP requests. A new or idle-replacement Harness also requires its selected interpreter to be a file. It validates service-specific health and OpenAPI identity, watches newly started child processes, and fails closed when a port belongs to an unrelated service. This keeps the documented Quick Start working when the main application environment uses Python 3.14, which LiteLLM does not currently support in this project. To create the dedicated environment when needed:
@@ -454,7 +455,7 @@ actions revalidate the project venv command line, base Python executable,
 service entry point, and port before terminating a process; unrelated port
 owners are displayed but never stopped.
 
-The script starts LiteLLM on `http://127.0.0.1:4000` and the harness UI on `http://127.0.0.1:8014/`. The harness routes GPT-family agents through the single LiteLLM alias `gpt5.6-sol`; do not use role-specific GPT aliases such as `gpt-planner`, `gpt-coder`, or `gpt-reviewer` in project routing unless you intentionally reintroduce them. GPT routes use `OPENAI_API_BASE`, so they can point at an OpenAI-compatible relay. Official DeepSeek routes use provider `deepseek` and model `deepseek-v4-flash` for search, reading, and verification. GPT routes generated by the team template carry DeepSeek as an ordered fallback.
+`scripts/start-harness.ps1` starts the Harness UI on `http://127.0.0.1:8014/`. Direct mode is the default: GPT uses `OPENAI_API_BASE` without a local proxy and sends the relay's real model id `gpt-5.6-sol`; LiteLLM does not start and port `4000` remains free. Advanced `litellm` mode starts the existing local proxy and retains its `gpt5.6-sol` alias. Official DeepSeek remains `deepseek/deepseek-v4-flash`, and generated GPT team routes carry DeepSeek as the ordered fallback.
 
 The launcher also sets a bounded real-model failure budget unless you already provided one in the environment: `TEAM_AGENT_MODEL_TIMEOUT_SECONDS=180`, `REQUEST_TIMEOUT=180`, `TEAM_AGENT_LITELLM_PROXY_MAX_ATTEMPTS=1`, and `DEFAULT_MAX_RETRIES=0`. The previous 75-second boundary cut off a healthy GPT step; 180 seconds accommodates observed long responses while still preventing nested retries or an upstream outage from leaving a run indefinitely active. Each LiteLLM request also carries `x-litellm-timeout` so the proxy applies the same timeout per call. Override these values only when you intentionally want a different upstream wait.
 
@@ -462,7 +463,7 @@ The YAML/JSON files intentionally do not contain real keys. Edit model names in 
 
 ### LiteLLM Alias Rules
 
-When `provider` is `litellm_proxy`, each harness agent should use the LiteLLM model alias, not the upstream model id. This project standardizes GPT-family routing on `gpt5.6-sol`. For example, `config/model-routing.local.json` should contain:
+When `provider` is `gpt_relay`, use the relay's real model id `gpt-5.6-sol`. When `provider` is `litellm_proxy`, use its local alias `gpt5.6-sol`. Existing ignored configs using that reviewed LiteLLM alias are mapped in memory for new direct-mode plans without rewriting the file; historical plans are unchanged.
 
 ```json
 {
@@ -642,6 +643,26 @@ python -m venv .venv
 
 ### Current Verification Record
 
+- On 2026-08-22 the three-cycle adversarial hardening checkout passed the full
+  local backend suite with `1360 passed, 5 skipped, 1 warning` in 389.64 seconds
+  without a pseudo-terminal. The warning remains the existing Starlette
+  `TestClient` deprecation. Regression coverage now proves terminal Pack-eval
+  replay, transient/integrity storage classification, live-lock ownership,
+  exact/quarantined history deletion and crash recovery, explicit model retry
+  status, redirect/proxy denial, server-scoped MCP secret filtering, bounded web
+  responses, and plan-free Run polling. A temporary 100-Run mock stress completed
+  100/100 in 137.198 seconds with no failed Run, active queue item, acquired lock,
+  SQLite integrity error, or foreign-key violation. The first instrumented stress
+  probe exceeded 120 seconds under `tracemalloc`; the uninstrumented production
+  path is the accepted result. A 500-Run measurement reduced polling from
+  4,058,001 to 74,001 bytes and median local latency from 0.266 to 0.050 seconds.
+  Playwright proved summary-only active polling, HTTP 200 application requests,
+  zero console warning/error, and no page overflow at desktop or 390px. Compile,
+  Node, PowerShell, JSON, dependency, whitespace, and credential checks passed.
+  The live direct service then reported worker running on 8014,
+  `/runs/summaries` HTTP 200, Chat Completions, and no listener on 4000. Earlier
+  paid direct GPT, official DeepSeek, controlled fallback, and DeepSeek-only
+  Codex delegation evidence remains the model-path verification for this checkout.
 - On 2026-08-21 the current model-routing checkout passed the full local backend
   suite with `1321 passed, 5 skipped, 1 warning` in 398.95 seconds when run
   without a pseudo-terminal. `python -m compileall -q app scripts`, `pip check`,
@@ -653,7 +674,7 @@ python -m venv .venv
   configured routes after capability validation. No paid model call was made in
   this verification.
 - On 2026-08-14 the CI-stabilized code snapshot at commit `5643b69` passed the full local backend suite with `1321 passed, 5 skipped, 1 warning` in 443.24 seconds. The runtime body-read abort target passed 100/100 repetitions, the worker shutdown/backlog target passed 20/20 repetitions, the strict setup ready-state target passed 100/100 repetitions, and the complete startup-script file passed 59 tests. GitHub Actions run `31795016194` then passed Windows Python 3.12, 3.13, and 3.14 with `1325 passed, 1 skipped, 1 warning` per job. These fixes change tests only: they use explicit body-read and worker-completion barriers, retain independent real hang watchdogs, and replace repeated environment-wide `pip check` calls in the setup state-machine test with a fail-closed exact-argv shim. Production worker shutdown, launcher readiness, model routing, and request timeout behavior are unchanged. Compile, both dependency environments, both JavaScript files, all four PowerShell scripts, YAML/JSON, whitespace, and intended-diff credential checks passed. Harness health and UI returned HTTP 200 with the worker running, and LiteLLM liveliness returned HTTP 200. GitHub's Node.js 20 action deprecation annotation remains a separate CI-maintenance item. No real or paid model call was made.
-- On 2026-08-14 the configurable-team, launcher, quality-lineage, and restricted Codex MCP release candidate passed the full local backend suite with `1321 passed, 5 skipped, 1 warning` in 445.21 seconds. The warning remains the existing Starlette `TestClient` deprecation. `python -m compileall -q app scripts`, `pip check` in both project environments, JavaScript syntax for both static scripts, all four tracked PowerShell AST parses, YAML/JSON parsing, `git diff --check`, and high-confidence credential and private-path scans passed. Quality evaluation binds each required artifact and acceptance result to the latest completed attempt, and Pack acceptance evidence must have one matching trace in the correct attempt/scope. The MCP adapter applies one monotonic wall-clock deadline across every HTTP request in a tool call, reads response bodies against the remaining budget, and bounds remembered Run receipts to a 128-entry LRU whose evictions are revalidated from Run/Team/hash lineage. Launcher startup now rejects an unrelated Harness listener before HTTP or support-service effects, fails before those effects when a free port has no interpreter file, and binds the later readiness probe to the initially verified PID and creation time. Harness interpreter overrides do not alter LiteLLM fallback or Chrome proxy runtimes. Launcher saves preserve unrelated `.env.local` fields/comments and protected ACL semantics through same-directory atomic replacement; post-replace ACL failure restores the original content and ACL, while incomplete rollback fails explicitly and retains the recoverable original backup. Service rollback stops the new process before restoring a reconstructable prior Harness, unreconstructable enabled-provider state is reused fail-closed, and active-work inspection returns `unknown` at its 20-Run bound. Task and Run listboxes implement Arrow/Home/End/Enter/Space behavior with roving `tabindex`. A fresh temporary-data Uvicorn process completed a six-step mock Research run through the real stdio MCP process: the fixed 12-tool catalog was present, `harness_list_recent`, `harness_get_quality`, and `harness_get_final_artifact` all passed their Run/hash bindings, quality passed 28 checks, six AgentRun checkpoints and six artifacts were persisted, and no error trace remained. The normal Harness and LiteLLM processes then passed live health/readiness checks on ports `8014` and `4000`. A fresh post-fix isolated Chrome pass covered `1440`, `390`, and `320` pixel layouts, found no page-level horizontal overflow or failed application request, reported zero console warnings/errors, and exercised task selection with Arrow/Enter plus Run selection with End/Space. Narrow navigation and detail-tab rows remained reachable through explicit horizontal scrolling. No real or paid model call was made. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
+- On 2026-08-14 the configurable-team, launcher, quality-lineage, and restricted Codex MCP release candidate passed the full local backend suite with `1321 passed, 5 skipped, 1 warning` in 445.21 seconds. The warning remains the existing Starlette `TestClient` deprecation. `python -m compileall -q app scripts`, `pip check` in both project environments, JavaScript syntax for both static scripts, all four tracked PowerShell AST parses, YAML/JSON parsing, `git diff --check`, and high-confidence credential and private-path scans passed. Quality evaluation binds each required artifact and acceptance result to the latest completed attempt, and Pack acceptance evidence must have one matching trace in the correct attempt/scope. The MCP adapter applies one monotonic wall-clock deadline across every HTTP request in a tool call, reads response bodies against the remaining budget, and bounds remembered Run receipts to a 128-entry LRU whose evictions are revalidated from Run/Team/hash lineage. Launcher startup now rejects an unrelated Harness listener before HTTP or support-service effects, fails before those effects when a free port has no interpreter file, and binds the later readiness probe to the initially verified PID and creation time. Harness interpreter overrides do not alter LiteLLM fallback or Chrome proxy runtimes. Launcher saves preserve unrelated `.env.local` fields/comments and protected ACL semantics through same-directory atomic replacement; post-replace ACL failure restores the original content and ACL, while incomplete rollback fails explicitly and retains the recoverable original backup. Service rollback stops the new process before restoring a reconstructable prior Harness, unreconstructable enabled-provider state is reused fail-closed, and active-work inspection returns `unknown` at its 20-Run bound. Task and Run listboxes implement Arrow/Home/End/Enter/Space behavior with roving `tabindex`. A fresh temporary-data Uvicorn process completed a six-step mock Research run through the real stdio MCP process: the fixed 13-tool catalog was present, `harness_list_recent`, `harness_get_quality`, and `harness_get_final_artifact` all passed their Run/hash bindings, quality passed 28 checks, six AgentRun checkpoints and six artifacts were persisted, and no error trace remained. The normal Harness and LiteLLM processes then passed live health/readiness checks on ports `8014` and `4000`. A fresh post-fix isolated Chrome pass covered `1440`, `390`, and `320` pixel layouts, found no page-level horizontal overflow or failed application request, reported zero console warnings/errors, and exercised task selection with Arrow/Enter plus Run selection with End/Space. Narrow navigation and detail-tab rows remained reachable through explicit horizontal scrolling. No real or paid model call was made. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
 - On 2026-08-10 the configurable-team, desktop-launcher, and restricted Codex MCP increment passed the focused execution-plan, Team Selection, API, and MCP regression set with `220 passed, 1 warning` and the full local backend suite with `1027 passed, 5 skipped, 1 warning`. `python -m compileall -q app scripts`, `pip check`, JavaScript syntax, every tracked PowerShell AST parse, `git diff --check`, and high-confidence credential-exposure scans passed. Browser verification completed default-team and six-position custom GPT/DeepSeek mock runs, confirmed immutable team receipts and passing quality reports, exercised widths `320`, `390`, `768`, `1024`, and `1440` without horizontal overflow or control overlap, preserved focus across provider/model redraws, enforced disabled custom-team controls, and reported no console warning or error. No real or paid model call was made. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
 - On 2026-08-10 the async-worker CI stabilization at commit `d8ce98b` passed the affected-file suite with `69 passed, 1 warning` and the full local backend suite with `823 passed, 5 skipped, 1 warning`. Worker-facing tests now use one shared 60-second test-only observation bound for scheduling, recovery, and terminal-state paths; `background_run_completed` is observed after authoritative queue terminalization and lock release, while deterministic release, join, heartbeat, ordering, and cleanup probes retain narrow bounds. `python -m compileall -q app scripts`, `pip check`, all four tracked PowerShell parse checks, two YAML and three JSON configuration parses, a high-confidence intended-diff credential scan, and `git diff --check` passed. GitHub Actions run `31323576572` passed the Windows Python 3.12, 3.13, and 3.14 matrix with `827 passed, 1 skipped, 1 warning` per job. The test warning remains the existing Starlette `TestClient` deprecation. GitHub also emitted its existing Node.js 20 action deprecation annotation; no CI workflow change was included in this test-only fix. No real or paid model call was made.
 - On 2026-08-07 the final release review passed the full backend suite with `823 passed, 5 skipped, 1 warning`. Fourteen focused adversarial regressions proved pre-dispatch durable provider-attempt evidence, fail-closed trace persistence, partial-usage accounting, local serialization rejection, sensitive-identifier sanitization, the exact built-in adapter trust boundary, and recorder coverage for normal Pack, Agent Loop, vision-sidecar, and Institutional local-code paths. `python -m compileall -q app scripts`, `pip check`, all four tracked PowerShell parse checks, CI/config YAML parsing, and `git diff --check` passed. The warning remains the existing Starlette `TestClient` deprecation. A fresh temporary-data Uvicorn smoke completed all six mock steps with `quality_passed=true`, six AgentRun checkpoints, five handoffs, six artifacts, 18 eval results, and no error trace; the service stopped cleanly and the temporary data was removed. This is local worktree evidence only and does not claim that CI or the remote repository contains these changes.
@@ -694,7 +715,16 @@ Use the safe CLI wrapper when operating from a terminal or from Codex:
 .\.venv\Scripts\python.exe scripts\harness_control.py model-providers
 ```
 
-Before running a full real-model workflow, you can smoke test LiteLLM aliases with tiny requests. This still may call paid external model APIs through LiteLLM, so it requires the same explicit real-model confirmation:
+In direct mode, use the bounded provider smoke endpoint with explicit confirmation. The default request uses `max_tokens=8`; increase it only when the provider's reasoning overhead requires more room:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8014/providers/gpt_relay/smoke `
+  -ContentType application/json `
+  -Body '{"model":"gpt-5.6-sol","confirm_real_models":true,"max_tokens":64}'
+```
+
+The legacy `harness_control.py model-smoke` command remains available for advanced LiteLLM aliases:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\harness_control.py model-smoke `
@@ -770,9 +800,10 @@ codex mcp get team-agent-harness
 
 The adapter binds only to an explicit loopback `http` Harness origin, disables
 HTTP proxies and redirects, and communicates with Codex through strict UTF-8
-newline-delimited JSON-RPC. Its fixed allowlist contains exactly 12 tools:
+newline-delimited JSON-RPC. Its fixed allowlist contains exactly 13 tools:
 `harness_health`, `harness_list_catalog`, `harness_list_recent`,
-`harness_get_team_template`, `harness_create_task`, `harness_validate_team`,
+`harness_get_team_template`, `harness_create_task`, `harness_delegate_plan`,
+`harness_validate_team`,
 `harness_start_run`, `harness_get_run`, `harness_get_run_detail`,
 `harness_get_run_team`, `harness_get_quality`, and
 `harness_get_final_artifact`. Recent-list reads use fixed server-side bounds;
@@ -807,6 +838,8 @@ ignored `.env.local`.
 - `GET /workflow-packs/{pack_name}/team-template`
 - `POST /runs`
 - `GET /runs`
+- `GET /runs/summaries` (plan-free bounded polling records)
+- `DELETE /records/history` (exact terminal snapshot only; files are quarantined before database deletion, while active runs and task definitions are retained)
 - `GET /runs/{run_id}`
 - `GET /runs/{run_id}/team`
 - `GET /runs/{run_id}/detail`
@@ -856,7 +889,7 @@ ignored `.env.local`.
 
 ## Thin UI Surface
 
-- Load backend health, workflow pack catalog, model provider skeleton catalog, agent catalog, tasks, and runs.
+- Load backend health, workflow pack catalog, model provider skeleton catalog, agent catalog, tasks, and plan-free Run summaries; active polling fetches only health/summaries plus the selected Run detail and resolves previously unseen task ids on demand.
 - Inspect selected pack steps, required inputs/artifacts, allowed tools, agent tool permissions, and eval checks through `GET /workflow-packs/{pack_name}` while keeping the workflow pack catalog as the selector source.
 - Inspect manually bound and auto-selected Skill Library routes. Auto-selected skills are shown as read-only prompt guidance and are not saved as manual bindings.
 - Inspect Main/Subagent coordination roles, controller steps, dependency branches, and return contracts for workflow steps.

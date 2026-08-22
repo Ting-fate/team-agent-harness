@@ -53,8 +53,8 @@ def test_team_template_covers_fixed_slots_without_exposing_prompts(tmp_path: Pat
     assert selection["pack_name"] == "code_rd"
     assert {item["slot"] for item in assignments} == {agent["role"] for agent in pack["agents"]}
     assert {item["route"]["family"] for item in assignments} == {"gpt", "deepseek"}
-    assert {item["route"]["provider"] for item in assignments} == {"litellm_proxy", "deepseek"}
-    assert all(item["route"]["model"] in {"gpt5.6-sol", "deepseek-v4-flash"} for item in assignments)
+    assert {item["route"]["provider"] for item in assignments} == {"gpt_relay", "deepseek"}
+    assert all(item["route"]["model"] in {"gpt-5.6-sol", "deepseek-v4-flash"} for item in assignments)
     for item in assignments:
         if item["route"]["family"] == "gpt":
             assert item["route"]["fallbacks"] == [
@@ -85,7 +85,11 @@ def test_validate_and_run_freeze_the_selected_team_and_role_card(tmp_path: Path)
     )
     app = _app(tmp_path)
     app.state.harness.model_gateway = ModelGateway(
-        {"litellm_proxy": MockModelAdapter(), "deepseek": MockModelAdapter()}
+        {
+            "gpt_relay": MockModelAdapter(),
+            "litellm_proxy": MockModelAdapter(),
+            "deepseek": MockModelAdapter(),
+        }
     )
 
     with TestClient(app) as client:
@@ -133,7 +137,11 @@ def test_validate_and_run_freeze_the_selected_team_and_role_card(tmp_path: Path)
 def test_run_team_receipt_uses_frozen_manifest_after_pack_changes(tmp_path: Path) -> None:
     app = _app(tmp_path)
     app.state.harness.model_gateway = ModelGateway(
-        {"litellm_proxy": MockModelAdapter(), "deepseek": MockModelAdapter()}
+        {
+            "gpt_relay": MockModelAdapter(),
+            "litellm_proxy": MockModelAdapter(),
+            "deepseek": MockModelAdapter(),
+        }
     )
 
     with TestClient(app) as client:
@@ -347,7 +355,11 @@ def test_dynamic_subset_plan_preserves_complete_selected_team_receipt(
 ) -> None:
     app = _app(tmp_path)
     app.state.harness.model_gateway = ModelGateway(
-        {"litellm_proxy": MockModelAdapter(), "deepseek": MockModelAdapter()}
+        {
+            "gpt_relay": MockModelAdapter(),
+            "litellm_proxy": MockModelAdapter(),
+            "deepseek": MockModelAdapter(),
+        }
     )
     execution_plan = {
         "schema_version": "execution-plan-v1",

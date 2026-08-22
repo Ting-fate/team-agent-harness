@@ -10,7 +10,7 @@ from math import isfinite
 import os
 import re
 from time import perf_counter, sleep
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Lock
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -31,6 +31,7 @@ from app.core.sensitive_text import contains_secret_like_text
 
 _MAX_MODEL_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_MODEL_DATA_URI_BYTES = 16 * 1024 * 1024
+_DEEPSEEK_MIN_RUN_OUTPUT_TOKENS = 8000
 _DATA_URI_RE = re.compile(
     r"^data:(image/(?:jpeg|png|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$"
 )
@@ -143,6 +144,7 @@ class ModelProviderInfo:
     real_calls_configured: bool
     requires_credentials: bool
     description: str
+    protocol: str = "unknown"
 
 
 class ModelAdapter(Protocol):
@@ -205,6 +207,7 @@ class OpenAICompatibleModelAdapter:
         *,
         provider: str,
         api_key_env: str,
+        api_key_resolver: Callable[[], str | None] | None = None,
         base_url: str | Callable[[], str] | None = None,
         client: Any | None = None,
         allow_real_calls_env: str = "TEAM_AGENT_ALLOW_REAL_MODEL_CALLS",
@@ -215,8 +218,11 @@ class OpenAICompatibleModelAdapter:
     ) -> None:
         self.provider = provider
         self.api_key_env = api_key_env
+        self.api_key_resolver = api_key_resolver
         self.base_url = base_url
         self._client = client
+        self._client_lock = Lock()
+        self._owns_client = False
         self.allow_real_calls_env = allow_real_calls_env
         self.endpoint = endpoint
         self.max_attempts = max(1, max_attempts)
@@ -237,7 +243,7 @@ class OpenAICompatibleModelAdapter:
             )
         started = perf_counter()
         try:
-            client = self._client or self._build_client()
+            client = self._client_for_call()
             timeout_budget = self._request_timeout_seconds(request)
         except _LocalModelRouteRejection:
             raise
@@ -309,8 +315,30 @@ class OpenAICompatibleModelAdapter:
             provider_attempts=provider_attempts,
         )
 
+    def _client_for_call(self) -> Any:
+        if self._client is not None:
+            return self._client
+        with self._client_lock:
+            if self._client is None:
+                self._client = self._build_client()
+                self._owns_client = True
+            return self._client
+
+    def close(self) -> None:
+        with self._client_lock:
+            client = self._client if self._owns_client else None
+            self._client = None
+            self._owns_client = False
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
     def _build_client(self) -> Any:
-        api_key = os.environ.get(self.api_key_env)
+        api_key = (
+            self.api_key_resolver()
+            if self.api_key_resolver is not None
+            else os.environ.get(self.api_key_env)
+        )
         if not api_key:
             raise ModelRuntimeError(
                 f"Model provider is not enabled: {self.provider}. "
@@ -318,18 +346,27 @@ class OpenAICompatibleModelAdapter:
             )
         base_url = self._resolved_base_url()
         try:
-            from openai import OpenAI
+            from openai import DefaultHttpxClient, OpenAI
         except ImportError as exc:
             raise ModelRuntimeError("OpenAI Python SDK is not installed.") from exc
 
         # Keep a single retry owner so the configured timeout is not multiplied by SDK retries.
-        kwargs: dict[str, Any] = {"api_key": api_key, "max_retries": 0}
+        http_client = DefaultHttpxClient(follow_redirects=False, trust_env=False)
+        kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "max_retries": 0,
+            "http_client": http_client,
+        }
         if base_url is not None:
             kwargs["base_url"] = base_url
         timeout_seconds = self._resolved_timeout_seconds()
         if timeout_seconds is not None:
             kwargs["timeout"] = timeout_seconds
-        return OpenAI(**kwargs)
+        try:
+            return OpenAI(**kwargs)
+        except Exception:
+            http_client.close()
+            raise
 
     def _resolved_base_url(self) -> str | None:
         if callable(self.base_url):
@@ -531,6 +568,12 @@ class ModelGateway:
             for provider in self.adapters
         }
 
+    def close(self) -> None:
+        for adapter in self.adapters.values():
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                close()
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         try:
             candidates = route_candidates_from_request(
@@ -633,12 +676,36 @@ class ModelGateway:
                         reason=rejection,
                     )
                 )
+                if len(candidates) > 1 and attempt == 1 and rejection in {
+                    "provider_not_configured",
+                    "provider_not_ready",
+                }:
+                    error_class = (
+                        "ProviderNotConfigured"
+                        if rejection == "provider_not_configured"
+                        else "ProviderNotReady"
+                    )
+                    raise ModelRuntimeError(
+                        "The primary model route is not ready; fallback was not attempted.",
+                        provider=candidate.provider,
+                        model=candidate.model,
+                        error_class=error_class,
+                        error_summary="classification=provider_error;retryable=false",
+                        route_receipt=receipt,
+                    )
                 continue
             candidate_price = self._route_price(candidate)
             candidate_request = replace(
                 request,
                 provider=candidate.provider,
                 model=candidate.model,
+                max_tokens=(
+                    max(request.max_tokens or 0, _DEEPSEEK_MIN_RUN_OUTPUT_TOKENS)
+                    if candidate.provider == "deepseek"
+                    and request.metadata.get("smoke_test") is not True
+                    and request.metadata.get("agent_loop_step") is None
+                    else request.max_tokens
+                ),
                 fallbacks=[],
                 input_usd_per_million=(
                     candidate_price.input_usd_per_million if candidate_price is not None else None
@@ -680,6 +747,11 @@ class ModelGateway:
                 )
             except ModelRuntimeError as exc:
                 retryable = model_error_is_retryable(exc)
+                if (
+                    exc.error_class in {"IncompleteModelResponse", "InvalidModelResponse"}
+                    and attempt < len(candidates)
+                ):
+                    retryable = True
                 local_rejection_reason = (
                     exc.reason if isinstance(exc, _LocalModelRouteRejection) else None
                 )
@@ -1107,7 +1179,8 @@ def model_runtime_error_payload(exc: Exception) -> dict[str, Any]:
 
 
 REAL_MODEL_PROVIDER_API_KEY_ENVS = {
-    "openai": "OPENAI_API_KEY",
+    "openai": "OPENAI_OFFICIAL_API_KEY",
+    "gpt_relay": "OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "litellm_proxy": "LITELLM_API_KEY",
 }
@@ -1122,6 +1195,15 @@ ROUTABLE_MODEL_PROVIDERS = {"mock", *REAL_MODEL_PROVIDERS}
 DEFAULT_REAL_MODEL_REASONING_EFFORT = "xhigh"
 
 
+def model_provider_credentials_configured(provider: str) -> bool:
+    if provider == "openai":
+        return bool(_official_openai_api_key())
+    if provider == "gpt_relay":
+        return bool(os.environ.get("OPENAI_API_KEY")) and bool(os.environ.get("OPENAI_API_BASE"))
+    env_name = REAL_MODEL_PROVIDER_API_KEY_ENVS.get(provider)
+    return bool(env_name and os.environ.get(env_name))
+
+
 def default_reasoning_effort_for_model(provider: str, model: str) -> str | None:
     if provider in REAL_MODEL_PROVIDERS:
         return DEFAULT_REAL_MODEL_REASONING_EFFORT
@@ -1131,7 +1213,18 @@ def default_reasoning_effort_for_model(provider: str, model: str) -> str | None:
 def default_model_adapters() -> dict[str, ModelAdapter]:
     return {
         "mock": MockModelAdapter(),
-        "openai": OpenAICompatibleModelAdapter(provider="openai", api_key_env="OPENAI_API_KEY"),
+        "openai": OpenAICompatibleModelAdapter(
+            provider="openai",
+            api_key_env="OPENAI_OFFICIAL_API_KEY",
+            api_key_resolver=_official_openai_api_key,
+        ),
+        "gpt_relay": OpenAICompatibleModelAdapter(
+            provider="gpt_relay",
+            api_key_env="OPENAI_API_KEY",
+            base_url=_gpt_relay_base_url,
+            endpoint=gpt_relay_protocol(),
+            max_attempts=1,
+        ),
         "anthropic": ProviderStubAdapter("anthropic"),
         "deepseek": OpenAICompatibleModelAdapter(
             provider="deepseek",
@@ -1151,6 +1244,16 @@ def default_model_adapters() -> dict[str, ModelAdapter]:
 
 
 def model_provider_catalog() -> list[ModelProviderInfo]:
+    relay_configured = bool(os.environ.get("OPENAI_API_KEY")) and bool(
+        os.environ.get("OPENAI_API_BASE")
+    )
+    relay_ready = relay_configured
+    if relay_ready:
+        try:
+            _gpt_relay_base_url()
+            gpt_relay_protocol()
+        except ModelRuntimeError:
+            relay_ready = False
     return [
         ModelProviderInfo(
             name="mock",
@@ -1164,14 +1267,35 @@ def model_provider_catalog() -> list[ModelProviderInfo]:
         ModelProviderInfo(
             name="openai",
             adapter="openai_compatible",
-            enabled=_real_model_calls_allowed() and bool(os.environ.get("OPENAI_API_KEY")),
+            enabled=_real_model_calls_allowed() and bool(_official_openai_api_key()),
             real_calls=True,
-            real_calls_configured=bool(os.environ.get("OPENAI_API_KEY")),
+            real_calls_configured=bool(_official_openai_api_key()),
             requires_credentials=True,
             description=(
-                "OpenAI adapter is available only when OPENAI_API_KEY is set, "
+                "Official OpenAI adapter is available when OPENAI_OFFICIAL_API_KEY is set, "
                 "an agent explicitly opts in, and real calls are explicitly enabled."
             ),
+            protocol="responses",
+        ),
+        ModelProviderInfo(
+            name="gpt_relay",
+            adapter=(
+                "openai_compatible_chat"
+                if gpt_relay_protocol() == "chat_completions"
+                else "openai_compatible"
+            ),
+            enabled=(
+                _real_model_calls_allowed()
+                and relay_ready
+            ),
+            real_calls=True,
+            real_calls_configured=relay_configured,
+            requires_credentials=True,
+            description=(
+                "Direct GPT relay adapter uses OPENAI_API_KEY and OPENAI_API_BASE without "
+                "starting the local LiteLLM process."
+            ),
+            protocol=gpt_relay_protocol(),
         ),
         ModelProviderInfo(
             name="anthropic",
@@ -1190,6 +1314,7 @@ def model_provider_catalog() -> list[ModelProviderInfo]:
             real_calls_configured=bool(os.environ.get("DEEPSEEK_API_KEY")),
             requires_credentials=True,
             description="DeepSeek adapter uses the OpenAI-compatible API only when DEEPSEEK_API_KEY is set and an agent explicitly opts in.",
+            protocol="chat_completions",
         ),
         ModelProviderInfo(
             name="litellm_proxy",
@@ -1202,6 +1327,7 @@ def model_provider_catalog() -> list[ModelProviderInfo]:
                 "LiteLLM Proxy adapter uses an OpenAI-compatible gateway at LITELLM_BASE_URL "
                 "and requires LITELLM_API_KEY plus explicit real-call opt-in."
             ),
+            protocol="chat_completions",
         ),
         ModelProviderInfo(
             name="local",
@@ -1839,7 +1965,7 @@ def reasoning_effort_transport(request: ModelRequest) -> ReasoningEffortTranspor
 
 
 def _supports_temperature(request: ModelRequest) -> bool:
-    if request.provider == "litellm_proxy" and _is_litellm_gpt_reasoning_model(request.model):
+    if request.provider in {"gpt_relay", "litellm_proxy"} and _is_litellm_gpt_reasoning_model(request.model):
         return False
     return True
 
@@ -1861,9 +1987,11 @@ def reasoning_effort_trace_payload(request: ModelRequest) -> dict[str, Any]:
 
 
 def _supports_xhigh_reasoning_effort(request: ModelRequest) -> bool:
-    if request.provider != "litellm_proxy":
-        return False
     if not _is_litellm_gpt_reasoning_model(request.model):
+        return False
+    if request.provider == "gpt_relay":
+        return os.environ.get("TEAM_AGENT_GPT_RELAY_XHIGH_PASSTHROUGH") == "1"
+    if request.provider != "litellm_proxy":
         return False
     return os.environ.get("TEAM_AGENT_LITELLM_XHIGH_REASONING_PASSTHROUGH") == "1"
 
@@ -1871,13 +1999,13 @@ def _supports_xhigh_reasoning_effort(request: ModelRequest) -> bool:
 def _supports_openai_reasoning_effort(request: ModelRequest) -> bool:
     if request.provider == "openai":
         return _is_known_openai_reasoning_model(request.model)
-    if request.provider == "litellm_proxy":
+    if request.provider in {"gpt_relay", "litellm_proxy"}:
         return _is_litellm_gpt_reasoning_model(request.model)
     return False
 
 
 def _is_litellm_gpt_reasoning_model(model: str) -> bool:
-    return model.lower().strip() in {"gpt5.5", "gpt5.6-sol"}
+    return model.lower().strip() in {"gpt5.5", "gpt5.6-sol", "gpt-5.5", "gpt-5.6-sol"}
 
 
 def _is_known_openai_reasoning_model(model: str) -> bool:
@@ -2290,10 +2418,8 @@ def _validated_finish_reason(value: Any, *, allow_tool_calls: bool = False) -> s
 
 def _is_transient_model_error(exc: Exception) -> bool:
     status_code = _provider_error_status_code(exc)
-    if status_code in {401, 403}:
-        return False
-    if status_code == 429 or status_code in {408, 500, 502, 503, 504}:
-        return True
+    if status_code is not None:
+        return status_code in {408, 429} or 500 <= status_code <= 599
     text = str(exc).lower()
     transient_markers = (
         "connection error",
@@ -2441,6 +2567,45 @@ def _normalize_model_error_summary(value: str | None) -> str | None:
 
 def _real_model_calls_allowed(env_name: str = "TEAM_AGENT_ALLOW_REAL_MODEL_CALLS") -> bool:
     return os.environ.get(env_name) == "1"
+
+
+def gpt_route_mode() -> str:
+    value = os.environ.get("TEAM_AGENT_GPT_ROUTE_MODE", "direct").strip().lower()
+    if value not in {"direct", "litellm"}:
+        raise ModelRuntimeError("TEAM_AGENT_GPT_ROUTE_MODE must be direct or litellm.")
+    return value
+
+
+def gpt_relay_protocol() -> str:
+    value = os.environ.get("TEAM_AGENT_GPT_RELAY_PROTOCOL", "chat_completions").strip().lower()
+    if value not in {"chat_completions", "responses"}:
+        raise ModelRuntimeError(
+            "TEAM_AGENT_GPT_RELAY_PROTOCOL must be chat_completions or responses."
+        )
+    return value
+
+
+def _official_openai_api_key() -> str | None:
+    explicit = os.environ.get("OPENAI_OFFICIAL_API_KEY")
+    if explicit:
+        return explicit
+    if os.environ.get("OPENAI_API_BASE"):
+        return None
+    return os.environ.get("OPENAI_API_KEY") or None
+
+
+def _gpt_relay_base_url() -> str:
+    value = os.environ.get("OPENAI_API_BASE", "").strip().rstrip("/")
+    parsed = urlparse(value)
+    if not value or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ModelRuntimeError("OPENAI_API_BASE must be an http(s) URL for gpt_relay.")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ModelRuntimeError(
+            "OPENAI_API_BASE must not include credentials, query, or fragment."
+        )
+    if not _is_loopback_host(parsed.hostname or "") and parsed.scheme != "https":
+        raise ModelRuntimeError("Remote GPT relay URLs must use https.")
+    return value
 
 
 def _litellm_base_url() -> str:

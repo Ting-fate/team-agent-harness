@@ -110,6 +110,45 @@ class ApprovalBlockingExecutor(RecordingExecutor):
         )
 
 
+def test_run_coordinator_never_reclaims_stale_lock_during_live_operation(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
+    state = app.state.harness
+    task = state.storage.create_task(
+        Task(
+            id="task-live-stale-lock",
+            title="Preserve live lock ownership",
+            goal="A delayed heartbeat must not permit a second critical section.",
+            workflow_pack="code_rd",
+        )
+    )
+    run = state.storage.create_run(Run(id="run-live-stale-lock", task_id=task.id))
+    stale_at = utc_now().replace(year=2000)
+    active_lock = state.storage.create_run_lock(
+        RunLock(
+            id="live-stale-lock",
+            run_id=run.id,
+            owner="api:first",
+            acquired_at=stale_at,
+            metadata={"heartbeat_at": stale_at.isoformat()},
+        )
+    )
+
+    try:
+        with pytest.raises(run_control.RunCoordinationConflict, match="active lock"):
+            run_control.RunCoordinator(state.storage, state.trace_logger).execute_exclusive(
+                run.id,
+                "second-operation",
+                lambda: pytest.fail("second critical section must not execute"),
+            )
+
+        persisted = state.storage.get_run_lock(active_lock.id)
+        assert persisted is not None
+        assert persisted.status == RunLockStatus.ACQUIRED
+        assert persisted.metadata.get("stale_recovered") is not True
+    finally:
+        state.close()
+
+
 def test_new_run_and_initial_queue_item_are_persisted_atomically(tmp_path, monkeypatch) -> None:
     app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
     state = app.state.harness

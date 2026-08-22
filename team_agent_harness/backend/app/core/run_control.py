@@ -21,7 +21,6 @@ from app.core.trace import TraceLogger
 
 
 T = TypeVar("T")
-RUN_LOCK_STALE_AFTER_SECONDS = 10 * 60
 RUN_LOCK_HEARTBEAT_INTERVAL_SECONDS = 5.0
 RUN_QUEUE_WRITE_ATTEMPTS = 3
 RUN_QUEUE_WRITE_RETRY_SECONDS = 0.01
@@ -265,11 +264,9 @@ class RunCoordinator:
                     metadata={
                         "local_only": True,
                         "scope": "run",
-                        "stale_after_seconds": RUN_LOCK_STALE_AFTER_SECONDS,
                         "heartbeat_at": now.isoformat(),
                     },
                 ),
-                stale_after_seconds=RUN_LOCK_STALE_AFTER_SECONDS,
             )
         except StorageError as exc:
             raise RunCoordinationConflict(str(exc)) from exc

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
@@ -19,6 +20,8 @@ from app.core.model_runtime import (
     OpenAICompatibleModelAdapter,
     ProviderStubAdapter,
     default_model_adapters,
+    gpt_relay_protocol,
+    gpt_route_mode,
     model_provider_catalog,
     model_request_from_agent,
     model_runtime_error_payload,
@@ -212,10 +215,11 @@ def test_model_gateway_uses_selected_fallback_identity_and_prices() -> None:
     assert fallback_requests[0].output_usd_per_million == 20.0
 
 
-def test_model_gateway_skips_known_unready_provider_before_adapter_call(
+def test_model_gateway_fails_closed_for_known_unready_primary_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_OFFICIAL_API_KEY", raising=False)
     monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
     request = ModelRequest(
         provider="openai",
@@ -226,17 +230,19 @@ def test_model_gateway_skips_known_unready_provider_before_adapter_call(
         metadata={"allow_mock_fallback": True},
     )
 
-    response = ModelGateway(
-        {
-            "openai": OpenAICompatibleModelAdapter(provider="openai", api_key_env="OPENAI_API_KEY"),
-            "mock": MockModelAdapter(),
-        }
-    ).complete(request)
+    with pytest.raises(ModelRuntimeError, match="primary model route is not ready") as exc_info:
+        ModelGateway(
+            {
+                "openai": OpenAICompatibleModelAdapter(
+                    provider="openai",
+                    api_key_env="OPENAI_API_KEY",
+                ),
+                "mock": MockModelAdapter(),
+            }
+        ).complete(request)
 
-    assert response.raw_provider == "mock"
-    assert [entry["reason"] for entry in response.route_receipt] == [
-        "provider_not_ready",
-        "selected",
+    assert [entry["reason"] for entry in exc_info.value.route_receipt] == [
+        "provider_not_ready"
     ]
 
 
@@ -272,6 +278,148 @@ def test_model_gateway_does_not_fallback_after_non_retryable_failure() -> None:
 
     assert fallback_calls == []
     assert exc_info.value.route_receipt[0]["reason"] == "non_retryable_error"
+
+
+def test_model_gateway_does_not_fallback_when_primary_credentials_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    fallback_calls: list[ModelRequest] = []
+    fallback = SimpleNamespace(
+        complete=lambda request: fallback_calls.append(request)
+        or ModelResponse(
+            text="unexpected fallback",
+            raw_provider="deepseek",
+            adapter="test",
+            mocked=False,
+        )
+    )
+    request = ModelRequest(
+        provider="gpt_relay",
+        model="gpt-5.6-sol",
+        system_prompt="System",
+        messages=[],
+        fallbacks=[
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "allow_real_calls": True,
+            }
+        ],
+    )
+
+    with pytest.raises(ModelRuntimeError, match="primary model route is not ready") as exc_info:
+        ModelGateway(
+            {
+                "gpt_relay": OpenAICompatibleModelAdapter(
+                    provider="gpt_relay",
+                    api_key_env="OPENAI_API_KEY",
+                ),
+                "deepseek": fallback,
+            }
+        ).complete(request)
+
+    assert fallback_calls == []
+    assert [entry["reason"] for entry in exc_info.value.route_receipt] == [
+        "provider_not_ready"
+    ]
+
+
+def test_model_gateway_falls_back_after_invalid_primary_response() -> None:
+    fallback_calls: list[ModelRequest] = []
+    invalid = SimpleNamespace(
+        complete=lambda _request: ModelResponse(
+            text="invalid",
+            raw_provider="wrong-provider",
+            adapter="test",
+            mocked=False,
+        )
+    )
+    fallback = SimpleNamespace(
+        complete=lambda request: fallback_calls.append(request)
+        or ModelResponse(
+            text="fallback result",
+            raw_provider="deepseek",
+            adapter="test",
+            mocked=False,
+        )
+    )
+    request = ModelRequest(
+        provider="gpt_relay",
+        model="gpt-5.6-sol",
+        system_prompt="System",
+        messages=[],
+        fallbacks=[
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "allow_real_calls": True,
+            }
+        ],
+    )
+
+    response = ModelGateway({"gpt_relay": invalid, "deepseek": fallback}).complete(request)
+
+    assert response.selected_provider == "deepseek"
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0].max_tokens == 8000
+    assert [entry["reason"] for entry in response.route_receipt] == [
+        "retryable_error",
+        "selected",
+    ]
+
+
+def test_model_gateway_applies_deepseek_minimum_only_to_non_smoke_run_requests() -> None:
+    calls: list[ModelRequest] = []
+    adapter = SimpleNamespace(
+        complete=lambda request: calls.append(request)
+        or ModelResponse(
+            text="OK",
+            raw_provider="deepseek",
+            adapter="test",
+            mocked=False,
+        )
+    )
+    gateway = ModelGateway({"deepseek": adapter})
+    base = ModelRequest(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        system_prompt="System",
+        messages=[],
+        max_tokens=64,
+    )
+
+    gateway.complete(base)
+    gateway.complete(replace(base, metadata={"smoke_test": True}))
+
+    assert [request.max_tokens for request in calls] == [8000, 64]
+
+
+def test_model_gateway_preserves_agent_loop_token_budget_for_deepseek() -> None:
+    calls: list[ModelRequest] = []
+    adapter = SimpleNamespace(
+        complete=lambda request: calls.append(request)
+        or ModelResponse(
+            text="bounded result",
+            raw_provider="deepseek",
+            adapter="test",
+            mocked=False,
+        )
+    )
+    request = ModelRequest(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        system_prompt="System",
+        messages=[],
+        max_tokens=37,
+        metadata={"agent_loop_step": 1},
+    )
+
+    ModelGateway({"deepseek": adapter}).complete(request)
+
+    assert calls[0].max_tokens == 37
 
 
 def test_model_gateway_rejects_mock_fallback_without_explicit_opt_in() -> None:
@@ -1112,7 +1260,15 @@ def test_openai_compatible_adapter_builds_client_with_default_timeout(
         api_key_env="OPENAI_API_KEY",
     )._build_client()
 
-    assert fake_openai.calls == [{"api_key": "test-key", "timeout": 180.0, "max_retries": 0}]
+    assert len(fake_openai.calls) == 1
+    captured = fake_openai.calls[0]
+    http_client = captured.pop("http_client")
+    try:
+        assert captured == {"api_key": "test-key", "timeout": 180.0, "max_retries": 0}
+        assert http_client.follow_redirects is False
+        assert http_client.trust_env is False
+    finally:
+        http_client.close()
 
 
 def test_openai_compatible_adapter_builds_client_with_env_timeout(
@@ -1129,7 +1285,15 @@ def test_openai_compatible_adapter_builds_client_with_env_timeout(
         api_key_env="OPENAI_API_KEY",
     )._build_client()
 
-    assert fake_openai.calls == [{"api_key": "test-key", "timeout": 12.5, "max_retries": 0}]
+    assert len(fake_openai.calls) == 1
+    captured = fake_openai.calls[0]
+    http_client = captured.pop("http_client")
+    try:
+        assert captured == {"api_key": "test-key", "timeout": 12.5, "max_retries": 0}
+        assert http_client.follow_redirects is False
+        assert http_client.trust_env is False
+    finally:
+        http_client.close()
 
 
 def test_openai_compatible_adapter_rejects_invalid_timeout(
@@ -1554,6 +1718,73 @@ def test_openai_compatible_adapter_retries_status_code_429_without_error_text_ma
     assert response.provider_attempts[0]["reason"] == "retryable_error"
     assert response.provider_attempts[0]["error_summary"] == (
         "classification=rate_limit_error;status_code=429;retryable=true"
+    )
+
+
+def test_openai_compatible_adapter_does_not_retry_explicit_400_with_timeout_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BadRequestError(RuntimeError):
+        status_code = 400
+
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    fake_client = FlakyChatCompatibleClient(
+        failures=[BadRequestError("invalid request: timeout parameter unsupported")]
+    )
+
+    with pytest.raises(ModelRuntimeError) as exc_info:
+        OpenAICompatibleModelAdapter(
+            provider="gpt_relay",
+            api_key_env="OPENAI_API_KEY",
+            client=fake_client,
+            endpoint="chat_completions",
+            max_attempts=3,
+            retry_delay_seconds=0,
+        ).complete(
+            ModelRequest(
+                provider="gpt_relay",
+                model="gpt-5.6-sol",
+                system_prompt="System",
+                messages=[],
+            )
+        )
+
+    assert len(fake_client.chat.completions.calls) == 1
+    assert exc_info.value.error_summary == (
+        "classification=provider_error;status_code=400;retryable=false"
+    )
+
+
+def test_openai_compatible_adapter_retries_all_explicit_5xx_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NotImplementedUpstreamError(RuntimeError):
+        status_code = 501
+
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    fake_client = FlakyChatCompatibleClient(
+        failures=[NotImplementedUpstreamError("request rejected")]
+    )
+
+    response = OpenAICompatibleModelAdapter(
+        provider="gpt_relay",
+        api_key_env="OPENAI_API_KEY",
+        client=fake_client,
+        endpoint="chat_completions",
+        max_attempts=2,
+        retry_delay_seconds=0,
+    ).complete(
+        ModelRequest(
+            provider="gpt_relay",
+            model="gpt-5.6-sol",
+            system_prompt="System",
+            messages=[],
+        )
+    )
+
+    assert len(fake_client.chat.completions.calls) == 2
+    assert response.provider_attempts[0]["error_summary"] == (
+        "classification=upstream_service_error;status_code=501;retryable=true"
     )
 
 
@@ -2041,14 +2272,20 @@ def test_litellm_base_url_allows_trusted_remote_hosts_with_explicit_opt_in(
 
     response = ModelGateway().complete(request)
 
-    assert calls == [
-        {
+    assert len(calls) == 1
+    captured = calls[0]
+    http_client = captured.pop("http_client")
+    try:
+        assert captured == {
             "api_key": "test-key",
             "base_url": "https://proxy.example/v1",
             "timeout": 180.0,
             "max_retries": 0,
         }
-    ]
+        assert http_client.follow_redirects is False
+        assert http_client.trust_env is False
+    finally:
+        http_client.close()
     assert response.raw_provider == "litellm_proxy"
     assert response.mocked is False
 
@@ -2090,17 +2327,29 @@ def test_openai_compatible_adapter_requires_explicit_real_call_opt_in(monkeypatc
 def test_model_provider_catalog_marks_provider_key_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+    monkeypatch.delenv("OPENAI_OFFICIAL_API_KEY", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setenv("LITELLM_API_KEY", "litellm-key")
 
     providers = {provider.name: provider for provider in model_provider_catalog()}
 
-    assert set(providers) == {"mock", "openai", "anthropic", "deepseek", "litellm_proxy", "local"}
+    assert set(providers) == {
+        "mock",
+        "openai",
+        "gpt_relay",
+        "anthropic",
+        "deepseek",
+        "litellm_proxy",
+        "local",
+    }
     assert providers["mock"].enabled is True
     assert providers["mock"].real_calls is False
     assert providers["openai"].enabled is False
     assert providers["openai"].real_calls is True
     assert providers["openai"].real_calls_configured is False
+    assert providers["gpt_relay"].enabled is False
+    assert providers["gpt_relay"].real_calls_configured is False
     assert providers["deepseek"].enabled is False
     assert providers["deepseek"].real_calls is True
     assert providers["deepseek"].real_calls_configured is True
@@ -2115,6 +2364,93 @@ def test_model_provider_catalog_marks_provider_key_configuration(monkeypatch: py
     providers = {provider.name: provider for provider in model_provider_catalog()}
     assert providers["deepseek"].enabled is True
     assert providers["litellm_proxy"].enabled is True
+
+
+def test_gpt_relay_defaults_to_direct_chat_and_uses_existing_relay_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TEAM_AGENT_GPT_ROUTE_MODE", raising=False)
+    monkeypatch.delenv("TEAM_AGENT_GPT_RELAY_PROTOCOL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "relay-key")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://relay.example.test/v1/")
+    monkeypatch.delenv("OPENAI_OFFICIAL_API_KEY", raising=False)
+
+    adapters = default_model_adapters()
+    relay = adapters["gpt_relay"]
+    providers = {provider.name: provider for provider in model_provider_catalog()}
+
+    assert gpt_route_mode() == "direct"
+    assert gpt_relay_protocol() == "chat_completions"
+    assert isinstance(relay, OpenAICompatibleModelAdapter)
+    assert relay.endpoint == "chat_completions"
+    assert relay._resolved_base_url() == "https://relay.example.test/v1"
+    assert providers["gpt_relay"].real_calls_configured is True
+    assert providers["gpt_relay"].protocol == "chat_completions"
+    assert providers["openai"].real_calls_configured is False
+
+
+def test_gpt_relay_supports_explicit_responses_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEAM_AGENT_GPT_RELAY_PROTOCOL", "responses")
+    monkeypatch.setenv("OPENAI_API_KEY", "relay-key")
+    monkeypatch.setenv("OPENAI_API_BASE", "https://relay.example.test/v1")
+
+    relay = default_model_adapters()["gpt_relay"]
+
+    assert isinstance(relay, OpenAICompatibleModelAdapter)
+    assert relay.endpoint == "responses"
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("TEAM_AGENT_GPT_ROUTE_MODE", "unknown", "must be direct or litellm"),
+        ("TEAM_AGENT_GPT_RELAY_PROTOCOL", "auto", "must be chat_completions or responses"),
+    ],
+)
+def test_gpt_relay_rejects_invalid_mode_or_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+    message: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ModelRuntimeError, match=message):
+        if name == "TEAM_AGENT_GPT_ROUTE_MODE":
+            gpt_route_mode()
+        else:
+            default_model_adapters()
+
+
+def test_gpt_relay_rejects_insecure_remote_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "relay-key")
+    monkeypatch.setenv("OPENAI_API_BASE", "http://relay.example.test/v1")
+    relay = default_model_adapters()["gpt_relay"]
+    assert isinstance(relay, OpenAICompatibleModelAdapter)
+
+    with pytest.raises(ModelRuntimeError, match="must use https"):
+        relay._resolved_base_url()
+
+
+def test_gpt_relay_maps_xhigh_to_high_unless_passthrough_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = ModelRequest(
+        provider="gpt_relay",
+        model="gpt-5.6-sol",
+        system_prompt="System",
+        messages=[ModelMessage(role="user", content="Hello")],
+        reasoning_effort="xhigh",
+    )
+
+    transport = reasoning_effort_transport(request)
+    assert transport.sent_reasoning_effort == "high"
+    assert transport.reasoning_effort_mapping == "xhigh->high"
+
+    monkeypatch.setenv("TEAM_AGENT_GPT_RELAY_XHIGH_PASSTHROUGH", "1")
+    passthrough = reasoning_effort_transport(request)
+    assert passthrough.sent_reasoning_effort == "xhigh"
+    assert passthrough.reasoning_effort_mapping is None
 
 
 def test_model_request_from_agent_uses_agent_model_config_and_context_metadata() -> None:

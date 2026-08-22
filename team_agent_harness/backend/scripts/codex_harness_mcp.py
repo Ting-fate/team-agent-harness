@@ -45,6 +45,13 @@ STDIO_ENCODING_ERROR_EXIT_CODE = 3
 
 REAL_MODELS_CAPABILITY_ENV = "TEAM_AGENT_CODEX_ALLOW_REAL_MODELS"
 REAL_WEB_CAPABILITY_ENV = "TEAM_AGENT_CODEX_ALLOW_REAL_WEB"
+_SERVER_SECRET_ENV_NAMES = (
+    "LITELLM_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_OFFICIAL_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "TAVILY_API_KEY",
+)
 
 JSONRPC_PARSE_ERROR = -32700
 JSONRPC_INVALID_REQUEST = -32600
@@ -88,7 +95,7 @@ _ARTIFACT_TYPES = frozenset(
 _ARTIFACT_VALIDATION_STATUSES = frozenset({"unvalidated", "pass", "warn", "fail"})
 _EVAL_STATUSES = frozenset({"pass", "warn", "fail"})
 _TEAM_MODEL_FAMILIES = frozenset({"gpt", "deepseek"})
-_TEAM_MODEL_PROVIDERS = frozenset({"openai", "deepseek", "litellm_proxy"})
+_TEAM_MODEL_PROVIDERS = frozenset({"openai", "gpt_relay", "deepseek", "litellm_proxy"})
 _REAL_WEB_TOOL_NAMES = frozenset(
     {"web_search", "fetch_page", "browser_search", "browser_fetch"}
 )
@@ -1699,7 +1706,7 @@ def _route_schema() -> dict[str, Any]:
         "required": ["family", "provider", "model"],
         "properties": {
             "family": {"type": "string", "enum": ["gpt", "deepseek"]},
-            "provider": {"type": "string", "enum": ["openai", "deepseek", "litellm_proxy"]},
+            "provider": {"type": "string", "enum": ["openai", "gpt_relay", "deepseek", "litellm_proxy"]},
             "model": {"type": "string", "minLength": 1, "maxLength": 200},
         },
     }
@@ -1709,7 +1716,7 @@ def _route_schema() -> dict[str, Any]:
         "required": ["family", "provider", "model"],
         "properties": {
             "family": {"type": "string", "enum": ["gpt", "deepseek"]},
-            "provider": {"type": "string", "enum": ["openai", "deepseek", "litellm_proxy"]},
+            "provider": {"type": "string", "enum": ["openai", "gpt_relay", "deepseek", "litellm_proxy"]},
             "model": {"type": "string", "minLength": 1, "maxLength": 200},
             "reasoning_effort": {
                 "type": ["string", "null"],
@@ -1812,6 +1819,39 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "harness_delegate_plan",
+            "description": (
+                "Create a Codex-authored plan in the Harness and optionally start it with a "
+                "DeepSeek-only team. No GPT fallback is added; use the run and final-artifact "
+                "tools to collect the result."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "goal", "workflow_pack", "plan"],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "goal": {"type": "string", "minLength": 1, "maxLength": 50000},
+                    "workflow_pack": {"type": "string", "minLength": 1, "maxLength": 100},
+                    "plan": {"type": "string", "minLength": 1, "maxLength": 50000},
+                    "inputs": {"type": "object", "maxProperties": 128},
+                    "constraints": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 5000},
+                    },
+                    "acceptance_criteria": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 5000},
+                    },
+                    "start_run": {"type": "boolean", "default": False},
+                    "confirm_real_models": {"type": "boolean", "default": False},
+                    "confirm_real_web": {"type": "boolean", "default": False},
+                },
+            },
+        },
+        {
             "name": "harness_validate_team",
             "description": "Validate a bounded GPT/DeepSeek Agent selection without starting a run.",
             "inputSchema": _team_selection_schema(),
@@ -1903,7 +1943,11 @@ class McpServer:
         except ToolInputError as exc:
             if not has_id:
                 return None
-            return _jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, _redact_error_text(str(exc)))
+            return _jsonrpc_error(
+                request_id,
+                JSONRPC_INVALID_PARAMS,
+                _redact_error_text(str(exc), self.environ),
+            )
         except Exception:
             if not has_id:
                 return None
@@ -1970,9 +2014,9 @@ class McpServer:
                     result = self._dispatch_tool(name, arguments)
             else:
                 result = self._dispatch_tool(name, arguments)
-            return _tool_result(result)
+            return _tool_result(result, self.environ)
         except (HarnessMcpError, ValueError) as exc:
-            return _tool_error(_redact_error_text(str(exc)))
+            return _tool_error(_redact_error_text(str(exc), self.environ))
         except Exception:
             return _tool_error("Harness tool failed safely.")
 
@@ -2000,6 +2044,8 @@ class McpServer:
             return self.client.get(f"/workflow-packs/{quote(pack_name, safe='')}/team-template")
         if name == "harness_create_task":
             return self.client.post("/tasks", _validated_task_payload(arguments))
+        if name == "harness_delegate_plan":
+            return self._delegate_plan(arguments)
         if name == "harness_validate_team":
             return self.client.post("/team-selections/validate", _validated_team_selection(arguments))
         if name == "harness_start_run":
@@ -2237,6 +2283,85 @@ class McpServer:
         )
         return run
 
+    def _delegate_plan(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        task_payload = _validated_delegation_payload(arguments)
+        if task_payload["start_run"] and not task_payload["confirm_real_models"]:
+            raise ToolInputError(
+                "start_run=true requires confirm_real_models=true because the delegated team is real DeepSeek."
+            )
+        if task_payload["start_run"] and self.environ.get(REAL_MODELS_CAPABILITY_ENV) != "1":
+            raise ToolInputError(
+                f"Real-model delegation is disabled for this MCP server; enable {REAL_MODELS_CAPABILITY_ENV}=1."
+            )
+        if task_payload["start_run"] and task_payload["confirm_real_web"] and self.environ.get(REAL_WEB_CAPABILITY_ENV) != "1":
+            raise ToolInputError(
+                f"Real-web delegation is disabled for this MCP server; enable {REAL_WEB_CAPABILITY_ENV}=1."
+            )
+        task_request_payload = {
+            key: task_payload[key]
+            for key in ("title", "goal", "workflow_pack", "inputs", "constraints", "acceptance_criteria", "created_by")
+        }
+        pack_name = task_payload["workflow_pack"]
+        template_path = f"/workflow-packs/{quote(pack_name, safe='')}/team-template"
+        template = self._validated_client_get(template_path)
+        slots = template.get("slots")
+        if not isinstance(slots, list) or not slots:
+            raise HarnessApiError("The selected workflow has no usable Agent slots.")
+        deepseek_selection = {
+            "version": "team-selection-v1",
+            "pack_name": pack_name,
+            "assignments": [
+                {
+                    "slot": _validated_team_assignment_string(slot.get("slot"), "slot"),
+                    "route": {
+                        "family": "deepseek",
+                        "provider": "deepseek",
+                        "model": "deepseek-v4-flash",
+                        "reasoning_effort": "xhigh",
+                        "fallbacks": [],
+                    },
+                }
+                for slot in slots
+                if isinstance(slot, dict)
+            ],
+        }
+        deepseek_selection = _validated_team_selection(deepseek_selection)
+        validation_path = "/team-selections/validate"
+        validation = _validate_and_project_http_response(
+            _http_response_contract("POST", validation_path),
+            validation_path,
+            deepseek_selection,
+            self.client.post(validation_path, deepseek_selection),
+        )
+        task = _validate_and_project_http_response(
+            _http_response_contract("POST", "/tasks"),
+            "/tasks",
+            task_request_payload,
+            self.client.post("/tasks", task_request_payload),
+        )
+        result: dict[str, Any] = {
+            "delegation": "codex_to_deepseek",
+            "task": task,
+            "team_selection": validation["team_selection"],
+            "execution_plan_hash": validation["public_execution_plan_hash"],
+            "started": False,
+            "run": None,
+            "route_policy": "deepseek_only_no_gpt_fallback",
+        }
+        if not task_payload["start_run"]:
+            return result
+        run = self._start_run(
+            {
+                "task_id": task["id"],
+                "confirm_real_models": True,
+                "confirm_real_web": task_payload["confirm_real_web"],
+                "team_selection": deepseek_selection,
+            }
+        )
+        result["started"] = True
+        result["run"] = run
+        return result
+
     def _validate_known_run_response(
         self,
         path: str,
@@ -2344,6 +2469,52 @@ def _validated_task_payload(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validated_delegation_payload(arguments: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "title",
+        "goal",
+        "workflow_pack",
+        "plan",
+        "inputs",
+        "constraints",
+        "acceptance_criteria",
+        "start_run",
+        "confirm_real_models",
+        "confirm_real_web",
+    }
+    _require_exact_keys(arguments, allowed, "harness_delegate_plan arguments")
+    for required in ("title", "goal", "workflow_pack", "plan"):
+        if required not in arguments:
+            raise ToolInputError(f"Missing required field: {required}.")
+    plan = _bounded_string(arguments["plan"], "plan", 50_000)
+    inputs = arguments.get("inputs", {})
+    if not isinstance(inputs, dict):
+        raise ToolInputError("inputs must be an object.")
+    if "codex_plan" in inputs or "codex_plan_hash" in inputs or "codex_plan_source" in inputs:
+        raise ToolInputError("inputs may not override the Codex plan metadata.")
+    _validate_json_shape(inputs)
+    delegated_inputs = {
+        **inputs,
+        "codex_plan": plan,
+        "codex_plan_source": "codex_mcp",
+        "codex_plan_hash": sha256(plan.encode("utf-8")).hexdigest(),
+    }
+    return {
+        "title": _bounded_string(arguments["title"], "title", 500),
+        "goal": _bounded_string(arguments["goal"], "goal", 50_000),
+        "workflow_pack": _validated_identifier(arguments["workflow_pack"], "workflow_pack", 100),
+        "inputs": delegated_inputs,
+        "constraints": _string_list(arguments.get("constraints", []), "constraints", 64, 5000),
+        "acceptance_criteria": _string_list(
+            arguments.get("acceptance_criteria", []), "acceptance_criteria", 64, 5000
+        ),
+        "created_by": "codex_mcp",
+        "start_run": _optional_boolean(arguments, "start_run", False),
+        "confirm_real_models": _optional_boolean(arguments, "confirm_real_models", False),
+        "confirm_real_web": _optional_boolean(arguments, "confirm_real_web", False),
+    }
+
+
 def _validated_team_selection(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ToolInputError("team selection must be an object.")
@@ -2397,7 +2568,7 @@ def _validated_route(value: Any, assignment_index: int) -> dict[str, Any]:
     provider = value["provider"]
     if family not in {"gpt", "deepseek"}:
         raise ToolInputError("route family must be gpt or deepseek.")
-    if provider not in {"openai", "deepseek", "litellm_proxy"}:
+    if provider not in {"openai", "gpt_relay", "deepseek", "litellm_proxy"}:
         raise ToolInputError("route provider is not allowed.")
     _validate_family_provider_model(family, provider, value["model"], "route")
     route: dict[str, Any] = {
@@ -2440,7 +2611,7 @@ def _validated_fallbacks(value: Any) -> list[dict[str, Any]]:
         provider = fallback["provider"]
         if family not in {"gpt", "deepseek"}:
             raise ToolInputError("fallback family must be gpt or deepseek.")
-        if provider not in {"openai", "deepseek", "litellm_proxy"}:
+        if provider not in {"openai", "gpt_relay", "deepseek", "litellm_proxy"}:
             raise ToolInputError("fallback provider is not allowed.")
         model = _bounded_string(fallback["model"], f"route.fallbacks[{index}].model", 200)
         _validate_family_provider_model(family, provider, model, f"route.fallbacks[{index}]")
@@ -2455,8 +2626,8 @@ def _validated_fallbacks(value: Any) -> list[dict[str, Any]]:
 
 def _validate_family_provider_model(family: str, provider: str, model: Any, field: str) -> None:
     model_name = _bounded_string(model, f"{field}.model", 200)
-    if provider == "openai" and (family != "gpt" or not model_name.startswith("gpt")):
-        raise ToolInputError(f"{field} direct openai routes require a gpt family/model.")
+    if provider in {"openai", "gpt_relay"} and (family != "gpt" or not model_name.startswith("gpt")):
+        raise ToolInputError(f"{field} direct GPT routes require a gpt family/model.")
     if provider == "deepseek" and (family != "deepseek" or not model_name.startswith("deepseek-")):
         raise ToolInputError(f"{field} direct deepseek routes require a deepseek family/model.")
 
@@ -2566,8 +2737,11 @@ def _validated_request_id(value: Any) -> str | int | None:
     raise _JsonRpcFailure(JSONRPC_INVALID_REQUEST, "Invalid JSON-RPC id.")
 
 
-def _tool_result(payload: Any) -> dict[str, Any]:
-    _reject_sensitive_tool_result(payload)
+def _tool_result(
+    payload: Any,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    _reject_sensitive_tool_result(payload, environ)
     try:
         text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError, RecursionError) as exc:
@@ -2577,13 +2751,16 @@ def _tool_result(payload: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
 
-def _reject_sensitive_tool_result(value: Any) -> None:
+def _reject_sensitive_tool_result(
+    value: Any,
+    environ: Mapping[str, str] | None = None,
+) -> None:
     stack = [value]
     visited: set[int] = set()
     while stack:
         item = stack.pop()
         if isinstance(item, str):
-            if _contains_secret_like_text(item):
+            if _contains_secret_like_text(item, environ):
                 raise HarnessMcpError("Harness API returned sensitive-looking data; result was blocked.")
             continue
         if type(item) not in {dict, list}:
@@ -2601,7 +2778,7 @@ def _reject_sensitive_tool_result(value: Any) -> None:
                     _is_sensitive_field_name(key)
                     and not _is_safe_operational_field(key, child)
                 )
-                or _contains_secret_like_text(key)
+                or _contains_secret_like_text(key, environ)
             ):
                 raise HarnessMcpError("Harness API returned sensitive-looking data; result was blocked.")
             stack.append(child)
@@ -2621,10 +2798,14 @@ def _is_safe_operational_field(name: str, value: Any) -> bool:
     return False
 
 
-def _contains_secret_like_text(value: str) -> bool:
-    for env_name in ("LITELLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
-        secret = os.environ.get(env_name)
-        if secret and len(secret) >= 4 and secret in value:
+def _contains_secret_like_text(
+    value: str,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    source = os.environ if environ is None else environ
+    for env_name in _SERVER_SECRET_ENV_NAMES:
+        secret = source.get(env_name)
+        if secret and secret in value:
             return True
     return any(pattern.search(value) for pattern in _SECRET_VALUE_PATTERNS)
 
@@ -2641,11 +2822,15 @@ def _jsonrpc_error(request_id: str | int | None, code: int, message: str) -> dic
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def _redact_error_text(text: str) -> str:
+def _redact_error_text(
+    text: str,
+    environ: Mapping[str, str] | None = None,
+) -> str:
     redacted = str(text)
-    for env_name in ("LITELLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
-        secret = os.environ.get(env_name)
-        if secret and len(secret) >= 4:
+    source = os.environ if environ is None else environ
+    for env_name in _SERVER_SECRET_ENV_NAMES:
+        secret = source.get(env_name)
+        if secret:
             redacted = redacted.replace(secret, "[REDACTED]")
     for pattern in _SECRET_PATTERNS:
         if "PRIVATE KEY" in pattern.pattern:

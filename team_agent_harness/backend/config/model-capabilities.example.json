@@ -17,6 +17,22 @@
       "schema_version": 1
     },
     {
+      "provider": "gpt_relay",
+      "model_pattern": "gpt-5.6-sol",
+      "protocol": "configurable_openai_compatible",
+      "model_family": "gpt",
+      "supports_tools": true,
+      "supports_streaming": true,
+      "supports_vision": true,
+      "supports_reasoning": true,
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "input_price": null,
+      "output_price": null,
+      "supports_web_sidecar": true,
+      "schema_version": 1
+    },
+    {
       "provider": "deepseek",
       "model_pattern": "deepseek-*",
       "protocol": "chat_completions",

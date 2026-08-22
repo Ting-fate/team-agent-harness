@@ -34,11 +34,12 @@ from app.core.models import (
     RuntimeJob,
     RuntimeJobStatus,
     Task,
+    TraceEvent,
     TraceEventType,
 )
 from app.core.registry import AgentRegistry
 from app.core.sensitive_text import redact_secret_like_text
-from app.core.storage import SQLiteStorage
+from app.core.storage import SQLiteStorage, StorageError, StorageIntegrityError
 from app.core.task_intake import analyze_task_intake
 from app.core.trace import TraceLogger
 from app.packs.base import EvalCheck, StepAcceptanceCriterion, WorkflowPack, WorkflowStep
@@ -604,6 +605,8 @@ class WorkflowRunner:
             self.storage.update_run(final_run)
             return final_run
         except Exception as exc:
+            if isinstance(exc, StorageError) and not isinstance(exc, StorageIntegrityError):
+                raise
             failed_run = self._fail_run(
                 active_run,
                 current_agent_run,
@@ -2119,26 +2122,95 @@ class WorkflowRunner:
         *,
         scope: str = "system",
     ) -> EvalResult:
-        result = self.storage.create_eval_result(
-            EvalResult(
-                run_id=run.id,
-                artifact_id=artifact_id,
+        if scope == "pack" and agent_run is not None:
+            existing = self._bound_pack_eval_result(
+                run,
+                agent_run,
                 check_name=check_name,
                 status=status,
                 message=message,
+                artifact_id=artifact_id,
             )
-        )
-        self.trace_logger.record(
-            run_id=run.id,
-            agent_run_id=agent_run.id if agent_run is not None else None,
-            event_type=TraceEventType.EVAL_RESULT,
-            payload={
-                "eval_result_id": result.id,
-                "check_name": result.check_name,
-                "status": result.status.value,
-                "scope": scope,
-            },
-        )
+            if existing is not None:
+                return existing
+        with self.storage.transaction():
+            result = self.storage.create_eval_result(
+                EvalResult(
+                    run_id=run.id,
+                    artifact_id=artifact_id,
+                    check_name=check_name,
+                    status=status,
+                    message=message,
+                )
+            )
+            self.trace_logger.record(
+                run_id=run.id,
+                agent_run_id=agent_run.id if agent_run is not None else None,
+                event_type=TraceEventType.EVAL_RESULT,
+                payload={
+                    "eval_result_id": result.id,
+                    "check_name": result.check_name,
+                    "status": result.status.value,
+                    "scope": scope,
+                },
+            )
+        return result
+
+    def _bound_pack_eval_result(
+        self,
+        run: Run,
+        agent_run: AgentRun,
+        *,
+        check_name: str,
+        status: EvalStatus,
+        message: str,
+        artifact_id: str | None,
+    ) -> EvalResult | None:
+        results_by_id = {
+            result.id: result
+            for result in self.storage.list_eval_results_for_run(run.id)
+            if result.check_name == check_name
+        }
+        bindings: dict[str, list[TraceEvent]] = {}
+        all_binding_counts: dict[str, int] = {}
+        for event in self.storage.list_trace_events_for_run(run.id):
+            if event.event_type == TraceEventType.EVAL_RESULT:
+                bound_result_id = event.payload.get("eval_result_id")
+                if isinstance(bound_result_id, str) and bound_result_id in results_by_id:
+                    all_binding_counts[bound_result_id] = all_binding_counts.get(bound_result_id, 0) + 1
+            if (
+                event.event_type != TraceEventType.EVAL_RESULT
+                or event.agent_run_id != agent_run.id
+                or event.payload.get("scope") != "pack"
+                or event.payload.get("check_name") != check_name
+            ):
+                continue
+            result_id = event.payload.get("eval_result_id")
+            if isinstance(result_id, str) and result_id in results_by_id:
+                bindings.setdefault(result_id, []).append(event)
+        unbound_result_ids = sorted(set(results_by_id) - set(all_binding_counts))
+        if unbound_result_ids:
+            raise WorkflowRunnerError(
+                f"Pack evaluation evidence has an unbound durable result: {check_name}"
+            )
+        if not bindings:
+            return None
+        if len(bindings) != 1 or any(len(events) != 1 for events in bindings.values()):
+            raise WorkflowRunnerError(
+                f"Pack evaluation evidence is ambiguous for terminal attempt: {check_name}"
+            )
+        result_id, events = next(iter(bindings.items()))
+        result = results_by_id[result_id]
+        event = events[0]
+        if (
+            result.status != status
+            or result.message != message
+            or result.artifact_id != artifact_id
+            or event.payload.get("status") != result.status.value
+        ):
+            raise WorkflowRunnerError(
+                f"Pack evaluation evidence conflicts with the recovered result: {check_name}"
+            )
         return result
 
     def _record_model_runtime_trace(

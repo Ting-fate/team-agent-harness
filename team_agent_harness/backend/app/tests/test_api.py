@@ -4,6 +4,7 @@ import json
 import pytest
 from types import SimpleNamespace
 
+from app.core import artifacts as artifacts_module
 from app.core.models import (
     AgentDefinition,
     AgentSession,
@@ -224,13 +225,207 @@ def test_run_endpoints_preserve_the_same_serialized_run_contract(tmp_path) -> No
 
         created = client.post("/runs", json={"task_id": task["id"]}).json()
         listed = client.get("/runs", params={"limit": 1}).json()[0]
+        summarized = client.get("/runs/summaries", params={"limit": 1}).json()[0]
         fetched = client.get(f"/runs/{created['id']}").json()
         detailed = client.get(f"/runs/{created['id']}/detail").json()["run"]
 
     assert created["real_web_access_confirmed"] is False
     assert listed == created
+    assert summarized == {
+        "id": created["id"],
+        "task_id": created["task_id"],
+        "status": created["status"],
+        "current_step": created["current_step"],
+        "started_at": created["started_at"],
+        "finished_at": created["finished_at"],
+        "final_artifact_id": created["final_artifact_id"],
+    }
+    assert "execution_plan" not in summarized
     assert fetched == created
     assert detailed == created
+
+
+def test_run_summaries_reject_index_payload_identity_drift(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+    with TestClient(app) as client:
+        state = app.state.harness
+        task = state.storage.create_task(
+            Task(id="summary-drift-task", title="Summary drift", goal="Fail closed.", workflow_pack="research")
+        )
+        run = state.storage.create_run(
+            Run(id="summary-drift-run", task_id=task.id, status=RunStatus.COMPLETED)
+        )
+        raw = state.storage.conn.execute(
+            "SELECT data FROM runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()
+        payload = json.loads(raw["data"])
+        payload["status"] = RunStatus.RUNNING.value
+        with state.storage.transaction():
+            state.storage.conn.execute(
+                "UPDATE runs SET data = ? WHERE id = ?",
+                (json.dumps(payload), run.id),
+            )
+
+        response = client.get("/runs/summaries")
+
+    assert response.status_code == 409
+    assert "cannot be trusted" in response.json()["detail"]
+
+
+def test_history_purge_deletes_terminal_run_data_and_artifact_files_but_keeps_active_runs(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+    with TestClient(app) as client:
+        task_response = client.post(
+            "/tasks",
+            json={
+                "title": "History purge",
+                "goal": "Verify terminal history cleanup.",
+                "workflow_pack": "research",
+            },
+        )
+        assert task_response.status_code == 201
+        task = task_response.json()
+        created_run = client.post("/runs", json={"task_id": task["id"], "background": False}).json()
+        assert created_run["status"] == "completed"
+
+        active_task = app.state.harness.storage.create_task(
+            Task(id="active-purge-task", title="Active", goal="Keep this task.", workflow_pack="research")
+        )
+        active_run = app.state.harness.storage.create_run(
+            Run(id="active-purge-run", task_id=active_task.id, status=RunStatus.RUNNING)
+        )
+
+        response = client.delete("/records/history")
+        remaining_runs = client.get("/runs").json()
+        remaining_tasks = client.get("/tasks").json()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "purged"
+    assert payload["runs_deleted"] == 1
+    assert payload["artifact_files_deleted"] >= 1
+    assert created_run["id"] in payload["run_ids"]
+    assert any(run["id"] == active_run.id and run["status"] == "running" for run in remaining_runs)
+    assert {item["id"] for item in remaining_tasks} == {task["id"], active_task.id}
+    assert not list((tmp_path / "artifacts").rglob("*"))
+
+
+def test_history_purge_keeps_database_records_when_artifact_quarantine_fails(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "Locked history artifact",
+                "goal": "Never lose tracking when a history artifact cannot move.",
+                "workflow_pack": "research",
+            },
+        ).json()
+        run = client.post("/runs", json={"task_id": task["id"], "background": False}).json()
+        artifact_paths = [
+            tmp_path / "artifacts" / item["path"]
+            for item in client.get(f"/runs/{run['id']}/artifacts").json()
+        ]
+        original_replace = artifacts_module.os.replace
+        quarantine_moves = 0
+
+        def reject_quarantine_move(source, target) -> None:
+            nonlocal quarantine_moves
+            if "_purge_quarantine" in artifacts_module.Path(target).parts:
+                quarantine_moves += 1
+                if quarantine_moves == 2:
+                    raise PermissionError("injected Windows sharing violation")
+            original_replace(source, target)
+
+        monkeypatch.setattr(artifacts_module.os, "replace", reject_quarantine_move)
+
+        response = client.delete("/records/history")
+
+        assert response.status_code == 409
+        assert client.get(f"/runs/{run['id']}").status_code == 200
+        assert client.get(f"/runs/{run['id']}/artifacts").status_code == 200
+        assert quarantine_moves == 2
+        assert all(path.is_file() for path in artifact_paths)
+
+
+def test_history_purge_quarantine_recovers_both_crash_windows(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+    with TestClient(app) as client:
+        task = client.post(
+            "/tasks",
+            json={
+                "title": "History crash recovery",
+                "goal": "Recover artifact quarantine around the SQLite commit.",
+                "workflow_pack": "research",
+            },
+        ).json()
+        run = client.post("/runs", json={"task_id": task["id"], "background": False}).json()
+        state = app.state.harness
+        preview = state.storage.preview_terminal_run_records()
+        source_paths = [tmp_path / "artifacts" / path for path in preview["artifact_paths"]]
+
+        before_commit = state.artifact_store.quarantine_relative_files(preview["artifact_paths"])
+        assert before_commit.root is not None and before_commit.root.is_dir()
+        assert all(not path.exists() for path in source_paths)
+        assert state.artifact_store.recover_purge_quarantines()["restored"] == len(source_paths)
+        assert all(path.is_file() for path in source_paths)
+
+        after_commit = state.artifact_store.quarantine_relative_files(preview["artifact_paths"])
+        state.storage.purge_terminal_run_records(
+            expected_run_ids=preview["run_ids"],
+            expected_artifacts=preview["artifacts"],
+        )
+        assert state.artifact_store.recover_purge_quarantines()["deleted"] == len(source_paths)
+        assert state.storage.get_run(run["id"]) is None
+        assert all(not path.exists() for path in source_paths)
+        assert after_commit.root is not None and not after_commit.root.exists()
+
+
+def test_history_purge_rejects_concurrent_cleanup(tmp_path) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+    with TestClient(app) as client:
+        assert app.state.harness.history_purge_lock.acquire(blocking=False) is True
+        try:
+            response = client.delete("/records/history")
+        finally:
+            app.state.harness.history_purge_lock.release()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "History cleanup is already running."
+
+
+def test_history_purge_recovery_rejects_reparse_root_and_missing_rollback_copy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts", config_root=tmp_path)
+    state = app.state.harness
+    quarantine_parent = tmp_path / "artifacts" / "_purge_quarantine"
+    quarantine_parent.mkdir(parents=True)
+    original_is_reparse = artifacts_module._is_reparse_point
+    monkeypatch.setattr(
+        artifacts_module,
+        "_is_reparse_point",
+        lambda path, file_stat: path == quarantine_parent
+        or original_is_reparse(path, file_stat),
+    )
+
+    with pytest.raises(artifacts_module.ArtifactStoreError, match="root is invalid"):
+        state.artifact_store.recover_purge_quarantines()
+
+    monkeypatch.setattr(artifacts_module, "_is_reparse_point", original_is_reparse)
+    missing_plan = artifacts_module.ArtifactPurgeQuarantine(
+        root=None,
+        moved=((tmp_path / "artifacts" / "run-missing" / "final.md", tmp_path / "missing.md"),),
+        missing=0,
+    )
+    with pytest.raises(artifacts_module.ArtifactStoreError, match="both unavailable"):
+        state.artifact_store.restore_quarantined_files(missing_plan)
+    state.close()
 
 
 def test_run_read_endpoints_preserve_legacy_web_snapshot_across_update(tmp_path) -> None:
@@ -677,6 +872,7 @@ def test_pack_and_agent_catalog_endpoints(tmp_path, monkeypatch: pytest.MonkeyPa
         assert {provider["name"] for provider in providers} == {
             "mock",
             "openai",
+            "gpt_relay",
             "anthropic",
             "deepseek",
             "litellm_proxy",
@@ -691,10 +887,12 @@ def test_pack_and_agent_catalog_endpoints(tmp_path, monkeypatch: pytest.MonkeyPa
                 "real_calls_configured": False,
                 "requires_credentials": False,
                 "description": "Deterministic mocked adapter used for local development and tests.",
+                "protocol": "unknown",
             }
         ]
         assert {provider["name"] for provider in providers if provider["real_calls"]} == {
             "openai",
+            "gpt_relay",
             "deepseek",
             "litellm_proxy",
         }
@@ -2244,7 +2442,7 @@ def test_runtime_job_approve_response_redacts_sensitive_runtime_fields(tmp_path)
         assert "external-job-secret" not in dumped
 
 
-def test_stale_run_lock_is_recovered_before_runtime_job_approval(tmp_path) -> None:
+def test_runtime_job_approval_never_reclaims_stale_lock_while_process_is_live(tmp_path) -> None:
     app = create_app(tmp_path / "harness.sqlite3", tmp_path / "artifacts")
     with TestClient(app) as client:
         task = client.post(
@@ -2269,10 +2467,10 @@ def test_stale_run_lock_is_recovered_before_runtime_job_approval(tmp_path) -> No
 
         approve_response = client.post(f"/runs/{run['id']}/runtime-jobs/{patch_job['id']}/approve")
 
-        assert approve_response.status_code == 200, approve_response.text
+        assert approve_response.status_code == 409, approve_response.text
         locks = client.get(f"/runs/{run['id']}/lock-state").json()
         stale = next(lock for lock in locks if lock["id"] == "stale-lock")
-        assert stale["status"] == "released"
+        assert stale["status"] == "acquired"
 
 
 def test_api_returns_404_for_missing_resources(tmp_path) -> None:

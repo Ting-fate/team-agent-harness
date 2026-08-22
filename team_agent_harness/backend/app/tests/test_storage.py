@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 import json
+import sqlite3
 
 import pytest
 
@@ -26,7 +27,12 @@ from app.core.models import (
     TraceEvent,
     TraceEventType,
 )
-from app.core.storage import RunRecordIntegrityError, SQLiteStorage, StorageError
+from app.core.storage import (
+    RunRecordIntegrityError,
+    SQLiteStorage,
+    StorageError,
+    StorageIntegrityError,
+)
 
 
 @pytest.fixture
@@ -68,6 +74,292 @@ def test_run_create_update_get_list(storage: SQLiteStorage) -> None:
 
     assert storage.get_run("run-1") == updated
     assert storage.list_runs() == [updated]
+
+
+def test_purge_terminal_run_records_preserves_active_runs_and_tasks(storage: SQLiteStorage) -> None:
+    task = storage.create_task(Task(id="task-purge", title="Purge", goal="Purge history.", workflow_pack="research"))
+    completed = storage.create_run(
+        Run(id="run-purge-completed", task_id=task.id, status=RunStatus.COMPLETED)
+    )
+    failed = storage.create_run(
+        Run(id="run-purge-failed", task_id=task.id, status=RunStatus.FAILED)
+    )
+    running = storage.create_run(
+        Run(id="run-purge-running", task_id=task.id, status=RunStatus.RUNNING)
+    )
+    locked = storage.create_run(
+        Run(id="run-purge-locked", task_id=task.id, status=RunStatus.COMPLETED)
+    )
+    storage.create_run_lock(
+        RunLock(id="lock-purge", run_id=locked.id, owner="test", status=RunLockStatus.ACQUIRED)
+    )
+    agent = storage.create_agent_definition(
+        AgentDefinition(
+            id="agent-purge",
+            pack_name="research",
+            role="Reader",
+            system_prompt="Read the source material.",
+        )
+    )
+    agent_run = storage.create_agent_run(
+        AgentRun(
+            id="agent-run-purge",
+            run_id=completed.id,
+            agent_id=agent.id,
+            step_name="read_sources",
+            status=AgentRunStatus.COMPLETED,
+        )
+    )
+
+    with storage.transaction():
+        storage.conn.execute(
+            "INSERT INTO artifacts (id, run_id, agent_run_id, type, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "artifact-purge",
+                completed.id,
+                agent_run.id,
+                ArtifactType.FINAL_REPORT.value,
+                json.dumps(
+                    {
+                        "id": "artifact-purge",
+                        "run_id": completed.id,
+                        "agent_run_id": "agent-run-purge",
+                        "type": ArtifactType.FINAL_REPORT.value,
+                        "path": "run-purge-completed/final.md",
+                        "content_hash": "a" * 64,
+                        "source_refs": [],
+                    }
+                ),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+
+    preview = storage.preview_terminal_run_records()
+    summary = storage.purge_terminal_run_records(
+        expected_run_ids=preview["run_ids"],
+        expected_artifacts=preview["artifacts"],
+    )
+
+    assert preview["run_ids"] == ["run-purge-completed", "run-purge-failed"]
+    assert preview["artifact_paths"] == ["run-purge-completed/final.md"]
+    assert summary["run_ids"] == ["run-purge-completed", "run-purge-failed"]
+    assert summary["artifact_paths"] == ["run-purge-completed/final.md"]
+    assert summary["runs_deleted"] == 2
+    assert storage.get_run(completed.id) is None
+    assert storage.get_run(failed.id) is None
+    assert storage.get_run(running.id) == running
+    assert storage.get_run(locked.id) == locked
+    assert storage.get_task(task.id) == task
+    assert storage.conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 0
+
+
+def test_purge_terminal_run_records_rejects_candidate_drift(storage: SQLiteStorage) -> None:
+    task = storage.create_task(
+        Task(id="task-purge-drift", title="Purge drift", goal="Freeze deletion scope.", workflow_pack="research")
+    )
+    run = storage.create_run(
+        Run(id="run-purge-drift", task_id=task.id, status=RunStatus.COMPLETED)
+    )
+    preview = storage.preview_terminal_run_records()
+    storage.create_run_lock(
+        RunLock(id="lock-purge-drift", run_id=run.id, owner="test", status=RunLockStatus.ACQUIRED)
+    )
+
+    with pytest.raises(StorageError, match="candidates changed"):
+        storage.purge_terminal_run_records(
+            expected_run_ids=preview["run_ids"],
+            expected_artifacts=preview["artifacts"],
+        )
+
+    assert storage.get_run(run.id) == run
+
+
+def test_purge_terminal_run_records_binds_artifact_identity(storage: SQLiteStorage) -> None:
+    task = storage.create_task(
+        Task(id="task-purge-artifact-drift", title="Artifact drift", goal="Freeze artifacts.", workflow_pack="research")
+    )
+    run = storage.create_run(
+        Run(id="run-purge-artifact-drift", task_id=task.id, status=RunStatus.COMPLETED)
+    )
+    agent = storage.create_agent_definition(
+        AgentDefinition(
+            id="agent-purge-artifact-drift",
+            pack_name="research",
+            role="ArtifactDrift",
+            system_prompt="Test artifact identity.",
+        )
+    )
+    agent_run = storage.create_agent_run(
+        AgentRun(
+            id="agent-run-purge-artifact-drift",
+            run_id=run.id,
+            agent_id=agent.id,
+            step_name="artifact_drift",
+        )
+    )
+    original = storage.create_artifact(
+        Artifact(
+            id="artifact-purge-original",
+            run_id=run.id,
+            agent_run_id=agent_run.id,
+            type=ArtifactType.FINAL_REPORT,
+            path=f"{run.id}/final.md",
+            content_hash="a" * 64,
+        )
+    )
+    preview = storage.preview_terminal_run_records()
+    storage.delete_artifact(original.id)
+    replacement = storage.create_artifact(
+        original.model_copy(
+            update={
+                "id": "artifact-purge-replacement",
+                "content_hash": "b" * 64,
+            }
+        )
+    )
+
+    with pytest.raises(StorageError, match="artifact candidates changed"):
+        storage.purge_terminal_run_records(
+            expected_run_ids=preview["run_ids"],
+            expected_artifacts=preview["artifacts"],
+        )
+
+    assert storage.get_run(run.id) == run
+    assert storage.get_artifact(replacement.id) == replacement
+
+
+def test_purge_terminal_run_records_rejects_invalid_artifact_metadata(
+    storage: SQLiteStorage,
+) -> None:
+    task = storage.create_task(
+        Task(id="task-purge-invalid-artifact", title="Invalid artifact", goal="Fail closed.", workflow_pack="research")
+    )
+    run = storage.create_run(
+        Run(id="run-purge-invalid-artifact", task_id=task.id, status=RunStatus.COMPLETED)
+    )
+    agent = storage.create_agent_definition(
+        AgentDefinition(
+            id="agent-purge-invalid-artifact",
+            pack_name="research",
+            role="InvalidArtifact",
+            system_prompt="Test invalid metadata.",
+        )
+    )
+    agent_run = storage.create_agent_run(
+        AgentRun(
+            id="agent-run-purge-invalid-artifact",
+            run_id=run.id,
+            agent_id=agent.id,
+            step_name="invalid_artifact",
+        )
+    )
+    artifact = storage.create_artifact(
+        Artifact(
+            id="artifact-purge-invalid-metadata",
+            run_id=run.id,
+            agent_run_id=agent_run.id,
+            type=ArtifactType.FINAL_REPORT,
+            path=f"{run.id}/final.md",
+        )
+    )
+    with storage.transaction():
+        storage.conn.execute(
+            "UPDATE artifacts SET data = ? WHERE id = ?",
+            ("{}", artifact.id),
+        )
+
+    with pytest.raises(StorageIntegrityError, match="metadata is invalid"):
+        storage.preview_terminal_run_records()
+
+    assert storage.get_run(run.id) == run
+
+
+def test_purge_terminal_run_records_rejects_path_owned_by_retained_artifact(
+    storage: SQLiteStorage,
+) -> None:
+    task = storage.create_task(
+        Task(id="task-purge-shared-path", title="Shared path", goal="Protect active files.", workflow_pack="research")
+    )
+    terminal_run = storage.create_run(
+        Run(id="run-purge-shared-path", task_id=task.id, status=RunStatus.COMPLETED)
+    )
+    active_run = storage.create_run(
+        Run(id="run-retained-shared-path", task_id=task.id, status=RunStatus.RUNNING)
+    )
+    agent = storage.create_agent_definition(
+        AgentDefinition(
+            id="agent-purge-shared-path",
+            pack_name="research",
+            role="SharedPath",
+            system_prompt="Test shared path ownership.",
+        )
+    )
+    terminal_attempt = storage.create_agent_run(
+        AgentRun(
+            id="attempt-purge-shared-path",
+            run_id=terminal_run.id,
+            agent_id=agent.id,
+            step_name="terminal",
+        )
+    )
+    active_attempt = storage.create_agent_run(
+        AgentRun(
+            id="attempt-retained-shared-path",
+            run_id=active_run.id,
+            agent_id=agent.id,
+            step_name="active",
+        )
+    )
+    shared_path = f"{terminal_run.id}/final.md"
+    storage.create_artifact(
+        Artifact(
+            id="artifact-purge-shared-path",
+            run_id=terminal_run.id,
+            agent_run_id=terminal_attempt.id,
+            type=ArtifactType.FINAL_REPORT,
+            path=shared_path,
+        )
+    )
+    storage.create_artifact(
+        Artifact(
+            id="artifact-retained-shared-path",
+            run_id=active_run.id,
+            agent_run_id=active_attempt.id,
+            type=ArtifactType.FINAL_REPORT,
+            path=shared_path,
+        )
+    )
+
+    with pytest.raises(StorageIntegrityError, match="retained artifact"):
+        storage.preview_terminal_run_records()
+
+    assert storage.get_run(terminal_run.id) == terminal_run
+    assert storage.get_run(active_run.id) == active_run
+
+
+def test_purge_terminal_run_records_batches_below_sqlite_variable_limit(
+    storage: SQLiteStorage,
+) -> None:
+    task = storage.create_task(
+        Task(
+            id="task-purge-batched",
+            title="Batched purge",
+            goal="Purge histories larger than one SQLite parameter batch.",
+            workflow_pack="research",
+        )
+    )
+    run_ids = [f"run-purge-batched-{index:02d}" for index in range(25)]
+    for run_id in run_ids:
+        storage.create_run(Run(id=run_id, task_id=task.id, status=RunStatus.COMPLETED))
+    previous_limit = storage.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 20)
+    try:
+        summary = storage.purge_terminal_run_records()
+    finally:
+        storage.conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+
+    assert summary["run_ids"] == run_ids
+    assert summary["runs_deleted"] == len(run_ids)
+    assert storage.list_runs() == []
 
 
 def test_storage_injects_legacy_web_snapshot_only_when_both_raw_fields_are_missing(
@@ -765,7 +1057,7 @@ def test_run_lock_rejects_duplicate_active_lock(storage: SQLiteStorage) -> None:
         storage.create_run_lock(RunLock(id="lock-2", run_id=run.id, owner="api:second"))
 
 
-def test_run_lock_can_recover_stale_active_lock(storage: SQLiteStorage) -> None:
+def test_run_lock_age_never_releases_active_lock(storage: SQLiteStorage) -> None:
     task = storage.create_task(Task(id="task-1", title="Task", goal="Goal", workflow_pack="code_rd"))
     run = storage.create_run(Run(id="run-1", task_id=task.id))
     stale_lock = storage.create_run_lock(
@@ -777,16 +1069,11 @@ def test_run_lock_can_recover_stale_active_lock(storage: SQLiteStorage) -> None:
         )
     )
 
-    replacement = storage.create_run_lock(
-        RunLock(id="lock-2", run_id=run.id, owner="api:second"),
-        stale_after_seconds=600,
-    )
+    with pytest.raises(StorageError, match="active lock"):
+        storage.create_run_lock(RunLock(id="lock-2", run_id=run.id, owner="api:second"))
 
-    recovered = storage.get_run_lock(stale_lock.id)
-    assert recovered is not None
-    assert recovered.status == RunLockStatus.RELEASED
-    assert recovered.metadata["stale_recovered"] is True
-    assert storage.get_active_run_lock(run.id) == replacement
+    assert storage.get_active_run_lock(run.id) == stale_lock
+    assert storage.get_run_lock(stale_lock.id).status == RunLockStatus.ACQUIRED  # type: ignore[union-attr]
 
 
 def test_run_lock_heartbeat_prevents_false_stale_recovery(storage: SQLiteStorage) -> None:
@@ -803,7 +1090,7 @@ def test_run_lock_heartbeat_prevents_false_stale_recovery(storage: SQLiteStorage
         )
     )
 
-    assert storage.get_active_run_lock(run.id, stale_after_seconds=600) == active
+    assert storage.get_active_run_lock(run.id) == active
     assert storage.get_run_lock(active.id).status == RunLockStatus.ACQUIRED  # type: ignore[union-attr]
 
 

@@ -355,7 +355,10 @@ def test_start_script_gates_litellm_before_starting_control_plane() -> None:
 
     litellm_gate = script.index("$LiteLlmReady = $false")
     harness_start = script.index("$HarnessService = Start-HarnessService")
-    harness_gate = script.index("if ($LiteLlmReady) {", litellm_gate)
+    harness_gate = script.index(
+        'if ($EffectiveRouteMode -eq "litellm" -and $LiteLlmReady) {',
+        litellm_gate,
+    )
 
     assert litellm_gate < script.index("$LiteLlmVersion =") < harness_start
     assert litellm_gate < script.index("$LiteLlmProcess = Start-Process") < harness_start
@@ -378,7 +381,7 @@ def test_start_script_preflights_harness_before_side_effects_and_revalidates_lat
     harness_python_guard = "Test-Path -LiteralPath $Python -PathType Leaf"
     preflight_python = executable_body.index(f"elseif (-not ({harness_python_guard}))")
     output_creation = executable_body.index("New-Item -ItemType Directory -Force $OutputDir")
-    litellm_probe = executable_body.index("$LiteLlmPid = Get-ListenerProcessId")
+    litellm_probe = executable_body.index("$LiteLlmPid = if")
     later_listener = executable_body.index("$HarnessListener = Get-RevalidatedHarnessListener")
     restart_block = executable_body[
         executable_body.index('if ($reuseAction -eq "restart_idle")') : executable_body.index(
@@ -421,6 +424,18 @@ def test_runtime_startup_never_installs_dependencies() -> None:
 
     assert '$LiteLlmRequirement = "litellm[proxy]==1.89.2"' in setup
     assert "pip install" not in start
+
+
+def test_start_script_falls_back_to_mock_routes_when_credentials_are_incomplete() -> None:
+    script = (ROOT / "scripts" / "start-litellm-harness.ps1").read_text(encoding="utf-8")
+    block = script[
+        script.index("if ($CredentialProblems.Count -gt 0) {") : script.index(
+            "$LiteLlmReady = $false"
+        )
+    ]
+
+    assert "Remove-Item Env:TEAM_AGENT_MODEL_ROUTING_CONFIG" in block
+    assert "Harness will use mock Pack routes" in block
 
 
 def test_setup_never_passes_provider_credentials_to_child_commands() -> None:
@@ -607,6 +622,8 @@ def test_start_script_keeps_healthy_services_when_env_is_invalid(tmp_path: Path)
                 str(ROOT / "scripts" / "start-litellm-harness.ps1"),
                 "-LiteLlmPort",
                 str(litellm_port),
+                "-RouteMode",
+                "litellm",
                 "-HarnessPort",
                 str(harness_port),
                 "-HarnessPython",
@@ -649,6 +666,8 @@ def test_start_script_litellm_port_conflict_is_only_a_support_warning(tmp_path: 
                 str(ROOT / "scripts" / "start-litellm-harness.ps1"),
                 "-LiteLlmPort",
                 str(litellm_port),
+                "-RouteMode",
+                "litellm",
                 "-HarnessPort",
                 str(harness_port),
                 "-HarnessPython",
@@ -680,10 +699,52 @@ def test_start_script_litellm_port_conflict_is_only_a_support_warning(tmp_path: 
     assert litellm_requests == []
 
 
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for startup behavior testing")
+def test_start_script_direct_mode_does_not_probe_or_start_litellm(tmp_path: Path) -> None:
+    litellm_requests: list[str] = []
+    with ExitStack() as stack:
+        litellm_port = stack.enter_context(_healthy_service("unrelated", litellm_requests))
+        harness_port = stack.enter_context(_running_project_harness(tmp_path / "harness"))
+        result = subprocess.run(
+            [
+                POWERSHELL,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ROOT / "scripts" / "start-harness.ps1"),
+                "-LiteLlmPort",
+                str(litellm_port),
+                "-HarnessPort",
+                str(harness_port),
+                "-HarnessPython",
+                sys.executable,
+                "-LiteLlmPython",
+                str(tmp_path / "missing-litellm-python.exe"),
+                "-EnvFile",
+                str(tmp_path / "missing.env"),
+            ],
+            cwd=ROOT,
+            env=_reuse_start_script_environment(configured=True),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+
+        assert result.returncode in {0, 2}, result.stderr
+        assert "not the expected LiteLLM service" not in result.stderr
+        assert "LiteLLM Proxy: disabled by direct route mode" in result.stdout
+
+    assert litellm_requests == []
+
+
 def test_start_script_checks_litellm_process_identity_before_http_probe() -> None:
     script = (ROOT / "scripts" / "start-litellm-harness.ps1").read_text(encoding="utf-8")
     occupied_path = script[
-        script.index("$LiteLlmPid = Get-ListenerProcessId") : script.index(
+        script.index("$LiteLlmPid = if") : script.index(
             "elseif ($CredentialProblems.Count -gt 0)"
         )
     ]
@@ -1474,6 +1535,8 @@ Save-EnvFile `
         "OPENAI_API_BASE=https://new.invalid/v1",
         "DEEPSEEK_API_KEY=new-deepseek-value",
         "# trailing comment",
+        "TEAM_AGENT_GPT_ROUTE_MODE=direct",
+        "TEAM_AGENT_GPT_RELAY_PROTOCOL=chat_completions",
     ]
 
 

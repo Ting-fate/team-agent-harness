@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import http.client
 from ipaddress import IPv4Address, IPv6Address, ip_address
+import json
 import os
 import socket
 import ssl
@@ -21,6 +22,11 @@ TAVILY_API_KEY_ENV = "TAVILY_API_KEY"
 DEFAULT_WEB_SEARCH_MAX_RESULTS = 5
 DEFAULT_WEB_FETCH_MAX_BYTES = 64 * 1024
 MAX_PUBLIC_URL_CHARS = 2_048
+WEB_REQUEST_TIMEOUT_SECONDS = 20.0
+WEB_READ_CHUNK_BYTES = 16 * 1024
+MAX_TAVILY_RESPONSE_BYTES = 512 * 1024
+MAX_TAVILY_JSON_DEPTH = 12
+MAX_TAVILY_JSON_ITEMS = 2_048
 
 
 class WebSearchClient(Protocol):
@@ -137,8 +143,14 @@ class TavilySearchClient:
             import httpx
         except ImportError as exc:
             raise _tool_validation_error("httpx is required for Tavily web search.") from exc
-        with httpx.Client(timeout=20, trust_env=False) as client:
-            response = client.post(
+        deadline = perf_counter() + WEB_REQUEST_TIMEOUT_SECONDS
+        with httpx.Client(
+            timeout=WEB_REQUEST_TIMEOUT_SECONDS,
+            trust_env=False,
+            follow_redirects=False,
+        ) as client:
+            with client.stream(
+                "POST",
                 "https://api.tavily.com/search",
                 json={
                     "api_key": api_key,
@@ -147,13 +159,33 @@ class TavilySearchClient:
                     "include_answer": False,
                     "include_raw_content": False,
                 },
-            )
-        response.raise_for_status()
-        return response.json()
+                headers={"Accept-Encoding": "identity"},
+            ) as response:
+                response.raise_for_status()
+                content_encoding = str(response.headers.get("content-encoding", "")).lower()
+                if content_encoding not in {"", "identity"}:
+                    raise _tool_validation_error(
+                        "web_search provider returned an unsupported content encoding."
+                    )
+                body = bytearray()
+                for chunk in response.iter_raw(chunk_size=WEB_READ_CHUNK_BYTES):
+                    _remaining_web_timeout(deadline)
+                    if len(body) + len(chunk) > MAX_TAVILY_RESPONSE_BYTES:
+                        raise _tool_validation_error("web_search provider response is too large.")
+                    body.extend(chunk)
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise _tool_validation_error("web_search provider returned invalid JSON.") from exc
+        _validate_bounded_json(payload)
+        if not isinstance(payload, dict):
+            raise _tool_validation_error("web_search provider returned an invalid response.")
+        return payload
 
 
 class SimpleWebFetchClient:
     def fetch(self, url: str, *, max_bytes: int) -> dict[str, Any]:
+        deadline = perf_counter() + WEB_REQUEST_TIMEOUT_SECONDS
         current_url = url
         for _ in range(5):
             current_url = _validate_public_http_url(current_url)
@@ -161,7 +193,13 @@ class SimpleWebFetchClient:
             host = parsed.hostname or ""
             port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
             resolved_addresses = _resolve_public_addresses(host, port)
-            connection = _pinned_http_connection(parsed, resolved_addresses)
+            remaining_timeout = _remaining_web_timeout(deadline)
+            connection = _pinned_http_connection(
+                parsed,
+                resolved_addresses,
+                timeout_seconds=remaining_timeout,
+                deadline=deadline,
+            )
             response: http.client.HTTPResponse | None = None
             try:
                 connection.request(
@@ -181,7 +219,12 @@ class SimpleWebFetchClient:
                     raise HTTPError(current_url, response.status, response.reason, response.headers, None)
                 final_url = current_url
                 content_type = response.getheader("content-type", "")
-                body = response.read(max_bytes + 1)
+                body = _read_bounded_response_body(
+                    response,
+                    connection,
+                    max_bytes=max_bytes,
+                    deadline=deadline,
+                )
                 status_code = response.status
                 break
             finally:
@@ -248,6 +291,9 @@ def _resolve_public_addresses(host: str, port: int) -> tuple[_ResolvedAddress, .
 def _pinned_http_connection(
     parsed: Any,
     resolved_addresses: tuple[_ResolvedAddress, ...],
+    *,
+    timeout_seconds: float,
+    deadline: float,
 ) -> http.client.HTTPConnection:
     host = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
@@ -255,19 +301,62 @@ def _pinned_http_connection(
         connection: http.client.HTTPConnection = http.client.HTTPSConnection(
             host,
             port,
-            timeout=20,
+            timeout=timeout_seconds,
             context=ssl.create_default_context(),
         )
     else:
-        connection = http.client.HTTPConnection(host, port, timeout=20)
+        connection = http.client.HTTPConnection(host, port, timeout=timeout_seconds)
 
     # HTTPConnection still owns Host, SNI, and TLS verification; only its TCP dialer is replaced.
     connection._create_connection = lambda _address, timeout, source_address: _connect_to_resolved_addresses(  # type: ignore[attr-defined]
         resolved_addresses,
         timeout=timeout,
         source_address=source_address,
+        deadline=deadline,
     )
     return connection
+
+
+def _read_bounded_response_body(
+    response: http.client.HTTPResponse,
+    connection: http.client.HTTPConnection,
+    *,
+    max_bytes: int,
+    deadline: float,
+) -> bytes:
+    body = bytearray()
+    while len(body) <= max_bytes:
+        remaining = _remaining_web_timeout(deadline)
+        if connection.sock is not None:
+            connection.sock.settimeout(remaining)
+        chunk = response.read1(min(WEB_READ_CHUNK_BYTES, max_bytes + 1 - len(body)))
+        if not chunk:
+            break
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _remaining_web_timeout(deadline: float) -> float:
+    remaining = deadline - perf_counter()
+    if remaining <= 0:
+        raise _tool_validation_error("web provider request exceeded its total time budget.")
+    return remaining
+
+
+def _validate_bounded_json(value: Any) -> None:
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    item_count = 0
+    while stack:
+        item, depth = stack.pop()
+        item_count += 1
+        if item_count > MAX_TAVILY_JSON_ITEMS:
+            raise _tool_validation_error("web_search provider response contains too many items.")
+        if depth > MAX_TAVILY_JSON_DEPTH:
+            raise _tool_validation_error("web_search provider response is nested too deeply.")
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
 
 
 def _connect_to_resolved_addresses(
@@ -275,12 +364,24 @@ def _connect_to_resolved_addresses(
     *,
     timeout: float | object,
     source_address: tuple[str, int] | None,
+    deadline: float | None = None,
 ) -> socket.socket:
     last_error: OSError | None = None
     for resolved in resolved_addresses:
         sock = socket.socket(resolved.family, resolved.socket_type, resolved.protocol)
         try:
-            sock.settimeout(timeout)
+            attempt_timeout = timeout
+            if deadline is not None:
+                remaining = deadline - perf_counter()
+                if remaining <= 0:
+                    raise _tool_validation_error(
+                        "web provider request exceeded its total time budget."
+                    )
+                if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+                    attempt_timeout = min(float(timeout), remaining)
+                else:
+                    attempt_timeout = remaining
+            sock.settimeout(attempt_timeout)
             if source_address is not None:
                 sock.bind(source_address)
             sock.connect(resolved.socket_address)
@@ -288,6 +389,9 @@ def _connect_to_resolved_addresses(
         except OSError as exc:
             last_error = exc
             sock.close()
+        except Exception:
+            sock.close()
+            raise
     if last_error is not None:
         raise last_error
     raise OSError("No validated address was available for the connection.")

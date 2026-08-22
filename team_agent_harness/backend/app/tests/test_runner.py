@@ -306,13 +306,13 @@ def test_runner_persists_completed_only_after_runtime_cleanup_succeeds(
 
     monkeypatch.setattr(runner, "_terminalize_open_runtime_state", fail_completed_cleanup_once)
 
-    with pytest.raises(WorkflowRunnerError, match="terminal cleanup failure"):
+    with pytest.raises(StorageError, match="terminal cleanup failure"):
         runner.run(Run(id="run-cleanup-order", task_id=task.id), _demo_pack())
 
     assert observed_statuses[0] == ("run_completed", RunStatus.RUNNING)
     persisted_run = storage.get_run("run-cleanup-order")
     assert persisted_run is not None
-    assert persisted_run.status == RunStatus.FAILED
+    assert persisted_run.status == RunStatus.RUNNING
 
 
 def test_default_runner_executor_records_mock_model_runtime_trace(
@@ -658,6 +658,140 @@ def test_blocker_eval_failure_marks_run_failed_but_warning_does_not(
     assert failure.status == EvalStatus.FAIL
 
 
+def test_recovery_reuses_pack_eval_for_same_terminal_attempt(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    task = storage.create_task(
+        Task(
+            id="task-pack-eval-recovery",
+            title="Recover terminal evaluation",
+            goal="Do not duplicate durable pack evaluation after a crash.",
+            workflow_pack="demo",
+        )
+    )
+    pack = _demo_pack()
+    runner = runner_factory(DemoExecutor())
+    completed = runner.run(Run(id="run-pack-eval-recovery", task_id=task.id), pack)
+    terminal_attempt = storage.list_agent_runs_for_run(completed.id)[-1]
+    storage.update_run(
+        completed.model_copy(
+            update={
+                "status": RunStatus.RUNNING,
+                "finished_at": None,
+                "final_artifact_id": None,
+            }
+        )
+    )
+
+    requeued = runner.requeue_interrupted_run(completed.id, pack)
+    recovered = runner.run(requeued, pack)
+
+    assert recovered.status == RunStatus.COMPLETED
+    matching_results = [
+        result
+        for result in storage.list_eval_results_for_run(recovered.id)
+        if result.check_name == "final_report_present"
+    ]
+    assert len(matching_results) == 1
+    binding_events = [
+        event
+        for event in storage.list_trace_events_for_run(recovered.id)
+        if event.event_type == TraceEventType.EVAL_RESULT
+        and event.agent_run_id == terminal_attempt.id
+        and event.payload.get("scope") == "pack"
+        and event.payload.get("check_name") == "final_report_present"
+    ]
+    assert len(binding_events) == 1
+    assert binding_events[0].payload["eval_result_id"] == matching_results[0].id
+
+
+def test_recovery_fails_closed_for_unbound_pack_eval_result(
+    storage: SQLiteStorage,
+    runner_factory,
+) -> None:
+    task = storage.create_task(
+        Task(
+            id="task-unbound-pack-eval",
+            title="Unbound terminal evaluation",
+            goal="Do not guess provenance for orphaned evaluation evidence.",
+            workflow_pack="demo",
+        )
+    )
+    pack = _demo_pack()
+    runner = runner_factory(DemoExecutor())
+    completed = runner.run(Run(id="run-unbound-pack-eval", task_id=task.id), pack)
+    storage.create_eval_result(
+        EvalResult(
+            run_id=completed.id,
+            check_name="final_report_present",
+            status=EvalStatus.PASS,
+            message="Orphaned result without a binding trace.",
+        )
+    )
+    storage.update_run(
+        completed.model_copy(
+            update={
+                "status": RunStatus.RUNNING,
+                "finished_at": None,
+                "final_artifact_id": None,
+            }
+        )
+    )
+    requeued = runner.requeue_interrupted_run(completed.id, pack)
+
+    with pytest.raises(WorkflowRunnerError, match="unbound durable result"):
+        runner.run(requeued, pack)
+
+    assert storage.get_run(completed.id).status == RunStatus.FAILED  # type: ignore[union-attr]
+
+
+def test_terminal_storage_failure_remains_retryable_from_completed_checkpoints(
+    storage: SQLiteStorage,
+    runner_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = storage.create_task(
+        Task(
+            id="task-terminal-storage-retry",
+            title="Retry terminal persistence",
+            goal="Do not convert a transient SQLite failure into a business failure.",
+            workflow_pack="demo",
+        )
+    )
+    pack = _demo_pack()
+    runner = runner_factory(DemoExecutor())
+    original_update_run = storage.update_run
+    failure_injected = False
+
+    def fail_first_terminal_update(run: Run) -> Run:
+        nonlocal failure_injected
+        if run.status == RunStatus.COMPLETED and not failure_injected:
+            failure_injected = True
+            raise StorageError("transient terminal Run update failure")
+        return original_update_run(run)
+
+    monkeypatch.setattr(storage, "update_run", fail_first_terminal_update)
+
+    with pytest.raises(StorageError, match="transient terminal Run update failure"):
+        runner.run(Run(id="run-terminal-storage-retry", task_id=task.id), pack)
+
+    interrupted = storage.get_run("run-terminal-storage-retry")
+    assert interrupted is not None
+    assert interrupted.status == RunStatus.RUNNING
+    requeued = runner.requeue_interrupted_run(interrupted.id, pack)
+    recovered = runner.run(requeued, pack)
+
+    assert failure_injected is True
+    assert recovered.status == RunStatus.COMPLETED
+    matching_results = [
+        result
+        for result in storage.list_eval_results_for_run(recovered.id)
+        if result.check_name == "final_report_present"
+    ]
+    assert len(matching_results) == 1
+
+
 def test_runner_rejects_eval_result_for_different_run(storage: SQLiteStorage, runner_factory) -> None:
     task = storage.create_task(
         Task(
@@ -778,13 +912,14 @@ def test_handoff_must_persist_before_agent_run_becomes_checkpoint(
 
     monkeypatch.setattr(runner.trace_logger, "record", fail_handoff_trace)
 
-    with pytest.raises(WorkflowRunnerError, match="handoff durability boundary failure"):
+    with pytest.raises(StorageError, match="handoff durability boundary failure"):
         runner.run(run, _demo_pack())
 
     agent_runs = storage.list_agent_runs_for_run(run.id)
     assert [(agent_run.step_name, agent_run.status) for agent_run in agent_runs] == [
-        ("plan", AgentRunStatus.FAILED)
+        ("plan", AgentRunStatus.RUNNING)
     ]
+    assert storage.get_run(run.id).status == RunStatus.RUNNING  # type: ignore[union-attr]
     assert len(storage.list_handoffs_for_run(run.id)) == 1
 
 

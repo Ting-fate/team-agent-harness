@@ -311,8 +311,13 @@
           <section id="routingView" class="view-page" aria-labelledby="workflowObserveTitle">
             <section class="panel overview-panel">
               <div class="section-title">
-                <h3 id="workflowObserveTitle">模型路由与工作流观察</h3>
-                <span id="selectedPackBadge" class="status-pill muted">未加载</span>
+                <div>
+                  <p class="eyebrow">模型控制面</p>
+                  <h2 id="workflowObserveTitle">模型路由</h2>
+                  <span class="sr-only">模型路由与工作流观察</span>
+                  <p class="panel-copy">只显示岗位分工、路由可用性和会影响运行结果的诊断。</p>
+                </div>
+                <span id="selectedPackBadge" class="status-pill muted">默认团队</span>
               </div>
               <div id="providerOverview" class="provider-overview empty">加载模型渠道目录后显示启用状态。</div>
               <div id="packOverview" class="pack-overview empty">加载工作流后显示步骤、智能体、模型配置与评估检查。</div>
@@ -400,11 +405,11 @@
                 <label>
                   <span>模型渠道</span>
                   <select id="bindingProvider" required></select>
-                  <small class="field-help">默认 GPT 使用 gpt5.6-sol 中转，DeepSeek 使用官方 deepseek-v4-flash；模型名必须与所选渠道配置一致。</small>
+                  <small class="field-help">默认 GPT 直连中转站 gpt-5.6-sol，DeepSeek 使用官方 deepseek-v4-flash；LiteLLM 使用兼容 alias gpt5.6-sol。</small>
                 </label>
                 <label>
                   <span>模型</span>
-                  <input id="bindingModel" type="text" placeholder="gpt5.6-sol / deepseek-v4-flash" required />
+                  <input id="bindingModel" type="text" placeholder="gpt-5.6-sol / deepseek-v4-flash" required />
                   <small class="field-help">填写对应模型渠道里可用的模型名。</small>
                 </label>
                 <label>
@@ -574,12 +579,13 @@
                   <div id="taskList" class="item-list empty">暂无任务</div>
                 </div>
 
-                <div>
-                  <div class="section-title">
-                    <h3>运行归纳</h3>
+                  <div>
+                    <div class="section-title">
+                      <h3>运行归纳</h3>
+                      <button id="purgeHistoryButton" class="danger-button" type="button" title="删除已完成、失败和取消的历史运行记录">清理历史运行</button>
+                    </div>
+                    <div id="runList" class="item-list empty">暂无运行记录</div>
                   </div>
-                  <div id="runList" class="item-list empty">暂无运行记录</div>
-                </div>
               </div>
             </section>
           </section>

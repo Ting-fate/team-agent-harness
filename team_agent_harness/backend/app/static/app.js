@@ -2,6 +2,7 @@ const state = {
   packs: [],
   selectedPackDetail: null,
   modelProviders: [],
+  providerDoctor: null,
   toolProviders: [],
   agents: [],
   roleCards: [],
@@ -84,6 +85,7 @@ const els = {
   runCount: document.querySelector("#runCount"),
   taskList: document.querySelector("#taskList"),
   runList: document.querySelector("#runList"),
+  purgeHistoryButton: document.querySelector("#purgeHistoryButton"),
   selectedRunBadge: document.querySelector("#selectedRunBadge"),
   selectedRunMeta: document.querySelector("#selectedRunMeta"),
   runtimeStatus: document.querySelector("#runtimeStatus"),
@@ -150,7 +152,7 @@ const viewMeta = {
   routingView: {
     eyebrow: "模型路由",
     title: "模型路由",
-    subtitle: "查看模型渠道状态、每个智能体的模型配置，以及工作流执行步骤。",
+    subtitle: "查看默认岗位分工、路由可用性和运行前诊断。",
   },
   roleCardsView: {
     eyebrow: "角色卡",
@@ -239,18 +241,19 @@ const agentRoleDisplay = {
 const providerDisplay = {
   mock: "本地模拟",
   openai: "OpenAI / GPT",
+  gpt_relay: "GPT 中转直连",
   deepseek: "DeepSeek",
   litellm_proxy: "LiteLLM 统一网关",
 };
 
 const MAX_TEAM_FALLBACKS = 4;
 const teamModelFamilies = new Set(["gpt", "deepseek"]);
-const teamModelProviders = new Set(["openai", "deepseek", "litellm_proxy"]);
+const teamModelProviders = new Set(["openai", "gpt_relay", "deepseek", "litellm_proxy"]);
 
 const routingPresets = {
   gptMainThread: {
-    provider: "litellm_proxy",
-    model: "gpt5.6-sol",
+    provider: "gpt_relay",
+    model: "gpt-5.6-sol",
     reasoning_effort: "xhigh",
     temperature: 0.2,
     max_tokens: "",
@@ -785,6 +788,7 @@ function setBusy(isBusy) {
   els.workflowRunCurrentButton.disabled = isBusy || !state.selectedTaskId;
   els.workflowTraceCurrentButton.disabled = isBusy || !state.selectedRunId;
   els.runSelectedButton.disabled = isBusy || !state.selectedTaskId;
+  els.purgeHistoryButton.disabled = isBusy;
   els.globalRunTaskButton.disabled = isBusy || !state.selectedTaskId;
   els.globalTraceButton.disabled = isBusy || !state.selectedRunId;
   els.useCustomTeam.disabled = isBusy || els.workflowPack.value === "auto";
@@ -932,13 +936,16 @@ function teamFamilyLabel(family) {
 }
 
 function defaultTeamModel(family, provider) {
-  if (provider === "openai") {
+  if (provider === "litellm_proxy") {
     return "gpt5.6-sol";
+  }
+  if (["openai", "gpt_relay"].includes(provider)) {
+    return "gpt-5.6-sol";
   }
   if (provider === "deepseek") {
     return "deepseek-v4-flash";
   }
-  return family === "deepseek" ? "deepseek-v4-flash" : "gpt5.6-sol";
+  return family === "deepseek" ? "deepseek-v4-flash" : "gpt-5.6-sol";
 }
 
 function teamRouteHasValidContract(route, options = {}) {
@@ -952,7 +959,7 @@ function teamRouteHasValidContract(route, options = {}) {
   ) {
     return false;
   }
-  if (route.provider === "openai") {
+  if (["openai", "gpt_relay"].includes(route.provider)) {
     return route.family === "gpt" && model.startsWith("gpt");
   }
   if (route.provider === "deepseek") {
@@ -1153,6 +1160,7 @@ function renderTeamFallbackRoutes(assignment, assignmentIndex) {
             <span>模型渠道</span>
             <select id="${providerId}" data-team-field="provider" data-team-slot="${escapeHtml(assignment.slot)}" data-team-fallback-index="${fallbackIndex}" required>
               <option value="litellm_proxy"${fallback.provider === "litellm_proxy" ? " selected" : ""}>LiteLLM</option>
+              <option value="gpt_relay"${fallback.provider === "gpt_relay" ? " selected" : ""}>GPT 中转直连</option>
               <option value="openai"${fallback.provider === "openai" ? " selected" : ""}>OpenAI</option>
               <option value="deepseek"${fallback.provider === "deepseek" ? " selected" : ""}>DeepSeek</option>
             </select>
@@ -1290,6 +1298,7 @@ function renderTeamConfigurator(options = {}) {
               <span>模型渠道</span>
               <select id="${providerId}" data-team-field="provider" data-team-slot="${escapeHtml(assignment.slot)}" required>
                 <option value="litellm_proxy"${route.provider === "litellm_proxy" ? " selected" : ""}>LiteLLM</option>
+                <option value="gpt_relay"${route.provider === "gpt_relay" ? " selected" : ""}>GPT 中转直连</option>
                 <option value="openai"${route.provider === "openai" ? " selected" : ""}>OpenAI</option>
                 <option value="deepseek"${route.provider === "deepseek" ? " selected" : ""}>DeepSeek</option>
               </select>
@@ -1348,14 +1357,14 @@ function updateTeamAssignment(event, options = {}) {
     route.model = options.trim ? target.value.trim() : target.value;
   } else if (field === "family") {
     route.family = target.value;
-    if (route.provider !== "litellm_proxy") {
-      route.provider = target.value === "deepseek" ? "deepseek" : "openai";
+    if (!["gpt_relay", "litellm_proxy"].includes(route.provider)) {
+      route.provider = target.value === "deepseek" ? "deepseek" : "gpt_relay";
     }
     route.model = defaultTeamModel(route.family, route.provider);
     renderTeamConfigurator({ focusId: target.id });
   } else if (field === "provider") {
     route.provider = target.value;
-    if (target.value === "openai") {
+    if (["openai", "gpt_relay"].includes(target.value)) {
       route.family = "gpt";
     } else if (target.value === "deepseek") {
       route.family = "deepseek";
@@ -1421,10 +1430,10 @@ async function loadSelectedPackDetail() {
 function renderPackOverview() {
   const pack = selectedPack();
   if (!pack) {
-    els.selectedPackBadge.className = "status-pill muted";
-    els.selectedPackBadge.textContent = "未加载";
+    els.selectedPackBadge.className = "status-pill ok";
+    els.selectedPackBadge.textContent = "默认团队";
     els.packOverview.className = "pack-overview empty";
-    els.packOverview.textContent = "加载工作流后显示步骤、智能体、模型配置与评估检查。";
+    els.packOverview.textContent = "在工作流页选择具体 Pack 后，这里会显示该 Pack 的实际岗位路由。";
     return;
   }
 
@@ -1433,120 +1442,106 @@ function renderPackOverview() {
   els.packOverview.className = "pack-overview";
   els.packOverview.innerHTML = `
     <article class="observer-block">
-      <h4>协作模型</h4>
-      <p>
-        Harness 主控线程编排工作流；子智能体按步骤和角色独立执行并回传摘要、产物和风险；
-        每个智能体通过模型配置路由到本地模拟、OpenAI、DeepSeek 或 LiteLLM 统一网关；执行方式和会话规则用来表达长期子会话或工程执行器边界。
-        当前仅记录本地会话、任务与审批意图；本地批准后恢复模拟或模型步骤，不启动外部工程执行器进程。
-      </p>
-    </article>
-    <article class="observer-block">
-      <h4>执行步骤</h4>
-      <ol class="observer-list">
-        ${pack.steps
-          .map((step, index) => `
-            <li>
-              <strong>${index + 1}. ${escapeHtml(step.name)} ｜ ${escapeHtml(step.agent_role)}</strong>
-              阶段：${escapeHtml(step.phase || "-")} ｜ 协调角色：${escapeHtml(coordinationLabel(step.coordination_role))} ｜ 产出：${escapeHtml(step.produces_artifact_type || "-")}<br />
-              执行方式：${escapeHtml(step.runtime || "model")}<br />
-              会话规则：${escapeHtml(formatSessionPolicy(step.session_policy))}<br />
-              控制步骤：${escapeHtml(step.controller_step || "-")}<br />
-              步骤依赖：${escapeHtml((step.depends_on || []).join(", ") || "-")}<br />
-              输入：${escapeHtml((step.required_inputs || []).join(", ") || "-")}<br />
-              依赖产物：${escapeHtml((step.required_artifacts || []).join(", ") || "-")}<br />
-              Gate：${escapeHtml(formatGateContext(step))}<br />
-              Ownership：${escapeHtml(formatOwnership(step.ownership))}<br />
-              返回要求：${escapeHtml(formatReturnContract(step.return_contract))}<br />
-              允许工具：${escapeHtml((step.allowed_tools || []).join(", ") || "-")}
-            </li>
-          `)
-          .join("")}
-      </ol>
-    </article>
-    <article class="observer-block">
-      <h4>智能体</h4>
-      <ul class="observer-list">
+      <h4>当前工作流路由</h4>
+      <p>这是 Pack 的基础路由；运行页的自定义团队会在提交时冻结并覆盖它，不能扩大工具权限或运行预算。</p>
+      <div class="route-table compact-route-table">
         ${pack.agents
           .map((agent) => `
-            <li>
+            <div class="route-row">
               <strong>${escapeHtml(agentRoleLabel(agent.role))}</strong>
-              <span class="muted-text"> ｜ ${escapeHtml(agent.role)}</span><br />
-              模型配置：${escapeHtml(formatModelConfig(agent))}<br />
-              工具权限：${escapeHtml((agent.tool_permissions || []).join(", ") || "-")}
-            </li>
+              <span>${escapeHtml(formatModelConfig(agent))}</span>
+              <span>${escapeHtml(agent.model_settings?.reasoning_effort || "xhigh")}</span>
+            </div>
           `)
           .join("")}
-      </ul>
+      </div>
     </article>
     <article class="observer-block">
-      <h4>评估检查</h4>
-      <ul class="observer-list">
-        ${(pack.eval_checks || [])
-          .map((check) => `
-            <li>
-              <strong>${escapeHtml(check.name)} ｜ ${escapeHtml(check.severity)}</strong>
-              ${escapeHtml(check.description)}<br />
-              需要：${escapeHtml((check.required_artifact_types || []).join(", ") || "-")}
-            </li>
-          `)
-          .join("")}
-      </ul>
+      <h4>执行边界</h4>
+      <p>执行步骤：${pack.steps.length} ｜ 智能体：${pack.agents.length} ｜ 评估检查：${(pack.eval_checks || []).length}</p>
+      <p>协作模型由主控线程编排，子智能体按执行步骤运行；移交 / 子智能体派发会保留返回要求、执行方式、会话规则、Gate 和 Ownership。</p>
+      <p>运行时会冻结模型配置、模型渠道、fallback、工具权限、上下文预算和 acceptance criteria；失败不会静默降级为 mock。</p>
+      <p>当前只记录本地会话、审批和队列状态；不启动外部工程执行器进程。</p>
+    </article>
+    <article class="observer-block">
+      <h4>实际决策入口</h4>
+      <p>需要改岗位模型时，去工作流页打开“自定义团队”；需要查中转站是否可用，看上方状态卡，不要从内部 adapter 名称判断。</p>
     </article>
   `;
 }
 
 function renderProviderOverview() {
-  if (!state.modelProviders.length && !state.toolProviders.length) {
+  if (!state.modelProviders.length && !state.providerDoctor) {
     els.providerOverview.className = "provider-overview empty";
-    els.providerOverview.textContent = "加载模型渠道和联网搜索状态后显示启用状态。";
+    els.providerOverview.textContent = "加载模型路由诊断后显示默认分工和可用性。";
     return;
   }
 
   els.providerOverview.className = "provider-overview";
+  const routeMode = state.providerDoctor?.gpt_route_mode || "direct";
+  const gptProvider = routeMode === "litellm" ? "litellm_proxy" : "gpt_relay";
+  const gptProviderLabel = routeMode === "litellm" ? "LiteLLM 高级模式" : "GPT 中转直连";
+  const defaultRows = [
+    ["Planner / Writer / Final Reviewer", gptProviderLabel, routeMode === "litellm" ? "gpt5.6-sol" : "gpt-5.6-sol", "DeepSeek 官方", "规划、写作和最终把关"],
+    ["Searcher / Reader / Verifier", "DeepSeek 官方", "deepseek-v4-flash", "无", "搜索、长上下文阅读和事实核验"],
+  ];
+  const doctorByName = new Map((state.providerDoctor?.providers || []).map((provider) => [provider.name, provider]));
+  const trace = state.selectedRunDetail?.trace || [];
+  const receiptEvent = [...trace].reverse().find((event) => Array.isArray(event.payload?.route_receipt));
+  const routeReceipt = receiptEvent?.payload?.route_receipt || [];
+  const routeProviderCards = [
+    [gptProvider, `${gptProviderLabel}（${routeMode === "direct" ? state.providerDoctor?.gpt_relay_protocol || "chat_completions" : "chat_completions"}）`],
+    ["deepseek", "DeepSeek 官方"],
+  ].map(([name, label]) => {
+    const provider = doctorByName.get(name) || state.modelProviders.find((item) => item.name === name);
+    const health = provider?.health || {};
+    const ready = provider?.ready ?? (provider?.enabled && provider?.real_calls_configured);
+    const status = ready ? "ok" : "danger";
+    const detail = ready
+      ? health.average_latency_ms ? `平均延迟约 ${Math.round(health.average_latency_ms)} ms` : "凭据和适配器已就绪"
+      : health.last_error_class ? `最近错误：${health.last_error_class}` : "未配置或未启用";
+    return `
+      <section class="route-health-card ${status}">
+        <header><strong>${label}</strong>${renderStatusPill(status, ready ? "可用" : "不可用")}</header>
+        <p>${escapeHtml(detail)}</p>
+        <small>${provider?.real_calls_configured ? "真实凭据已配置" : "等待服务端配置"} ｜ ${provider?.health?.circuit_open ? "熔断中" : "熔断未打开"}</small>
+      </section>
+    `;
+  }).join("");
   els.providerOverview.innerHTML = `
     <article class="observer-block">
-      <h4>模型渠道</h4>
-      <div class="provider-grid">
-        ${state.modelProviders
-          .map((provider) => {
-            const tone = provider.real_calls ? "real" : "mock";
-            return `
-              <section class="provider-card ${tone}">
-                <header>
-                  <strong>${escapeHtml(provider.name)}</strong>
-                  <span class="model-chip">${escapeHtml(provider.adapter)}</span>
-                </header>
-                <p>状态：${provider.enabled ? "启用" : "未启用"} ｜ 真实调用能力：${provider.real_calls ? "是" : "否"}</p>
-                <p>凭据已配置：${provider.real_calls_configured ? "是" : "否"} ｜ 凭据：${provider.requires_credentials ? "需要" : "不需要"}</p>
-                <p>${escapeHtml(provider.description)}</p>
-              </section>
-            `;
-          })
-          .join("")}
+      <h4>默认岗位分工</h4>
+      <div class="route-table">
+        ${defaultRows.map(([roles, primary, model, fallback, purpose]) => `
+          <div class="route-row">
+            <strong>${roles}</strong>
+            <span>${primary} / ${model}</span>
+            <span>fallback：${fallback}</span>
+            <small>${purpose} ｜ reasoning：xhigh</small>
+          </div>
+        `).join("")}
       </div>
+      <p class="route-note">用户可以在工作流页按岗位选择已配置的 GPT 或 DeepSeek 模型；提交运行后会冻结实际路由。</p>
     </article>
     <article class="observer-block">
-      <h4>联网工具</h4>
-      <div class="provider-grid">
-        ${state.toolProviders
-          .map((provider) => {
-            const tone = provider.real_calls ? "real" : "mock";
-            return `
-              <section class="provider-card ${tone}">
-                <header>
-                  <strong>${escapeHtml(provider.name)}</strong>
-                  <span class="model-chip">${escapeHtml(provider.adapter)}</span>
-                </header>
-                <p>服务：${escapeHtml(provider.provider)} ｜ 状态：${provider.enabled ? "启用" : "未启用"}</p>
-                <p>真实联网：${provider.real_calls ? "是" : "否"} ｜ 凭据已配置：${provider.real_calls_configured ? "是" : "否"}</p>
-                <p>Chrome/CDP：${provider.provider === "chrome" ? "Google Chrome 桥接" : provider.adapter === "browser_cdp" ? "本地 CDP 桥接" : "不适用"} ｜ 仅 Research 的 browser_search/browser_fetch 使用。</p>
-                <p>${escapeHtml(provider.description)}</p>
-              </section>
-            `;
-          })
-          .join("")}
-      </div>
+      <h4>当前可用性诊断</h4>
+      <div class="route-health-grid">${routeProviderCards}</div>
+      <p class="route-note">诊断不会发起模型请求；“可用”只表示服务端已配置并通过本地 readiness gate，真实运行仍需要逐次确认。</p>
     </article>
+    ${routeReceipt.length ? `
+      <article class="observer-block">
+        <h4>最近运行路由结果</h4>
+        <div class="route-table compact-route-table">
+          ${routeReceipt.map((entry) => `
+            <div class="route-row">
+              <strong>${escapeHtml(`${entry.provider || "-"} / ${entry.model || "-"}`)}</strong>
+              <span>${escapeHtml(entry.outcome || "-")}</span>
+              <span>${escapeHtml(entry.reason || entry.error_class || "-")}</span>
+            </div>
+          `).join("")}
+        </div>
+      </article>
+    ` : ""}
   `;
 }
 
@@ -1562,14 +1557,15 @@ function defaultModelForProvider(provider) {
   const defaults = {
     mock: "mock-model",
     litellm_proxy: "gpt5.6-sol",
-    openai: "gpt5.6-sol",
+    openai: "gpt-5.6-sol",
+    gpt_relay: "gpt-5.6-sol",
     deepseek: "deepseek-v4-flash",
   };
   return defaults[provider] || "";
 }
 
 function defaultReasoningEffortForModel(provider, model) {
-  if (["openai", "deepseek", "litellm_proxy"].includes(provider)) {
+  if (["openai", "gpt_relay", "deepseek", "litellm_proxy"].includes(provider)) {
     return "xhigh";
   }
   return "";
@@ -1660,7 +1656,7 @@ function renderRoleCards() {
     els.bindingAgent.value = currentAgent;
   }
 
-  const providers = state.modelProviders.filter((provider) => ["mock", "openai", "deepseek", "litellm_proxy"].includes(provider.name));
+  const providers = state.modelProviders.filter((provider) => ["mock", "openai", "gpt_relay", "deepseek", "litellm_proxy"].includes(provider.name));
   const currentProvider = els.bindingProvider.value;
   els.bindingProvider.innerHTML = providers
     .map((provider) => `<option value="${escapeHtml(provider.name)}">${escapeHtml(providerLabel(provider.name))} ｜ ${escapeHtml(provider.name)} ｜ ${provider.real_calls ? "真实调用" : "模拟"}</option>`)
@@ -2172,6 +2168,7 @@ function renderRunCard(run) {
 
 function renderRuns() {
   els.runCount.textContent = state.runs.length;
+  els.purgeHistoryButton.disabled = state.isBusy;
   const visibleRuns = filteredRuns();
 
   if (!visibleRuns.length) {
@@ -2634,6 +2631,9 @@ async function renderRunDetails() {
   renderFailureSummary(detail.run, trace, artifacts, evalResults);
   renderExecutionChain(agentRuns, handoffs, artifacts, evalResults, trace, runtimeSessions, runtimeJobs, detail.run);
   renderEvalResults(evalResults);
+  if (state.activeView === "routingView") {
+    renderProviderOverview();
+  }
 
   els.tracePanel.innerHTML = trace.length
     ? trace
@@ -2702,6 +2702,28 @@ function updateAutoRefresh() {
   }
 }
 
+function runSummaryListsEqual(left, right) {
+  const fields = ["id", "task_id", "status", "current_step", "started_at", "finished_at", "final_artifact_id"];
+  return left.length === right.length && left.every((run, index) => {
+    const candidate = right[index];
+    return candidate && fields.every((field) => run[field] === candidate[field]);
+  });
+}
+
+async function resolveMissingRunTasks(tasks, runs, requestOptions) {
+  const knownTaskIds = new Set(tasks.map((task) => task.id));
+  const missingTaskIds = [...new Set(runs.map((run) => run.task_id))]
+    .filter((taskId) => !knownTaskIds.has(taskId))
+    .slice(0, 50);
+  if (!missingTaskIds.length) {
+    return tasks;
+  }
+  const loadedTasks = await Promise.all(
+    missingTaskIds.map((taskId) => api(`/tasks/${encodeURIComponent(taskId)}`, requestOptions)),
+  );
+  return [...loadedTasks, ...tasks];
+}
+
 function syncSelectionAfterRefresh() {
   if (state.selectedTaskId && !state.tasks.some((task) => task.id === state.selectedTaskId)) {
     state.selectedTaskId = null;
@@ -2747,16 +2769,17 @@ async function refreshDataOnce(options = {}) {
     let tasks;
     let runs;
     if (options.runtimeOnly) {
-      [health, tasks, runs] = await Promise.all([
+      [health, runs] = await Promise.all([
         api("/health", requestOptions),
-        api("/tasks?limit=500", requestOptions),
-        api("/runs?limit=500", requestOptions),
+        api("/runs/summaries?limit=500", requestOptions),
       ]);
+      tasks = state.tasks;
     } else {
       const [
         loadedHealth,
         packs,
         modelProviders,
+        providerDoctor,
         toolProviders,
         agents,
         roleCards,
@@ -2770,6 +2793,7 @@ async function refreshDataOnce(options = {}) {
         api("/health", requestOptions),
         api("/workflow-packs", requestOptions),
         api("/model-providers", requestOptions),
+        api("/providers/doctor", requestOptions),
         api("/tool-providers", requestOptions),
         api("/agents", requestOptions),
         api("/role-cards", requestOptions),
@@ -2778,13 +2802,14 @@ async function refreshDataOnce(options = {}) {
         api("/skill-bindings", requestOptions),
         api("/skill-auto-routes", requestOptions),
         api("/tasks?limit=500", requestOptions),
-        api("/runs?limit=500", requestOptions),
+        api("/runs/summaries?limit=500", requestOptions),
       ]);
       health = loadedHealth;
       tasks = loadedTasks;
       runs = loadedRuns;
       state.packs = packs;
       state.modelProviders = modelProviders;
+      state.providerDoctor = providerDoctor;
       state.toolProviders = toolProviders;
       state.agents = agents;
       state.roleCards = roleCards;
@@ -2794,6 +2819,8 @@ async function refreshDataOnce(options = {}) {
       state.skillAutoRoutes = skillAutoRoutes;
     }
 
+    tasks = await resolveMissingRunTasks(tasks, runs, requestOptions);
+    const runSummariesChanged = !runSummaryListsEqual(state.runs, runs);
     state.tasks = tasks;
     state.runs = runs;
     state.lastRefreshAt = Date.now();
@@ -2804,17 +2831,20 @@ async function refreshDataOnce(options = {}) {
 
     syncSelectionAfterRefresh();
 
-    runtimeFocus = options.runtimeOnly ? captureRuntimeFocus() : null;
+    const renderSelections = !options.runtimeOnly || runSummariesChanged;
+    runtimeFocus = options.runtimeOnly && renderSelections ? captureRuntimeFocus() : null;
 
     if (!options.runtimeOnly) {
       renderCatalog();
       await loadSelectedPackDetail();
     }
-    renderGlobalRunBar();
-    renderRunConsole();
-    renderTasks();
-    renderRuns();
-    renderWorkflowCurrent();
+    if (renderSelections) {
+      renderGlobalRunBar();
+      renderRunConsole();
+      renderTasks();
+      renderRuns();
+      renderWorkflowCurrent();
+    }
     if (!options.runtimeOnly) {
       renderProviderOverview();
       renderPackOverview();
@@ -3560,6 +3590,29 @@ async function deleteSelectedAgentBinding() {
   syncBindingFormFromSelectedAgent(true);
 }
 
+async function purgeHistoryRecords() {
+  const confirmed = window.confirm(
+    "将删除服务器中全部已完成、失败或取消且不再活跃的历史运行及其产物。任务定义和正在运行的任务会保留。当前列表可能只显示部分历史，实际范围由服务器重新判定。继续吗？",
+  );
+  if (!confirmed) {
+    return;
+  }
+  const result = await api("/records/history", { method: "DELETE" });
+  if (result.run_ids?.includes(state.selectedRunId)) {
+    state.selectedRunId = null;
+    state.selectedRunDetail = null;
+  }
+  if (result.status === "partial") {
+    showToast(
+      `历史记录已删除，但有 ${result.artifact_files_rejected || 0} 个产物文件未能清理。`,
+      "danger",
+    );
+  } else {
+    showToast(`已清理 ${result.runs_deleted || 0} 条历史运行，删除 ${result.artifact_files_deleted || 0} 个产物文件。`);
+  }
+  await refreshData({ feedback: true });
+}
+
 async function runAction(callback) {
   if (state.isBusy) {
     return;
@@ -3789,6 +3842,8 @@ els.clearRecordFiltersButton.addEventListener("click", () => {
   els.recordStatusFilter.value = "all";
   renderRunSelectionViews();
 });
+
+els.purgeHistoryButton.addEventListener("click", () => runAction(purgeHistoryRecords));
 
 els.workflowRunCurrentButton.addEventListener("click", () => {
   if (!state.selectedTaskId) {

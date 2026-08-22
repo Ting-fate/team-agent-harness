@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import codecs
+from dataclasses import dataclass
 from hashlib import sha256
 import os
 from pathlib import Path
 import stat
+from uuid import uuid4
 
 from app.core.models import Artifact, ArtifactType, TraceEventType
 from app.core.storage import SQLiteStorage
@@ -13,6 +15,13 @@ from app.core.trace import TraceLogger
 
 class ArtifactStoreError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ArtifactPurgeQuarantine:
+    root: Path | None
+    moved: tuple[tuple[Path, Path], ...]
+    missing: int
 
 
 class ArtifactStore:
@@ -260,6 +269,118 @@ class ArtifactStore:
         artifact_path = self._existing_artifact_path(artifact.path)
         return artifact_path.read_text(encoding="utf-8")
 
+    def quarantine_relative_files(self, paths: list[str]) -> ArtifactPurgeQuarantine:
+        if len(paths) != len(set(paths)):
+            raise ArtifactStoreError("artifact purge paths must be unique")
+        if not paths:
+            return ArtifactPurgeQuarantine(root=None, moved=(), missing=0)
+        quarantine_root = self.root_dir / "_purge_quarantine" / uuid4().hex
+        self._ensure_under_root(quarantine_root)
+        self._ensure_no_reparse_components(quarantine_root, allow_missing=True)
+        moved: list[tuple[Path, Path]] = []
+        missing = 0
+        try:
+            for relative_path in paths:
+                source = self._purge_source_path(relative_path)
+                try:
+                    source_stat = source.lstat()
+                except FileNotFoundError:
+                    missing += 1
+                    continue
+                except OSError as exc:
+                    raise ArtifactStoreError("artifact purge source could not be inspected") from exc
+                self._assert_regular_unlinked_stat(source_stat)
+                raw_path = Path(relative_path)
+                target = quarantine_root.joinpath(*raw_path.parts)
+                self._ensure_under_root(target)
+                self._ensure_no_reparse_components(target, allow_missing=True)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+                moved.append((source, target))
+        except Exception as exc:
+            try:
+                self._restore_quarantine_moves(moved)
+            except ArtifactStoreError as rollback_exc:
+                raise ArtifactStoreError(
+                    "artifact purge preparation failed and rollback was incomplete"
+                ) from rollback_exc
+            self._remove_empty_quarantine_dirs(quarantine_root)
+            if isinstance(exc, ArtifactStoreError):
+                raise
+            raise ArtifactStoreError("artifact purge preparation failed") from exc
+        return ArtifactPurgeQuarantine(
+            root=quarantine_root,
+            moved=tuple(moved),
+            missing=missing,
+        )
+
+    def restore_quarantined_files(self, quarantine: ArtifactPurgeQuarantine) -> None:
+        self._restore_quarantine_moves(list(quarantine.moved))
+        if quarantine.root is not None:
+            self._remove_empty_quarantine_dirs(quarantine.root)
+
+    def discard_quarantined_files(self, quarantine: ArtifactPurgeQuarantine) -> dict[str, int]:
+        deleted = 0
+        missing = quarantine.missing
+        rejected = 0
+        for source, target in quarantine.moved:
+            try:
+                target.unlink()
+                deleted += 1
+            except FileNotFoundError:
+                missing += 1
+            except OSError:
+                rejected += 1
+            try:
+                if source.parent != self.root_dir and not any(source.parent.iterdir()):
+                    source.parent.rmdir()
+            except (FileNotFoundError, OSError):
+                pass
+        if quarantine.root is not None:
+            self._remove_empty_quarantine_dirs(quarantine.root)
+        return {"deleted": deleted, "missing": missing, "rejected": rejected}
+
+    def recover_purge_quarantines(self) -> dict[str, int]:
+        quarantine_parent = self.root_dir / "_purge_quarantine"
+        try:
+            parent_stat = quarantine_parent.lstat()
+        except FileNotFoundError:
+            return {"restored": 0, "deleted": 0}
+        except OSError as exc:
+            raise ArtifactStoreError("artifact purge quarantine could not be inspected") from exc
+        if not stat.S_ISDIR(parent_stat.st_mode) or _is_reparse_point(
+            quarantine_parent,
+            parent_stat,
+        ):
+            raise ArtifactStoreError("artifact purge quarantine root is invalid")
+        self._ensure_no_reparse_components(quarantine_parent, allow_missing=False)
+        try:
+            roots = list(quarantine_parent.iterdir())
+        except OSError as exc:
+            raise ArtifactStoreError("artifact purge quarantine could not be listed") from exc
+        restored = 0
+        deleted = 0
+        for root in roots:
+            if not root.is_dir() or root.is_symlink() or _is_reparse_point(root, root.lstat()):
+                raise ArtifactStoreError("artifact purge quarantine contains an invalid entry")
+            if len(root.name) != 32 or any(char not in "0123456789abcdef" for char in root.name):
+                raise ArtifactStoreError("artifact purge quarantine id is invalid")
+            moves = self._quarantine_moves_from_disk(root)
+            run_exists = {self.storage.get_run(source.parent.name) is not None for source, _target in moves}
+            if len(run_exists) > 1:
+                raise ArtifactStoreError("artifact purge quarantine has mixed database state")
+            quarantine = ArtifactPurgeQuarantine(root=root, moved=tuple(moves), missing=0)
+            if run_exists == {True}:
+                self.restore_quarantined_files(quarantine)
+                restored += len(moves)
+            else:
+                result = self.discard_quarantined_files(quarantine)
+                if result["rejected"]:
+                    raise ArtifactStoreError("artifact purge quarantine cleanup failed")
+                deleted += result["deleted"]
+        self._remove_empty_quarantine_dirs(quarantine_parent)
+        return {"restored": restored, "deleted": deleted}
+
     def read_text_verified(self, artifact: Artifact) -> str:
         artifact_path = self._existing_artifact_path(artifact.path)
         try:
@@ -316,6 +437,77 @@ class ArtifactStore:
         self._ensure_under_root(artifact_path)
         self._ensure_no_reparse_components(artifact_path, allow_missing=True)
         return artifact_path
+
+    def _purge_source_path(self, relative_path: str) -> Path:
+        if not isinstance(relative_path, str) or not relative_path:
+            raise ArtifactStoreError("artifact purge path must be a relative path")
+        raw_path = Path(relative_path)
+        if raw_path.is_absolute() or len(raw_path.parts) != 2:
+            raise ArtifactStoreError("artifact purge path must contain a Run id and filename")
+        return self._artifact_path(raw_path.parts[0], raw_path.parts[1])
+
+    def _restore_quarantine_moves(self, moves: list[tuple[Path, Path]]) -> None:
+        for source, target in reversed(moves):
+            try:
+                target_stat = target.lstat()
+                self._assert_regular_unlinked_stat(target_stat)
+                self._ensure_under_root(source)
+                self._ensure_no_reparse_components(source, allow_missing=True)
+                if source.exists():
+                    raise ArtifactStoreError("artifact purge rollback destination already exists")
+                source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, source)
+            except FileNotFoundError:
+                try:
+                    source_stat = source.lstat()
+                    self._assert_regular_unlinked_stat(source_stat)
+                except (FileNotFoundError, OSError, ArtifactStoreError) as exc:
+                    raise ArtifactStoreError(
+                        "artifact purge rollback source and quarantine copy are both unavailable"
+                    ) from exc
+            except ArtifactStoreError:
+                raise
+            except OSError as exc:
+                raise ArtifactStoreError("artifact purge rollback failed") from exc
+
+    def _quarantine_moves_from_disk(self, root: Path) -> list[tuple[Path, Path]]:
+        moves: list[tuple[Path, Path]] = []
+        for run_dir in root.iterdir():
+            if not run_dir.is_dir() or run_dir.is_symlink() or _is_reparse_point(run_dir, run_dir.lstat()):
+                raise ArtifactStoreError("artifact purge quarantine Run entry is invalid")
+            self._ensure_simple_segment(run_dir.name, "quarantine run_id")
+            for target in run_dir.iterdir():
+                if not target.is_file() or target.is_symlink() or _is_reparse_point(target, target.lstat()):
+                    raise ArtifactStoreError("artifact purge quarantine file entry is invalid")
+                self._ensure_simple_segment(target.name, "quarantine filename")
+                self._assert_regular_unlinked_stat(target.lstat())
+                moves.append((self._artifact_path(run_dir.name, target.name), target))
+        return moves
+
+    def _remove_empty_quarantine_dirs(self, root: Path) -> None:
+        if root.exists() and root.is_dir():
+            directories = sorted(
+                (path for path in root.rglob("*") if path.is_dir()),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            )
+            for directory in directories:
+                try:
+                    directory.rmdir()
+                except OSError:
+                    continue
+        current = root
+        quarantine_parent = self.root_dir / "_purge_quarantine"
+        while current != self.root_dir:
+            try:
+                current.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                break
+            if current == quarantine_parent:
+                break
+            current = current.parent
 
     def _ensure_simple_segment(self, value: str, field_name: str) -> None:
         if (
