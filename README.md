@@ -242,12 +242,10 @@ Latest local verification on 2026-08-23:
   seconds. The browser then proved that active polling requests only health,
   Run summaries, and the selected Run detail.
 
-These results describe the local worktree, not the current GitHub remote until
-the current changes are pushed. The latest previously published CI evidence is
-commit `d23a99c`: [GitHub Actions run
-`31795016194`](https://github.com/Ting-fate/team-agent-harness/actions/runs/31795016194)
-passed on Windows Python 3.12, 3.13, and 3.14 with
-`1325 passed, 1 skipped, 1 warning` in every job.
+These results are now synchronized with GitHub commit `6fe27b9`: [GitHub
+Actions run `32587277159`](https://github.com/Ting-fate/team-agent-harness/actions/runs/32587277159)
+passed on Windows Python 3.12, 3.13, and 3.14. Each job reported
+`1371 passed, 1 skipped, 1 warning`.
 
 ## Not Included
 
