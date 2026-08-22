@@ -473,6 +473,20 @@ function Save-EnvFile {
     Write-EnvFileAtomically -Path $EnvFile -Lines $content.ToArray()
 }
 
+function Get-LauncherComboValue {
+    param(
+        [System.Windows.Forms.ComboBox]$ComboBox
+    )
+    if ($null -eq $ComboBox -or $null -eq $ComboBox.SelectedItem) {
+        throw "A launcher option must be selected."
+    }
+    $value = [string]$ComboBox.SelectedItem.Value
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "The selected launcher option has no internal value."
+    }
+    return $value
+}
+
 function Test-HarnessUiReady {
     param([int]$Port = 8014)
     return [bool](& $HarnessReadinessProbe $Port $HarnessPython $HarnessBasePython $Root)
@@ -1544,13 +1558,15 @@ $script:StartupTimer.Add_Tick({ Update-StartupState })
 
 Button $T.SaveConfig 20 392 {
     try {
+        $routeMode = Get-LauncherComboValue $comboBoxes["GPT Route Mode"]
+        $relayProtocol = Get-LauncherComboValue $comboBoxes["GPT Relay Protocol"]
         Save-EnvFile `
             -LiteLlmApiKey $textBoxes["LiteLLM API Key"].Text.Trim() `
             -OpenAiApiKey $textBoxes["OpenAI Relay Key"].Text.Trim() `
             -OpenAiApiBase $textBoxes["OpenAI Base URL"].Text.Trim() `
             -DeepSeekApiKey $textBoxes["DeepSeek API Key"].Text.Trim() `
-            -RouteMode ([string]$comboBoxes["GPT Route Mode"].SelectedValue) `
-            -RelayProtocol ([string]$comboBoxes["GPT Relay Protocol"].SelectedValue)
+            -RouteMode $routeMode `
+            -RelayProtocol $relayProtocol
         Append-Log $T.SavedConfig
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, $T.SaveFailed, "OK", "Error") | Out-Null
@@ -1559,6 +1575,8 @@ Button $T.SaveConfig 20 392 {
 
 $script:StartButton = Button $T.StartServices 180 392 {
     try {
+        $routeMode = Get-LauncherComboValue $comboBoxes["GPT Route Mode"]
+        $relayProtocol = Get-LauncherComboValue $comboBoxes["GPT Relay Protocol"]
         if ($script:StartupProcess) {
             $script:StartupProcess.Refresh()
             if (-not $script:StartupProcess.HasExited) {
@@ -1577,15 +1595,15 @@ $script:StartButton = Button $T.StartServices 180 392 {
             -OpenAiApiKey $textBoxes["OpenAI Relay Key"].Text.Trim() `
             -OpenAiApiBase $textBoxes["OpenAI Base URL"].Text.Trim() `
             -DeepSeekApiKey $textBoxes["DeepSeek API Key"].Text.Trim() `
-            -RouteMode ([string]$comboBoxes["GPT Route Mode"].SelectedValue) `
-            -RelayProtocol ([string]$comboBoxes["GPT Relay Protocol"].SelectedValue)
+            -RouteMode $routeMode `
+            -RelayProtocol $relayProtocol
 
         New-Item -ItemType Directory -Force $OutputDir | Out-Null
         $startupId = Get-Date -Format "yyyyMMdd-HHmmss-fff"
         $script:StartupLogPath = Join-Path $OutputDir "startup-supervisor-$startupId.log"
         $script:StartupErrorLogPath = Join-Path $OutputDir "startup-supervisor-$startupId.err.log"
         $argumentLine = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -LiteLlmPython "{1}" -RouteMode "{2}"' -f `
-            $StartScript, $LiteLlmPython, ([string]$comboBoxes["GPT Route Mode"].SelectedValue)
+            $StartScript, $LiteLlmPython, $routeMode
         $script:StartupProcess = Start-Process `
             -FilePath "powershell.exe" `
             -ArgumentList $argumentLine `

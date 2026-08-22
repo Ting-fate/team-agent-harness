@@ -176,7 +176,7 @@ def _agent(
         runtime_limits={
             "max_steps": 8,
             "max_tool_calls": 16,
-            "max_total_tokens": 128_000,
+            "max_total_tokens": 64_000,
             "timeout_seconds": 900,
             "max_repeated_tool_calls": 2,
             "max_observation_chars": 20_000,

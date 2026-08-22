@@ -31,6 +31,7 @@ _ALLOWED_FIELD_NAMES = {
     "model",
     "temperature",
     "max_tokens",
+    "continuation_attempts",
     "reasoning_effort",
     "allow_real_calls",
     "allow_mock_fallback",
@@ -77,6 +78,7 @@ class ModelRoute(HarnessModel):
     model: str = Field(min_length=1)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0, le=200000)
+    continuation_attempts: int = Field(default=0, ge=0, le=3)
     reasoning_effort: str | None = Field(default=None, min_length=1)
     allow_real_calls: bool = False
     allow_mock_fallback: bool = False
@@ -200,6 +202,8 @@ def _apply_agent_route(agent: AgentDefinition, route: ModelRoute | None) -> Agen
         model_settings.pop("allow_mock_fallback", None)
     if not route.fallbacks:
         model_settings.pop("fallbacks", None)
+    if model_settings.get("continuation_attempts") == 0:
+        model_settings.pop("continuation_attempts", None)
     model_settings.setdefault(
         "reasoning_effort",
         default_reasoning_effort_for_model(route.provider, route.model),

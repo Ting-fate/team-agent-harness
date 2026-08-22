@@ -92,3 +92,12 @@ def test_active_routes_use_bounded_output_budgets() -> None:
     assert {
         agent_id: local_config["agents"][agent_id]["max_tokens"] for agent_id in local_expected
     } == local_expected
+
+
+def test_builtin_agent_runtime_token_caps_are_100k() -> None:
+    packs = [get_code_rd_pack(), get_research_pack(), get_code_rd_institutional_pack()]
+    for pack in packs:
+        assert {
+            agent.runtime_limits["max_total_tokens"]
+            for agent in pack.agents
+        } == {64_000}

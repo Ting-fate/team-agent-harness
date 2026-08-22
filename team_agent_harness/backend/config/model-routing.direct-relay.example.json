@@ -59,6 +59,7 @@
       "provider": "deepseek",
       "model": "deepseek-v4-flash",
       "max_tokens": 4096,
+      "continuation_attempts": 2,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
@@ -66,6 +67,7 @@
       "provider": "deepseek",
       "model": "deepseek-v4-flash",
       "max_tokens": 4096,
+      "continuation_attempts": 2,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
@@ -73,6 +75,7 @@
       "provider": "deepseek",
       "model": "deepseek-v4-flash",
       "max_tokens": 4096,
+      "continuation_attempts": 2,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },
@@ -81,6 +84,7 @@
       "model": "gpt-5.6-sol",
       "fallbacks": [{"provider": "deepseek", "model": "deepseek-v4-flash", "reason": "gpt_relay_fallback", "allow_real_calls": true}],
       "max_tokens": 700,
+      "continuation_attempts": 2,
       "allow_real_calls": true,
       "reasoning_effort": "xhigh"
     },

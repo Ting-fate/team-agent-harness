@@ -77,6 +77,7 @@ defaults, but it does not bypass per-run real-model consent.
 | Restart recovery | Available | Only validated completed checkpoints are reused |
 | Configurable GPT + DeepSeek teams | Available | Selection cannot widen the Pack DAG, tools, ownership, or runtime limits |
 | GPT relay fallback to DeepSeek | Available | Retryable transport/upstream failures only; auth and local validation failures fail closed |
+| Bounded continuation and empty-response recovery | Available | Opt-in per route, shared deadline, at most three continuations, one empty-response retry |
 | Bounded Agent Loop | Opt-in | Step, token, time, tool, repetition, and estimated-cost budgets |
 | Planner/operator DAG | Available | Plan is schema-validated, permission-bounded, then frozen for the Run |
 | Parallel branches | Available where safe | Dependencies and workspace ownership must not conflict |
@@ -208,7 +209,7 @@ the option to choose a separate license or commercial model later.
 
 ## Verification
 
-Latest local verification on 2026-08-22:
+Latest local verification on 2026-08-23:
 
 - Default run-scoped routing is direct `gpt_relay/gpt-5.6-sol` for Planner, Writer,
   and Final Reviewer, with official `deepseek-v4-flash` for Searcher, Reader,
@@ -218,13 +219,15 @@ Latest local verification on 2026-08-22:
   level after capability validation.
 - Direct Chat Completions smoke passed with `23` total tokens; official DeepSeek
   smoke passed, and a controlled retryable GPT failure selected real DeepSeek.
-- A real Codex-authored Research plan completed 6/6 DeepSeek roles, passed the
-  quality gate, and returned a 2,123-character hash-bound final artifact with no
-  error trace. Port `4000` was not listening in direct mode.
-- The full local backend suite passed `1360 passed, 5 skipped, 1 warning` after
-  the direct-relay, recovery, routing, history-cleanup, security, polling, and Codex delegation updates. The
-  warning is the existing Starlette `TestClient` deprecation notice; no test or
-  runtime failure remains.
+- A real Research Run `873ce8a4-9d15-4c77-badb-8250006e5b61` completed all six
+  steps, passed all `28/28` quality checks, and returned final artifact
+  `55893fc2-5a2a-4f68-a0d6-73f8be741506`. Reader used one bounded continuation;
+  the final artifact contained no provider `DSML`, `tool_calls`, or tool-envelope
+  markup. The run used official DeepSeek fallback where the GPT relay failed.
+- The full local backend suite passed `1367 passed, 5 skipped, 1 warning` after
+  bounded continuation, empty-response retry, step-level route deadlines, and
+  provider-output sanitization updates. The warning is the existing Starlette
+  `TestClient` deprecation notice; no test or runtime failure remains.
 - `compileall`, JavaScript syntax, PowerShell parsing, JSON parsing, `pip check`,
   `git diff --check`, and a high-confidence credential scan passed.
 - Direct mode left port `4000` unused. Desktop and 390-pixel browser checks had
@@ -239,8 +242,9 @@ Latest local verification on 2026-08-22:
   seconds. The browser then proved that active polling requests only health,
   Run summaries, and the selected Run detail.
 
-These results describe the local worktree, not the current GitHub remote. The
-latest published CI evidence is commit `5643b69`: [GitHub Actions run
+These results describe the local worktree, not the current GitHub remote until
+the current changes are pushed. The latest previously published CI evidence is
+commit `d23a99c`: [GitHub Actions run
 `31795016194`](https://github.com/Ting-fate/team-agent-harness/actions/runs/31795016194)
 passed on Windows Python 3.12, 3.13, and 3.14 with
 `1325 passed, 1 skipped, 1 warning` in every job.

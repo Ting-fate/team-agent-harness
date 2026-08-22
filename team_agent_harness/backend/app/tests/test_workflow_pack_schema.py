@@ -2,7 +2,15 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.models import AgentDefinition
-from app.packs.base import ContextPolicy, EvalCheck, ReturnContract, SessionPolicy, WorkflowPack, WorkflowStep
+from app.packs.base import (
+    AgentLoopPolicy,
+    ContextPolicy,
+    EvalCheck,
+    ReturnContract,
+    SessionPolicy,
+    WorkflowPack,
+    WorkflowStep,
+)
 
 
 def _agent(role: str) -> AgentDefinition:
@@ -96,9 +104,10 @@ def test_workflow_step_context_policy_serializes_and_rejects_negative_budgets() 
         "artifact_excerpt_chars": 16000,
         "max_artifacts": 6,
         "max_upstream_handoffs": 4,
-        "max_context_chars": 100000,
-        "max_context_bytes": 300000,
+        "max_context_chars": 120000,
+        "max_context_bytes": 480000,
     }
+    assert AgentLoopPolicy().max_total_tokens == 64000
     with pytest.raises(ValidationError):
         ContextPolicy(artifact_excerpt_chars=-1)
     with pytest.raises(ValidationError):

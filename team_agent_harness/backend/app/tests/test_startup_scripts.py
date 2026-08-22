@@ -1481,6 +1481,43 @@ def test_launcher_start_path_does_not_gate_harness_on_provider_credentials() -> 
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for launcher behavior testing")
+def test_launcher_combo_values_are_read_from_selected_items() -> None:
+    launcher_path = str(LAUNCHER).replace("'", "''")
+    command = f"""
+. '{launcher_path}' -FunctionsOnly
+$route = New-Object System.Windows.Forms.ComboBox
+$route.DisplayMember = 'Label'
+$route.ValueMember = 'Value'
+[void]$route.Items.Add([PSCustomObject]@{{ Label = 'Direct'; Value = 'direct' }})
+[void]$route.Items.Add([PSCustomObject]@{{ Label = 'LiteLLM'; Value = 'litellm' }})
+$route.SelectedIndex = 0
+$protocol = New-Object System.Windows.Forms.ComboBox
+$protocol.DisplayMember = 'Label'
+$protocol.ValueMember = 'Value'
+[void]$protocol.Items.Add([PSCustomObject]@{{ Label = 'Chat Completions'; Value = 'chat_completions' }})
+[void]$protocol.Items.Add([PSCustomObject]@{{ Label = 'Responses'; Value = 'responses' }})
+$protocol.SelectedIndex = 0
+if ((Get-LauncherComboValue $route) -ne 'direct') {{ throw 'route value mismatch' }}
+if ((Get-LauncherComboValue $protocol) -ne 'chat_completions') {{ throw 'protocol value mismatch' }}
+"""
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-STA", "-ExecutionPolicy", "Bypass", "-Command", command],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    script = LAUNCHER.read_text(encoding="utf-8")
+    assert "function Get-LauncherComboValue" in script
+    assert ".SelectedValue" not in script
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is required for launcher behavior testing")
 def test_launcher_save_preserves_unmanaged_env_lines_without_printing_values(tmp_path: Path) -> None:
     env_file = tmp_path / "launcher.env"
     original_lines = [

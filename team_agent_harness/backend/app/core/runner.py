@@ -2264,6 +2264,7 @@ class WorkflowRunner:
                     "latency_ms": output.model_response.latency_ms,
                     "finish_reason": output.model_response.finish_reason,
                     "output_length": len(output.model_response.text),
+                    "continuation_count": output.model_response.continuation_count,
                     "route_receipt": output.model_response.route_receipt,
                 },
                 duration_ms=output.model_response.latency_ms,

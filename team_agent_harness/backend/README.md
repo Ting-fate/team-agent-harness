@@ -39,6 +39,19 @@ This directory includes the original MVP phases, the durable local worker and bo
 
 The compatibility Pack definitions remain mocked when no routing config or `team_selection` is supplied. Normal desktop startup loads the direct-relay routing config, so GPT positions use `gpt_relay/gpt-5.6-sol` and selected GPT failures can fall back to official `deepseek/deepseek-v4-flash`; `TEAM_AGENT_GPT_ROUTE_MODE=litellm` restores the advanced local proxy path. Every real route still requires a configured provider, `TEAM_AGENT_ALLOW_REAL_MODEL_CALLS=1`, and explicit per-run confirmation. Tavily/browser and credential boundaries are unchanged; keys remain server-side in the ignored `.env.local` and never enter task/team payloads, SQLite, trace, or artifacts.
 
+Model routes may opt into at most three bounded continuations for non-empty `length`/`incomplete` responses. The continuation reuses the same route deadline, appends only the assembled partial answer with a no-repeat instruction, aggregates usage conservatively, and remains disabled when `continuation_attempts` is absent or zero. The checked-in Research Searcher, Reader, Verifier, and Writer routes enable two continuations because long evidence and synthesis responses are the most common truncation points; this does not raise a provider's actual per-request output limit.
+
+Every real route also gets one same-route retry for an empty provider response (`InvalidModelResponse`) within the shared deadline. Authentication, permission, local validation, and non-empty incomplete responses are not silently retried; they follow the existing fallback policy.
+
+The direct GPT relay transport defaults to two provider attempts via `TEAM_AGENT_GPT_RELAY_MAX_ATTEMPTS=2`; the attempts share the route deadline and can be reduced to `1` when a relay charges duplicate requests or is known to fail deterministically.
+
+Normal Pack model requests inherit the Agent runtime timeout as the route-level
+budget, so fallback and continuation attempts can use the remaining step time.
+The OpenAI-compatible transport still bounds each individual HTTP call by the
+configured client timeout (180 seconds by default); this prevents a hung socket
+from occupying a worker forever while allowing the step to progress through
+approved fallback/continuation attempts.
+
 The runner can dispatch safe explicit-DAG batches in parallel only when the executor explicitly opts in and every ready step has non-conflicting ownership. Parallel work is submitted up to the frozen plan's `max_parallel_steps`; after a branch failure, queued branches are not started, running calls are allowed to settle, and commit/error handling stays in deterministic plan order. `ModelGateway` separately limits concurrent calls per provider through `TEAM_AGENT_PROVIDER_MAX_CONCURRENCY` (default `4`). The in-process `RunWorker` is a durable local execution mechanism, not a distributed queue or external engineering executor. Built-in runtime jobs still do not launch external ACP processes or maintain live background child sessions. Code R&D does not receive general web search by default; only Research uses the web tools.
 
 ## Durable Background Runs And Context Budgets
@@ -72,7 +85,7 @@ Each `WorkflowStep` has a typed `context_policy`:
 - `max_artifacts`: maximum completed-attempt artifact refs/texts retained.
 - `max_upstream_handoffs`: maximum structured upstream handoffs retained; schema validation requires it to be at least the number of declared dependencies.
 
-Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step at 100K excerpt characters, 300K encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are streamed through a full hash verification while retaining only the bounded excerpt; tampered artifacts and artifacts or handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. The active local `research-planner` route uses `max_tokens=1000`; normal non-smoke `deepseek-v4-flash` requests receive at least 8,000 output tokens to avoid reasoning-heavy truncation. Agent Loop requests keep their computed remaining token/cost cap, and smoke requests keep their explicit tiny bound. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
+Artifact excerpt budgets are configured by position from 2K to 24K characters. The global schema caps a step's context envelope at 120K characters, 480,000 encoded bytes, 32 artifacts, and 32 handoffs. The final structured context is checked again before any model call. Artifact files are streamed through a full hash verification while retaining only the bounded excerpt; tampered artifacts and artifacts or handoffs from incomplete attempts are excluded. Context trace events record retained/dropped counts and character totals, never artifact bodies. Task intake is independently bounded by character, byte, container-size, and nesting-depth limits before SQLite persistence. Built-in Agent Loop and runtime budgets allow about 64K total tokens per step, while provider capability checks remain authoritative for each model's actual context and output limits. The active local `research-planner` route uses `max_tokens=1000`; normal non-smoke `deepseek-v4-flash` requests receive at least 8,000 output tokens to avoid reasoning-heavy truncation. Agent Loop requests keep their computed remaining token/cost cap, and smoke requests keep their explicit tiny bound. Incomplete model responses fail closed instead of becoming checkpoints. Other GPT budgets are unchanged.
 
 ## Multimodal Input Contract
 
@@ -457,7 +470,7 @@ owners are displayed but never stopped.
 
 `scripts/start-harness.ps1` starts the Harness UI on `http://127.0.0.1:8014/`. Direct mode is the default: GPT uses `OPENAI_API_BASE` without a local proxy and sends the relay's real model id `gpt-5.6-sol`; LiteLLM does not start and port `4000` remains free. Advanced `litellm` mode starts the existing local proxy and retains its `gpt5.6-sol` alias. Official DeepSeek remains `deepseek/deepseek-v4-flash`, and generated GPT team routes carry DeepSeek as the ordered fallback.
 
-The launcher also sets a bounded real-model failure budget unless you already provided one in the environment: `TEAM_AGENT_MODEL_TIMEOUT_SECONDS=180`, `REQUEST_TIMEOUT=180`, `TEAM_AGENT_LITELLM_PROXY_MAX_ATTEMPTS=1`, and `DEFAULT_MAX_RETRIES=0`. The previous 75-second boundary cut off a healthy GPT step; 180 seconds accommodates observed long responses while still preventing nested retries or an upstream outage from leaving a run indefinitely active. Each LiteLLM request also carries `x-litellm-timeout` so the proxy applies the same timeout per call. Override these values only when you intentionally want a different upstream wait.
+The launcher sets bounded transport defaults unless you already provided them in the environment: `TEAM_AGENT_MODEL_TIMEOUT_SECONDS=180`, `REQUEST_TIMEOUT=180`, `TEAM_AGENT_LITELLM_PROXY_MAX_ATTEMPTS=1`, and `DEFAULT_MAX_RETRIES=0`. A normal Pack step also carries its Agent runtime timeout as a larger route-level budget, so approved GPT fallback and bounded continuation can proceed after an individual 180-second transport timeout. Each LiteLLM request carries `x-litellm-timeout` with the per-call transport value. Override these values only when you intentionally want a different upstream wait.
 
 The YAML/JSON files intentionally do not contain real keys. Edit model names in the YAML if your LiteLLM provider names differ, but keep credentials in environment variables or `.env.local`.
 
@@ -532,13 +545,13 @@ The backend validates accepted values (`minimal`, `low`, `medium`, `high`, and `
 
 LiteLLM itself defaults to very long upstream waits and provider retries. The harness keeps the failure boundary local and observable:
 
-- `TEAM_AGENT_MODEL_TIMEOUT_SECONDS` controls the harness OpenAI-compatible client timeout and defaults to 180 seconds in the launcher.
+- `TEAM_AGENT_MODEL_TIMEOUT_SECONDS` controls the per-provider OpenAI-compatible client timeout and defaults to 180 seconds in the launcher; normal Pack steps separately carry their larger Agent runtime timeout as the shared route budget.
 - Provider semaphore waiting, provider retries, and retry backoff consume one monotonic request deadline. Each retry receives only the remaining time instead of restarting the timeout budget.
 - LiteLLM proxy calls receive `x-litellm-timeout` with that same value.
 - `TEAM_AGENT_LITELLM_PROXY_MAX_ATTEMPTS` defaults to `1` so harness retries do not stack on top of LiteLLM retries.
 - `REQUEST_TIMEOUT` and `DEFAULT_MAX_RETRIES` are set by `scripts/start-litellm-harness.ps1` for the local LiteLLM process.
 
-If a relay returns `504`, the run should fail with a model error trace instead of waiting through several nested retry loops. The remote relay or upstream provider may still be unhealthy; the local fix is to fail clearly and quickly, not to hide the outage.
+If a relay returns `504`, the route records the failed attempt and can use the approved DeepSeek fallback within the shared step deadline. Authentication, permission, local validation, and exhausted continuation budgets still fail with a model error trace rather than being hidden by mock output.
 
 Provider failures in `code_rd_institutional` are also fail-closed by default. Set `TEAM_AGENT_ALLOW_MODEL_FALLBACK_TO_MOCK=1` only when an operator explicitly wants non-approved session steps in that pack to fall back to mock output; without that exact opt-in, a real-provider error fails the run and cannot be mistaken for a real-model result.
 

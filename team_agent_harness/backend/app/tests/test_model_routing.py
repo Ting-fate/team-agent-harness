@@ -176,6 +176,18 @@ def test_checked_in_routes_use_current_defaults_and_xhigh_reasoning() -> None:
                 assert route["reasoning_effort"] == "xhigh"
 
 
+def test_research_routes_enable_only_two_bounded_continuations() -> None:
+    routing_paths = [PROJECT_ROOT / "config/model-routing.direct-relay.example.json"]
+    local_routing_path = PROJECT_ROOT / "config/model-routing.local.json"
+    if local_routing_path.is_file():
+        routing_paths.append(local_routing_path)
+
+    for routing_path in routing_paths:
+        agents = json.loads(routing_path.read_text(encoding="utf-8"))["agents"]
+        for agent_id in ("research-searcher", "research-reader", "research-verifier", "research-writer"):
+            assert agents[agent_id]["continuation_attempts"] == 2
+
+
 def test_model_routing_can_apply_role_file_without_leaking_it_to_model_config(tmp_path) -> None:
     roles_dir = tmp_path / "roles"
     roles_dir.mkdir()

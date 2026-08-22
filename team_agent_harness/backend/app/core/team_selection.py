@@ -138,6 +138,7 @@ class _TeamSnapshotSettings(HarnessModel):
     model: str = Field(min_length=1, max_length=200)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0, le=200_000)
+    continuation_attempts: int = Field(default=0, ge=0, le=3)
     reasoning_effort: str = Field(min_length=1)
     fallbacks: list[_TeamSnapshotFallback] = Field(default_factory=list, max_length=4)
     model_family: ModelFamily
@@ -567,6 +568,8 @@ def _model_settings_from_route(
             if not isinstance(item, dict):
                 raise TeamSelectionError("Validated model fallback did not produce an object.")
             item["model_family"] = selected_fallback.family
+    if model_settings.get("continuation_attempts") == 0:
+        model_settings.pop("continuation_attempts", None)
     model_settings["model_family"] = selected_route.family
     model_settings.setdefault(
         "reasoning_effort",

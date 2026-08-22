@@ -7,6 +7,11 @@ from pydantic import Field, model_validator
 from app.core.models import AgentDefinition, ArtifactType, HarnessModel
 
 
+DEFAULT_CONTEXT_MAX_CHARS = 120_000
+DEFAULT_CONTEXT_MAX_BYTES = 480_000
+DEFAULT_AGENT_LOOP_MAX_TOTAL_TOKENS = 64_000
+
+
 class EvalCheck(HarnessModel):
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
@@ -31,15 +36,15 @@ class ContextPolicy(HarnessModel):
     artifact_excerpt_chars: int = Field(default=0, ge=0, le=100_000)
     max_artifacts: int = Field(default=8, ge=0, le=32)
     max_upstream_handoffs: int = Field(default=8, ge=0, le=32)
-    max_context_chars: int = Field(default=100_000, ge=10_000, le=1_000_000)
-    max_context_bytes: int = Field(default=300_000, ge=10_000, le=3_000_000)
+    max_context_chars: int = Field(default=DEFAULT_CONTEXT_MAX_CHARS, ge=10_000, le=1_000_000)
+    max_context_bytes: int = Field(default=DEFAULT_CONTEXT_MAX_BYTES, ge=10_000, le=3_000_000)
 
 
 class AgentLoopPolicy(HarnessModel):
     enabled: bool = False
     max_steps: int = Field(default=1, ge=1, le=12)
     max_tool_calls: int = Field(default=0, ge=0, le=32)
-    max_total_tokens: int = Field(default=32_000, ge=1, le=1_000_000)
+    max_total_tokens: int = Field(default=DEFAULT_AGENT_LOOP_MAX_TOTAL_TOKENS, ge=1, le=1_000_000)
     timeout_seconds: float = Field(default=180.0, gt=0, le=3600)
     max_repeated_tool_calls: int = Field(default=2, ge=1, le=5)
     max_observation_chars: int = Field(default=20_000, ge=100, le=100_000)

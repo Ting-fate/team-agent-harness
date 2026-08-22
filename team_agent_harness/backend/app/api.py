@@ -1600,6 +1600,7 @@ class PackMappedExecutor:
             model_config=agent.model_settings,
             allowed_tools=step.allowed_tools,
             context=context,
+            timeout_seconds=float(agent.runtime_limits.get("timeout_seconds", 180.0)),
         )
         self._record_model_request_started(run=run, model_request=model_request)
         model_request, model_response = self._complete_model_request(
@@ -1953,6 +1954,7 @@ class PackMappedExecutor:
             model_config=agent.model_settings,
             allowed_tools=step.allowed_tools,
             context=context,
+            timeout_seconds=step.agent_loop.timeout_seconds,
         )
         model_request = self._with_provider_attempt_recorder(run, model_request)
         result = AgentLoopExecutor(

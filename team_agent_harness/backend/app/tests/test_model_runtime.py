@@ -1352,6 +1352,191 @@ def test_openai_compatible_adapter_can_use_chat_completions_without_network(
     assert response.usage == {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7}
 
 
+def test_model_gateway_continues_a_length_limited_response_within_one_route_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+
+    responses = iter(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="part one"),
+                        finish_reason="length",
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=4, completion_tokens=3, total_tokens=7),
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="part two"),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2, total_tokens=7),
+            ),
+        ]
+    )
+
+    class SequenceCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return next(responses)
+
+    completions = SequenceCompletions()
+    adapter = OpenAICompatibleModelAdapter(
+        provider="deepseek",
+        api_key_env="DEEPSEEK_API_KEY",
+        base_url="https://api.deepseek.com",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+        endpoint="chat_completions",
+    )
+    result = ModelGateway(adapters={"deepseek": adapter}).complete(
+        ModelRequest(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            system_prompt="System",
+            messages=[ModelMessage(role="user", content="Write a report")],
+            max_tokens=128,
+            max_continuations=1,
+        )
+    )
+
+    assert result.text == "part one\npart two"
+    assert result.finish_reason == "stop"
+    assert result.continuation_count == 1
+    assert result.usage == {"input_tokens": 9, "output_tokens": 5, "total_tokens": 14}
+    assert len(completions.calls) == 2
+    assert completions.calls[1]["messages"][-2:] == [
+        {"role": "assistant", "content": "part one"},
+        {
+            "role": "user",
+            "content": (
+                "Continue the previous response from exactly where it stopped. "
+                "Do not repeat any text already present. Preserve the same structure "
+                "and finish the requested deliverable."
+            ),
+        },
+    ]
+
+
+def test_model_gateway_retries_one_empty_provider_response_before_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+
+    responses = iter(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=""),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=FakeChatUsage(),
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="recovered"),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=FakeChatUsage(),
+            ),
+        ]
+    )
+
+    class SequenceCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return next(responses)
+
+    completions = SequenceCompletions()
+    adapter = OpenAICompatibleModelAdapter(
+        provider="deepseek",
+        api_key_env="DEEPSEEK_API_KEY",
+        base_url="https://api.deepseek.com",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+        endpoint="chat_completions",
+    )
+
+    result = ModelGateway(adapters={"deepseek": adapter}).complete(
+        ModelRequest(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            system_prompt="System",
+            messages=[ModelMessage(role="user", content="Write")],
+            max_tokens=128,
+        )
+    )
+
+    assert result.text == "recovered"
+    assert len(completions.calls) == 2
+
+
+def test_openai_compatible_adapter_extracts_provider_tool_envelope_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+    content = "# Clean report\n\n正文 & 结论"
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=(
+                        "preface\n<"
+                        + marker
+                        + "tool_calls>\n<"
+                        + marker
+                        + 'parameter name="content" string="true">'
+                        + content
+                        + "</"
+                        + marker
+                        + "parameter>\n"
+                    )
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=FakeChatUsage(),
+    )
+
+    result = _complete_static_response(response, endpoint="chat_completions")
+
+    assert result.text == "# Clean report\n\n正文 & 结论"
+    assert marker not in result.text
+
+
+def test_openai_compatible_adapter_rejects_unextractable_provider_tool_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=f"<{marker}tool_calls>broken"),
+                finish_reason="stop",
+            )
+        ],
+        usage=FakeChatUsage(),
+    )
+
+    with pytest.raises(ModelRuntimeError, match="provider tool envelope"):
+        _complete_static_response(response, endpoint="chat_completions")
+
+
 @pytest.mark.parametrize(
     ("endpoint", "finish_reason", "expected_summary"),
     [

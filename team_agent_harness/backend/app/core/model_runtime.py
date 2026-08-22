@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 import base64
 import binascii
+import html
 from ipaddress import ip_address
 import json
 from math import isfinite
@@ -32,6 +33,13 @@ from app.core.sensitive_text import contains_secret_like_text
 _MAX_MODEL_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_MODEL_DATA_URI_BYTES = 16 * 1024 * 1024
 _DEEPSEEK_MIN_RUN_OUTPUT_TOKENS = 8000
+_INVALID_RESPONSE_RETRY_LIMIT = 1
+_DSML_MARKER = "\uff5c\uff5cDSML\uff5c\uff5c"
+_DSML_CONTENT_PARAMETER_RE = re.compile(
+    rf"<{re.escape(_DSML_MARKER)}parameter name=\"content\"[^>]*>"
+    rf"(?P<content>.*?)</{re.escape(_DSML_MARKER)}parameter>",
+    re.DOTALL,
+)
 _DATA_URI_RE = re.compile(
     r"^data:(image/(?:jpeg|png|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$"
 )
@@ -77,6 +85,7 @@ class ModelRequest:
     messages: list[ModelMessage]
     temperature: float | None = None
     max_tokens: int | None = None
+    max_continuations: int = 0
     reasoning_effort: str | None = None
     timeout_seconds: float | None = None
     tools_allowed: list[str] = field(default_factory=list)
@@ -114,6 +123,8 @@ class ModelResponse:
     tool_calls: list[ModelToolCall] = field(default_factory=list)
     route_receipt: list[dict[str, Any]] = field(default_factory=list)
     provider_attempts: list[dict[str, Any]] = field(default_factory=list)
+    partial: bool = False
+    continuation_count: int = 0
     selected_provider: str | None = None
     selected_model: str | None = None
     selected_input_usd_per_million: float | None = None
@@ -278,8 +289,24 @@ class OpenAICompatibleModelAdapter:
                 _raise_unsupported_response_shape("tool_call")
             tool_calls = _response_tool_calls(response)
             _validate_requested_tool_calls(request, tool_calls)
-            finish_reason = _response_finish_reason(response, allow_tool_calls=bool(tool_calls))
-            text = _response_text(response, allow_empty=bool(tool_calls))
+            text = _normalize_provider_text(_response_text(response, allow_empty=bool(tool_calls)))
+            raw_finish_reason = _raw_response_finish_reason(response)
+            partial = False
+            try:
+                finish_reason = _validated_finish_reason(
+                    raw_finish_reason,
+                    allow_tool_calls=bool(tool_calls),
+                )
+            except ModelRuntimeError as exc:
+                if (
+                    request.max_continuations > 0
+                    and raw_finish_reason in {"length", "incomplete"}
+                    and text.strip()
+                ):
+                    finish_reason = str(raw_finish_reason)
+                    partial = True
+                else:
+                    raise exc
             usage = _response_usage(response)
         except ModelRuntimeError as exc:
             failed_attempts = [
@@ -313,6 +340,7 @@ class OpenAICompatibleModelAdapter:
             mocked=False,
             tool_calls=tool_calls,
             provider_attempts=provider_attempts,
+            partial=partial,
         )
 
     def _client_for_call(self) -> Any:
@@ -734,17 +762,43 @@ class ModelGateway:
                     break
                 candidate_request = replace(candidate_request, timeout_seconds=remaining_seconds)
             try:
-                response = self._complete_single(candidate_request)
                 trusted_transport = _is_trusted_attempt_adapter(
                     self.adapters.get(candidate.provider)
                 )
-                validated = _validate_model_response(
-                    response,
-                    provider=candidate.provider,
-                    model=candidate.model,
-                    allowed_tools={tool.name for tool in request.tools},
-                    allow_provider_attempts=trusted_transport,
-                )
+                response_retry_attempt = 0
+                while True:
+                    try:
+                        validated = self._complete_with_continuations(
+                            candidate_request,
+                            provider=candidate.provider,
+                            model=candidate.model,
+                            allowed_tools={tool.name for tool in request.tools},
+                            allow_provider_attempts=trusted_transport,
+                            deadline=route_deadline,
+                        )
+                        break
+                    except ModelRuntimeError as exc:
+                        if (
+                            exc.error_class != "InvalidModelResponse"
+                            or response_retry_attempt >= _INVALID_RESPONSE_RETRY_LIMIT
+                        ):
+                            raise
+                        response_retry_attempt += 1
+                        remaining_seconds = (
+                            route_deadline - perf_counter()
+                            if route_deadline is not None
+                            else candidate_request.timeout_seconds
+                        )
+                        if remaining_seconds is not None and remaining_seconds <= 0:
+                            raise
+                        candidate_request = replace(
+                            candidate_request,
+                            timeout_seconds=remaining_seconds,
+                            metadata={
+                                **candidate_request.metadata,
+                                "response_retry_attempt": response_retry_attempt,
+                            },
+                        )
             except ModelRuntimeError as exc:
                 retryable = model_error_is_retryable(exc)
                 if (
@@ -963,6 +1017,85 @@ class ModelGateway:
         finally:
             gate.release()
 
+    def _complete_with_continuations(
+        self,
+        request: ModelRequest,
+        *,
+        provider: str,
+        model: str,
+        allowed_tools: set[str],
+        allow_provider_attempts: bool,
+        deadline: float | None,
+    ) -> ModelResponse:
+        response = self._complete_single(request)
+        validated = _validate_model_response(
+            response,
+            provider=provider,
+            model=model,
+            allowed_tools=allowed_tools,
+            allow_provider_attempts=allow_provider_attempts,
+        )
+        if not validated.partial:
+            return validated
+
+        continuation_deadline = deadline
+        if continuation_deadline is None:
+            continuation_timeout = request.timeout_seconds or _positive_float_env(
+                "TEAM_AGENT_MODEL_TIMEOUT_SECONDS", 180.0
+            )
+            continuation_deadline = perf_counter() + continuation_timeout
+
+        responses = [validated]
+        assembled_text = validated.text
+        for continuation_index in range(1, request.max_continuations + 1):
+            remaining_seconds = continuation_deadline - perf_counter()
+            if remaining_seconds <= 0:
+                break
+            continuation_request = _continuation_request(
+                request,
+                assembled_text,
+                continuation_index,
+                remaining_seconds,
+            )
+            response = self._complete_single(continuation_request)
+            validated = _validate_model_response(
+                response,
+                provider=provider,
+                model=model,
+                allowed_tools=allowed_tools,
+                allow_provider_attempts=allow_provider_attempts,
+            )
+            responses.append(validated)
+            assembled_text = _merge_continuation_text(assembled_text, validated.text)
+            if not validated.partial:
+                return replace(
+                    validated,
+                    text=assembled_text,
+                    usage=_sum_model_usage(responses),
+                    latency_ms=sum(item.latency_ms for item in responses),
+                    partial=False,
+                    continuation_count=continuation_index,
+                    provider_attempts=[
+                        attempt
+                        for item in responses
+                        for attempt in item.provider_attempts
+                    ],
+                )
+
+        raise ModelRuntimeError(
+            "Model response remained incomplete after bounded continuations.",
+            provider=provider,
+            model=model,
+            error_class="IncompleteModelResponse",
+            error_summary=f"finish_reason={responses[-1].finish_reason}",
+            elapsed_ms=sum(item.latency_ms for item in responses),
+            provider_attempts=[
+                attempt
+                for item in responses
+                for attempt in item.provider_attempts
+            ],
+        )
+
     def _validate_request_capabilities(self, request: ModelRequest) -> None:
         required = request.metadata.get("required_model_capabilities", [])
         if not isinstance(required, list) or any(
@@ -1124,7 +1257,7 @@ def _record_provider_attempt_started(request: ModelRequest, provider_attempt: in
         value = request.metadata.get(key)
         if type(value) is str:
             evidence[key] = _safe_model_identifier(value, f"unknown_{key}")
-    for key in ("route_attempt", "agent_loop_step"):
+    for key in ("route_attempt", "agent_loop_step", "response_retry_attempt", "continuation_attempt"):
         value = request.metadata.get(key)
         if type(value) is int and value > 0:
             evidence[key] = value
@@ -1223,7 +1356,7 @@ def default_model_adapters() -> dict[str, ModelAdapter]:
             api_key_env="OPENAI_API_KEY",
             base_url=_gpt_relay_base_url,
             endpoint=gpt_relay_protocol(),
-            max_attempts=1,
+            max_attempts=_positive_int_env("TEAM_AGENT_GPT_RELAY_MAX_ATTEMPTS", 2),
         ),
         "anthropic": ProviderStubAdapter("anthropic"),
         "deepseek": OpenAICompatibleModelAdapter(
@@ -1356,6 +1489,55 @@ def _request_contains_image_block(request: ModelRequest) -> bool:
         if isinstance(message.content, list)
         for block in message.content
     )
+
+
+def _continuation_request(
+    request: ModelRequest,
+    assembled_text: str,
+    continuation_index: int,
+    timeout_seconds: float,
+) -> ModelRequest:
+    return replace(
+        request,
+        messages=[
+            *request.messages,
+            ModelMessage(role="assistant", content=assembled_text),
+            ModelMessage(
+                role="user",
+                content=(
+                    "Continue the previous response from exactly where it stopped. "
+                    "Do not repeat any text already present. Preserve the same structure "
+                    "and finish the requested deliverable."
+                ),
+            ),
+        ],
+        timeout_seconds=timeout_seconds,
+        metadata={
+            **request.metadata,
+            "continuation_attempt": continuation_index,
+        },
+    )
+
+
+def _merge_continuation_text(existing: str, continuation: str) -> str:
+    continuation = continuation.lstrip()
+    if not continuation:
+        return existing
+    max_overlap = min(2_000, len(existing), len(continuation))
+    for overlap in range(max_overlap, 0, -1):
+        if existing.endswith(continuation[:overlap]):
+            return existing + continuation[overlap:]
+    return f"{existing}\n{continuation}"
+
+
+def _sum_model_usage(responses: list[ModelResponse]) -> dict[str, int]:
+    usage_keys = ("input_tokens", "output_tokens", "total_tokens")
+    if any(any(key not in response.usage for key in usage_keys) for response in responses):
+        return {}
+    return {
+        key: sum(response.usage[key] for response in responses)
+        for key in usage_keys
+    }
 
 
 def _route_receipt_entry(
@@ -1536,6 +1718,7 @@ def model_request_from_agent(
     model_config: dict[str, Any],
     allowed_tools: list[str],
     context: dict[str, Any],
+    timeout_seconds: float | None = None,
 ) -> ModelRequest:
     provider = str(model_config.get("provider", "mock"))
     model = str(model_config.get("model", "mock-model"))
@@ -1567,6 +1750,8 @@ def model_request_from_agent(
         messages=messages,
         temperature=_optional_float(model_config.get("temperature")),
         max_tokens=_optional_int(model_config.get("max_tokens")),
+        max_continuations=max(0, _optional_int(model_config.get("continuation_attempts")) or 0),
+        timeout_seconds=timeout_seconds,
         reasoning_effort=reasoning_effort,
         tools_allowed=allowed_tools,
         fallbacks=model_fallbacks_from_config(model_config),
@@ -2072,7 +2257,13 @@ def _validate_model_response(
             selected_model = _validated_model_response_identifier(response.selected_model)
             if selected_model != model:
                 _raise_invalid_model_response_metadata()
-        if raw_provider != provider or type(response.mocked) is not bool:
+        if (
+            raw_provider != provider
+            or type(response.mocked) is not bool
+            or type(response.partial) is not bool
+            or type(response.continuation_count) is not int
+            or response.continuation_count < 0
+        ):
             _raise_invalid_model_response_metadata()
     except Exception:
         raise ModelRuntimeError(
@@ -2085,8 +2276,18 @@ def _validate_model_response(
     try:
         tool_calls = _validated_model_tool_calls(response.tool_calls)
         _ensure_tool_calls_allowed(tool_calls, allowed_tools)
-        finish_reason = _validated_finish_reason(response.finish_reason, allow_tool_calls=bool(tool_calls))
+        finish_reason = _validated_finish_reason(
+            response.finish_reason,
+            allow_tool_calls=bool(tool_calls),
+            allow_incomplete=response.partial,
+        )
         text = _validated_response_text(response.text, allow_empty=bool(tool_calls))
+        if response.partial and not text.strip():
+            raise ModelRuntimeError(
+                "Partial model response did not contain usable text.",
+                error_class="InvalidModelResponse",
+                error_summary="response_text=empty",
+            )
     except ModelRuntimeError as exc:
         raise ModelRuntimeError(
             str(exc),
@@ -2108,6 +2309,8 @@ def _validate_model_response(
         mocked=response.mocked,
         tool_calls=tool_calls,
         provider_attempts=provider_attempts,
+        partial=response.partial,
+        continuation_count=response.continuation_count,
     )
 
 
@@ -2330,6 +2533,27 @@ def _validated_response_text(value: Any, *, allow_empty: bool = False) -> str:
     return value
 
 
+def _normalize_provider_text(value: str) -> str:
+    """Remove provider-specific tool envelopes that are returned as plain text."""
+    if _DSML_MARKER not in value:
+        return value
+    match = _DSML_CONTENT_PARAMETER_RE.search(value)
+    if match is None:
+        raise ModelRuntimeError(
+            "Model response contained an unsupported provider tool envelope.",
+            error_class="InvalidModelResponse",
+            error_summary="response_shape=provider_tool_markup",
+        )
+    content = html.unescape(match.group("content")).strip()
+    if not content:
+        raise ModelRuntimeError(
+            "Model response provider tool envelope contained empty content.",
+            error_class="InvalidModelResponse",
+            error_summary="response_text=empty",
+        )
+    return content
+
+
 def _response_usage(response: Any) -> dict[str, int]:
     try:
         usage = getattr(response, "usage", None)
@@ -2378,16 +2602,25 @@ def _present_response_usage(**values: Any) -> dict[str, int]:
 
 
 def _response_finish_reason(response: Any, *, allow_tool_calls: bool = False) -> str:
+    return _validated_finish_reason(
+        _raw_response_finish_reason(response),
+        allow_tool_calls=allow_tool_calls,
+    )
+
+
+def _raw_response_finish_reason(response: Any) -> Any:
     choices = getattr(response, "choices", None) or []
     for choice in choices:
-        return _validated_finish_reason(
-            getattr(choice, "finish_reason", None),
-            allow_tool_calls=allow_tool_calls,
-        )
-    return _validated_finish_reason(getattr(response, "status", None), allow_tool_calls=allow_tool_calls)
+        return getattr(choice, "finish_reason", None)
+    return getattr(response, "status", None)
 
 
-def _validated_finish_reason(value: Any, *, allow_tool_calls: bool = False) -> str:
+def _validated_finish_reason(
+    value: Any,
+    *,
+    allow_tool_calls: bool = False,
+    allow_incomplete: bool = False,
+) -> str:
     if not isinstance(value, str) or not value.strip():
         summary = (
             "finish_reason=missing"
@@ -2401,6 +2634,8 @@ def _validated_finish_reason(value: Any, *, allow_tool_calls: bool = False) -> s
         )
     finish_reason = value.strip().lower()
     if finish_reason == "tool_calls" and allow_tool_calls:
+        return finish_reason
+    if finish_reason in {"length", "incomplete"} and allow_incomplete:
         return finish_reason
     if finish_reason not in _COMPLETE_RESPONSE_STATES:
         summary = (
