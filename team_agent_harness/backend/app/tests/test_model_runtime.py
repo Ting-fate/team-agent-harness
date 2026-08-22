@@ -1356,6 +1356,7 @@ def test_model_gateway_continues_a_length_limited_response_within_one_route_budg
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
 
     responses = iter(
         [
@@ -1429,6 +1430,7 @@ def test_model_gateway_retries_one_empty_provider_response_before_failing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TEAM_AGENT_ALLOW_REAL_MODEL_CALLS", "1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
 
     responses = iter(
         [
